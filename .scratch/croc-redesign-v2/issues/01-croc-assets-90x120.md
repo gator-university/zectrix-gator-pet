@@ -6,7 +6,7 @@
 
 **Status:** ready-for-agent
 
-- [ ] `assets/croc/default/` 六个动作均为 90×120 单色 PNG（L 模式），风格符合 `docs/reference/croc-style/` 的造型语言：圆头、短吻、2px 黑描边、高光眼、浅色肚皮；六张是同一只角色的不同姿态
+- [ ] `assets/croc/default/` 六个动作均为 90×120 单色 PNG（L 模式），主角是 gator（短吻鳄，alligator）：圆头、**短而宽的 U 形吻部**（不是长尖吻 croc，不外露齿排）、2px 黑描边、高光眼、浅色肚皮；风格符合 `docs/reference/croc-style/`；六张是同一只角色的不同姿态
 - [ ] 动作语义：idle 端咖啡杯、working 敲笔记本、waiting 举手/问号、done 星星/点赞、error 绷带或 × 眼、sleep 闭眼 + Z
 - [ ] 渲染路径改为 1:1（缩放参数传 1），画在 (300,150)，不超出 400×300 画布、不压到底部信息线
 - [ ] `src/sprite.rs` 测试更新：尺寸 90×120、墨量比例 6%–50%、包围盒 ≥ 40×60、六动作互不相同、未知动作不画
