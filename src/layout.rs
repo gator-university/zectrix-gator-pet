@@ -415,7 +415,8 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         } else {
             "idle"
         };
-        sprite::draw_action(&mut e, 300, 150, action, 3);
+        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-CROC-04）。
+        sprite::draw_action(&mut e, 300, 150, action, 1);
     }
 
     rect(&mut e, 16, 271, 368, 0, None);
@@ -854,7 +855,9 @@ mod tests {
             for frame in 0..6 {
                 let v = draw(&m, 100, frame);
                 let e = v["elements"].as_array().unwrap();
-                assert!(e.len() <= 200);
+                // 90×120 鳄鱼素材贪婪矩形化后单帧约 240–285 个元素（实测：素材 208–274，
+                // 版式约 10）；ticket 01 明确允许把上限从 200 提到 400，再高就该简化素材。
+                assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
                 for v in e {
                     if v["type"] == "line" {
                         // 矢量图标（完成的对勾）：坐标是 x1/y1/x2/y2，同样必须在画布内。
