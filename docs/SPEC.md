@@ -174,7 +174,7 @@
 **FR-SET-01 位置**
 - 期望：DSH 的 Plugins 页 → 本插件详情（与官方插件一致）；无独立面板/托盘。
 - 状态：待验证（代码完成，需重启 DSH 在界面确认；本机已装 bundle，`plugins.bundle.config` slot 注册 key `zectrix-croc-pet`）。
-- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.slots.inject('plugins.bundle.config', …)`；`package.json` `dsh.client{platform:web,immediately:true}`；Node 沙箱 harness 实测注册 `{name:'plugins.bundle.config', key:'zectrix-croc-pet'}` 且组件为函数（`CLIENT OK`）。页面渲染需刷新/重启 DSH GUI 后确认。
+- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.slots.inject('plugins.bundle.config', …)`；`package.json` `dsh.client{platform:web,immediately:true}`；Node 沙箱 harness 实测注册 `{name:'plugins.bundle.config', key:'zectrix-croc-pet'}` 且组件为函数（`CLIENT OK`）；展示元信息 `plugin/locale/{en,zh}.json`（meta.title/description）与 `./icon` 已导出并通过 `files` 打包，插件启用/停用重载无警告、宠物进程正常拉起。页面渲染需刷新 DSH GUI 后确认。
 
 **FR-SET-02 字段**
 - 术语说明：见 GLOSSARY「配置桥」「宿主插件」「client bundle」。
