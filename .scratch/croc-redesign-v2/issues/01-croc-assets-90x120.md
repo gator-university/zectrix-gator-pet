@@ -4,11 +4,17 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `assets/croc/default/` 六个动作均为 90×120 单色 PNG（L 模式），主角是 gator（短吻鳄，alligator）：圆头、**短而宽的 U 形吻部**（不是长尖吻 croc，不外露齿排）、2px 黑描边、高光眼、浅色肚皮；风格符合 `docs/reference/croc-style/`；六张是同一只角色的不同姿态
-- [ ] 动作语义：idle 端咖啡杯、working 敲笔记本、waiting 举手/问号、done 星星/点赞、error 绷带或 × 眼、sleep 闭眼 + Z
-- [ ] 渲染路径改为 1:1（缩放参数传 1），画在 (300,150)，不超出 400×300 画布、不压到底部信息线
-- [ ] `src/sprite.rs` 测试更新：尺寸 90×120、墨量比例 6%–50%、包围盒 ≥ 40×60、六动作互不相同、未知动作不画
-- [ ] `cargo test` 全过（≥67 项）；`preview --demo <state>` 六张 PNG 生成到 `out/croc-v2-<state>.png` 作为视觉证据
-- [ ] 版式层不因素材变大而越界（`layouts_obey_hub_limits` 等现有测试仍通过）
+<!-- 验收证据：分支 ticket/01-croc-assets；提交 765cc4e（素材/生成器/渲染）与
+2ec9660（合并 feat/croc-v2）。cargo test 68 项全过，cargo build --release 0 警告。
+预览：out/croc-v2-{idle,working,waiting,done,error,stopped,sleep}.png；
+合并 ticket 02 后版式整体下移 2px，素材实际画在 (300,152)，仍不压底部分隔线。 -->
+
+
+- [x] `assets/croc/default/` 六个动作均为 90×120 单色 PNG（L 模式），主角是 gator（短吻鳄，alligator）：圆头、**短而宽的 U 形吻部**（不是长尖吻 croc，不外露齿排）、2px 黑描边、高光眼、浅色肚皮；风格符合 `docs/reference/croc-style/`；六张是同一只角色的不同姿态
+- [x] 动作语义：idle 端咖啡杯、working 敲笔记本、waiting 举手/问号、done 星星/点赞、error 绷带或 × 眼、sleep 闭眼 + Z
+- [x] 渲染路径改为 1:1（缩放参数传 1），画在 (300,150)，不超出 400×300 画布、不压到底部信息线
+- [x] `src/sprite.rs` 测试更新：尺寸 90×120、墨量比例 6%–50%、包围盒 ≥ 40×60、六动作互不相同、未知动作不画
+- [x] `cargo test` 全过（≥67 项）；`preview --demo <state>` 六张 PNG 生成到 `out/croc-v2-<state>.png` 作为视觉证据
+- [x] 版式层不因素材变大而越界（`layouts_obey_hub_limits` 等现有测试仍通过）
