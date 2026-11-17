@@ -5,7 +5,7 @@
 一只像素小鳄鱼，跟着 DSH 的会话状态换动作。它是 **DeepSeek Harness 插件**：
 DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugins 里，没有别的常驻程序。
 
-`Windows 10 / 11 x64` · `v0.6.0` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
+`Windows 10 / 11 x64` · `v0.6.1` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
 
 <p align="center">
   <img src="docs/screens/live.png" width="420" alt="设备上的一帧：两个任务并行">
@@ -78,9 +78,11 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 
 - 路径：`assets/croc/default/{action}.png`
 - `action`：`idle`、`working`、`waiting`、`done`、`error`、`sleep`
-- 规格：30×40 单色 PNG（透明/黑），3× 最近邻放大到 90×120，画在右下角 `(300,150)`
+- 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），按 1:1 直接画在右下角 `(300,152)`，不再放大
+- 风格基线：gator（短吻鳄）——圆头、短宽 U 吻、2px 实心描边、白高光眼睛、浅色肚皮分节线
 - 今后装扮：`assets/croc/<outfit>/<action>.png`，默认 `default`；可选第二帧 `<action>-2.png`（v1 不用）
-- 当前是代码生成的**占位图**，等你的正式形象替换。
+- 六张由 `scripts/make_croc_v2.py` 用同一套头/身/腿/尾模板生成，可复现；`--icon` 另出 `plugin/icon.png`
+- 替换形象：用同尺寸、同路径的 6 个文件覆盖即可，不用改代码（契约见 `docs/adr/0007-croc-asset-contract-90x120.md`）
 
 ## 花絮（右下角句子）
 
@@ -127,7 +129,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 ## 从源码构建
 
 ```powershell
-cargo test                 # 52 lib + 15 bin = 67
+cargo test                 # 53 lib + 15 bin = 68
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```
@@ -147,7 +149,7 @@ src\                Rust：dsh.rs 会话跟随、layout.rs 版式、sprite.rs �
 assets\croc\        鳄鱼动作 PNG（default 装扮）
 assets\quips.txt    右下角花絮
 docs\SPEC.md        功能清单与逐项验收（唯一功能规格）
-docs\adr\           架构决策记录（生命周期、命名、素材、刷新、设置页、花絮）
+docs\adr\           架构决策记录（生命周期、命名、素材、刷新、设置页、花絮、90×120 素材契约）
 docs\screens\       版式截图
 GLOSSARY.md         术语表
 ```

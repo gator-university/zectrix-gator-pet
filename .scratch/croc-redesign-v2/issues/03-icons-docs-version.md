@@ -4,11 +4,11 @@
 
 **Blocked by:** 01（新素材）、02（新版式）
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `plugin/icon.png` 为 128×128 单色新鳄鱼头像，`./icon` 导出与 `files` 打包不变；插件清单仍能通过安装/启用
-- [ ] README 头图与 `docs/screens/{live,working,waiting,done,error,stopped}.png` 用最终版式与形象重渲染
-- [ ] `docs/SPEC.md`：新增 FR-CROC-05（形象 v2 风格基线），更新 FR-CROC-01/02/03、FR-UI-05 的状态与证据；版本标注 0.6.1
-- [ ] 新增 `docs/adr/0007-croc-asset-contract-90x120.md`，记录契约变更与理由；GLOSSARY 如涉术语同步
-- [ ] `Cargo.toml` 与 `plugin/package.json` 版本同步 0.6.1，`cargo test` 全过，release 构建成功
-- [ ] 三次提交在集成分支上可读（素材/版式/收尾），工作区干净
+- [x] `plugin/icon.png` 为 128×128 单色新鳄鱼头像，`./icon` 导出与 `files` 打包不变；插件清单仍能通过安装/启用
+- [x] README 头图与 `docs/screens/{live,working,waiting,done,error,stopped}.png` 用最终版式与形象重渲染
+- [x] `docs/SPEC.md`：新增 FR-CROC-05（形象 v2 风格基线），更新 FR-CROC-01/02/03、FR-UI-05 的状态与证据；版本标注 0.6.1
+- [x] 新增 `docs/adr/0007-croc-asset-contract-90x120.md`，记录契约变更与理由；GLOSSARY 如涉术语同步
+- [x] `Cargo.toml` 与 `plugin/package.json` 版本同步 0.6.1，`cargo test` 全过，release 构建成功
+- [x] 三次提交在集成分支上可读（素材/版式/收尾），工作区干净

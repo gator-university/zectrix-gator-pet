@@ -89,7 +89,7 @@
 - 复用先例：`src/sprite.rs` 的 `all_actions_have_art`、`unknown_action_draws_nothing`；`src/layout.rs` 的 `layouts_obey_hub_limits`、`header_is_brand_only_and_idle_footer_reports_device`。
 - 新增断言：素材 90×120；每动作墨点比例 6%–50%；包围盒宽高 ≥ 40×60；六动作矩形集合两两不同；页头文本同时包含「鳄鱼大宠物」与「Zetrix / DSH pet」，且英文基线 < 分隔线 < 状态大字基线。
 - 视觉验收：`preview --demo <state>` 六张 PNG 与参考图比对；真机推六状态各一张。
-- 性能：贪心矩形化后单帧元素数仍 < 220（现有测试上限 200，需实测；若超出则调上限并把素材简化为更少矩形）。
+- 性能：贪心矩形化后单帧元素数上限 **400**（90×120 素材实测 218–284，原「<220」目标已上调；见 `src/layout.rs` 的 `layouts_obey_hub_limits`；再高应简化素材而不是拆动作）。
 
 ## Out of Scope
 

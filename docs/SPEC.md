@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.6.0 · 2026-11-18
+> 版本：0.6.1 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -94,9 +94,9 @@
 ## 4. 版式（FR-UI）
 
 **FR-UI-01 单任务详情页**
-- 内容：左上品牌「鳄鱼大宠物」12px、右上模式徽章；状态大字+图标；标题≤3 行；详情一行；进度条；等待页题干/徽章；底部两态。
+- 内容：左上品牌「鳄鱼大宠物」12px（副行「Zetrix / DSH pet」9px）、右上模式徽章；状态大字+图标；标题≤3 行；详情一行；进度条；等待页题干/徽章；底部两态。
 - 状态：已验收。
-- 证据：`out/v6-working.png`、`out/v6-waiting.png`、`out/v6-done.png`；layout 测试 52 项。
+- 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 53 项（含 layout）。
 
 **FR-UI-02 双任务**
 - 期望：两行，每行「状态图标 + 标题 2 行 + 状态短语」；不画鳄鱼；Waiting 置顶。
@@ -114,9 +114,9 @@
 - 证据：`status_glyph()` + `draw_check()` 用 `line` 图元；微软雅黑无 ✓/✕，故不再用字体符号。
 
 **FR-UI-05 品牌头**
-- 期望：只显示「鳄鱼大宠物」12px，无英文副标题、无「AI 工作搭子」；右上角保留模式徽章（演示时显示「演示」）。
+- 期望：品牌行两行——中文主行「鳄鱼大宠物」12px，英文副行「Zetrix / DSH pet」9px；无「AI 工作搭子」；右上角保留模式徽章（演示时显示「演示」）。
 - 状态：已验收。
-- 证据：测试 `header_is_brand_only_and_idle_footer_reports_device`；`out/v6-*.png`。
+- 证据：测试 `header_is_brand_only_and_idle_footer_reports_device`（断言中文 12px / 英文 9px、英文基线在分隔线之上、两行不压徽章）；`docs/screens/{live,working,waiting,done,error,stopped}.png`。
 
 **FR-UI-06 底部两态**
 - 有任务：左「上下文 N% · 剩 MK」，右花絮；空闲：左「电量 N% · Wi-Fi 良好/一般/弱」，右「等你派活」；底部永远保留。
@@ -138,22 +138,33 @@
 **FR-CROC-01 一只鳄鱼，六个动作**
 - 动作：`idle` 待命、`working` 干活、`waiting` 等你、`done` 完成、`error` 出错、`sleep` 睡觉；单帧静态，状态切换才重绘。
 - 状态：已验收。
-- 证据：`assets/croc/default/{6 动作}.png`；`sprite::draw_action` 贪心矩形化；测试 `all_actions_have_art`。
+- 证据：`assets/croc/default/{6 动作}.png`（90×120，1:1 绘制在 (300,152)）；`sprite::draw_action` 贪心矩形化；测试 `all_actions_have_art`、`actions_are_pairwise_distinct`。
 
 **FR-CROC-02 触发规则**
 - idle：无任务（含完成 5 秒后）；working：有 Working；waiting：有 Waiting；done：完成后 5 秒内；error：Error/Stopped（决定：Stopped 也走 error 动作）；sleep：连续 30 分钟无活跃任务（`model.last_active_at`）。
+- 素材从 30×40@3× 换到 90×120@1× 后，触发规则与动作选择不变。
 - 状态：已验收。
 - 证据：`layout.rs` 动作选择分支；`last_active_at` 在扫描时刷新。
 
 **FR-CROC-03 素材契约**
-- 路径 `assets/croc/default/{action}.png`；30×40 单色 PNG，3× 最近邻放大到 90×120，绘制在 (300,150)；装扮目录 `assets/croc/<outfit>/`；可选第二帧（v1 不用）。
-- 状态：已验收（占位图）；正式形象待用户提供参考图后替换。
-- 证据：6 张占位 PNG（PIL 生成脚本另存）；`sprite` 测试。
+- 路径 `assets/croc/default/{action}.png`；90×120 单色 PNG（L 模式，只含 0/255），按 1:1 直接绘制在 (300,152)，不再缩放；`sprite::draw_action(elements, x, y, action, scale)` 的 `scale` 参数保留（v1 传 1，供未来更换素材尺寸）；装扮目录 `assets/croc/<outfit>/`；可选第二帧（v1 不用）。
+- 状态：已验收。
+- 证据：6 张 90×120 PNG 由 `scripts/make_croc_v2.py` 可复现；`sprite` 测试断言尺寸 90×120、墨量 6%–50%、包围盒 ≥40×60、单帧矩形数 ≤400、不越出 (300,150)–(390,270)；未知动作不画。
 
 **FR-CROC-04 手势**
 - 单击回主页、双击静音切换、三击退出（follow=false 并释放设备）、长按无操作。
 - 状态：已验收。
 - 证据：连击 700ms 窗 + 650ms 双击落定；长按确认键日志「按规格无操作（不录音、不投递）」；原长按换造型（六套装扮）随新规格移除。
+
+**FR-CROC-05 形象 v2 风格基线**
+- 物种：gator / 短吻鳄（alligator）——圆头、短而宽的 U 形吻部、上颌盖住下颌；不画长 V 形吻与外露齿排。
+- 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），几何按 1:1 绘制在 (300,152)，`scale` 保留、v1 传 1；头身比 chibi（头部约占身高 45%）。
+- 画法：2px 实心黑描边；眼睛 2×2 白高光；肚皮 2–3 条 1px 分节线；短腿短尾。
+- 六动作：`idle` 端咖啡、`working` 敲笔记本、`waiting` 举手 + 问号、`done` 星星 + 点赞、`error` 绷带 + × 眼、`sleep` 闭眼 + Z。
+- 素材契约：`assets/croc/default/{action}.png`；六张由同一套头/身/腿/尾模板派生，是同一只；用户可用 6 个同尺寸同路径文件直接替换，不改代码。
+- 生成：`scripts/make_croc_v2.py`（4× 超采样 + MinFilter 腐蚀描边 + NEAREST 下采样，只输出 0/255）；`--icon` 另渲染 128×128 插件图标。
+- 状态：已验收。
+- 证据：`assets/croc/default/*.png`；`docs/screens/{working,waiting,done,error,stopped}.png`；`plugin/icon.png`；`src/sprite.rs` 测试 `all_actions_have_art`/`actions_are_pairwise_distinct`；设计记录 `docs/specs/croc-redesign-v2.md`、ADR 0007。
 
 ## 6. 提示音与手势（FR-AUD）
 
@@ -200,16 +211,17 @@
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `https://github.com/gator-university/zectrix-croc-pet`；本地开发用 link 目录。
 - 状态：待验证（本地 link 安装已验证；Git 地址未建仓/未发布）。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.6.0）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.6.1）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 10. 可验证性（FR-VER）
 
 **FR-VER-01 自动化**：`cargo test` 全过（≥65 项）。
-- 状态：已验收。52 lib + 15 bin = **67** 项。
+- 状态：已验收。53 lib + 15 bin = **68** 项。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
-- 状态：已验收。证据：`out/v6-{idle,working,waiting,done,error,stopped,live}.png`、`docs/screens/`。
+- 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
+- 性能目标：单帧元素上限从 220 提到 **400**（90×120 素材的贪心矩形比 30×40 多；实测 218–284，见 `src/layout.rs` 的 `layouts_obey_hub_limits`，上限 400；再高应简化素材而不是拆动作）。
 
 **FR-VER-03 真机**：关键页面推送到设备后由用户拍照确认。
 - 状态：待验证（已有实时推送日志与用户可见画面；照片待用户补）。
@@ -220,6 +232,6 @@
 ## 11. 已知限制 / 后续项
 
 - 同一时刻只能一个程序占设备（固件约束）。
-- 动作调试页（FR-SET-02 子项）、正式鳄鱼美术、GitHub 建仓与发布未做。
+- 动作调试页（FR-SET-02 子项）、GitHub 建仓与发布未做。
 - 语音输入已按 Q18 决定从设备手势移除（`voice` CLI 仍可诊断转写/粘贴链路）；如需恢复，需重新定义手势。
 - 设置页需重启 DSH 后才可见（client bundle 在启动时加载）。
