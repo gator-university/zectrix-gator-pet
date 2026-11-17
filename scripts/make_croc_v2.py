@@ -11,6 +11,7 @@
 用法：
     <bundled-python> scripts/make_croc_v2.py
     <bundled-python> scripts/make_croc_v2.py --sheet out/croc-v2-sheet.png
+    <bundled-python> scripts/make_croc_v2.py --icon      # plugin/icon.png
 """
 
 from __future__ import annotations
@@ -30,6 +31,13 @@ INK = 0
 PAPER = 255
 T = 2  # 描边宽度（最终像素）
 
+# 渲染插件图标时临时改动：几何整体乘 SCALE、平移 (OX, OY) 到方形画布 CW×CH。
+# 动作素材一律用默认值（1.0 / 0 / 0 / 90×120），输出不变。
+SCALE = 1.0
+OX = 0.0
+OY = 0.0
+CW, CH = W, H
+
 
 # ---------------------------------------------------------------------------
 # 基础绘制工具（坐标一律用最终 90×120 像素，内部乘 SS）
@@ -37,23 +45,29 @@ T = 2  # 描边宽度（最终像素）
 
 
 def canvas() -> Image.Image:
-    return Image.new("L", (W * SS, H * SS), PAPER)
+    return Image.new("L", (CW * SS, CH * SS), PAPER)
 
 
 def _box(x0: float, y0: float, x1: float, y1: float):
-    return [round(x0 * SS), round(y0 * SS), round(x1 * SS), round(y1 * SS)]
+    return [
+        round((x0 * SCALE + OX) * SS),
+        round((y0 * SCALE + OY) * SS),
+        round((x1 * SCALE + OX) * SS),
+        round((y1 * SCALE + OY) * SS),
+    ]
 
 
 def _pts(points):
-    return [(round(x * SS), round(y * SS)) for x, y in points]
+    return [(round((x * SCALE + OX) * SS), round((y * SCALE + OY) * SS)) for x, y in points]
 
 
 def _mask():
-    return Image.new("L", (W * SS, H * SS), 0)
+    return Image.new("L", (CW * SS, CH * SS), 0)
 
 
-def paint(img: Image.Image, mask: Image.Image, width: int = T) -> None:
+def paint(img: Image.Image, mask: Image.Image, width: int | None = None) -> None:
     """把 mask 当作一个实心形状：内部刷白（覆盖后面的元素），再描黑边。"""
+    width = T if width is None else width
     img.paste(PAPER, mask=mask)
     eroded = mask.filter(ImageFilter.MinFilter(width * SS * 2 + 1))
     img.paste(INK, mask=ImageChops.subtract(mask, eroded))
@@ -165,7 +179,7 @@ def draw_head(img: Image.Image) -> None:
     """圆头 + 两个眼包 + 短吻，合成一个轮廓（同一只鳄鱼）。"""
     m = _mask()
     d = ImageDraw.Draw(m)
-    d.rounded_rectangle(_box(*HEAD), radius=round(17 * SS), fill=255)
+    d.rounded_rectangle(_box(*HEAD), radius=round(17 * SCALE * SS), fill=255)
     d.polygon(_pts(SNOUT), fill=255)
     # 圆鼻尖，让短吻的前端是圆的而不是刀切的。
     d.ellipse(_box(1.5, 44.5, 9.5, 53.5), fill=255)
@@ -419,12 +433,54 @@ def render(action: str) -> Image.Image:
 
 
 def stats(im: Image.Image) -> str:
+    w, h = im.size
     raw = im.tobytes()
     ink = sum(1 for p in raw if p < 128)
-    xs = [i % W for i, p in enumerate(raw) if p < 128]
-    ys = [i // W for i, p in enumerate(raw) if p < 128]
+    xs = [i % w for i, p in enumerate(raw) if p < 128]
+    ys = [i // w for i, p in enumerate(raw) if p < 128]
     bbox = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
-    return f"ink {ink / (W * H) * 100:.1f}%  bbox {bbox[2]-bbox[0]}×{bbox[3]-bbox[1]}"
+    return f"ink {ink / (w * h) * 100:.1f}%  bbox {bbox[2]-bbox[0]}×{bbox[3]-bbox[1]}"
+
+
+def _threshold(img: Image.Image, size: int) -> Image.Image:
+    return img.resize((size, size), Image.NEAREST).point(lambda p: INK if p < 128 else PAPER)
+
+
+def _ink_bbox(img: Image.Image):
+    return img.point(lambda p: 255 - p).getbbox()
+
+
+def _head_layer() -> Image.Image:
+    img = canvas()
+    draw_head(img)
+    draw_nose(img)
+    mouth_smile(img)
+    open_eye(img, BUMP_L[0], BUMP_L[1])
+    open_eye(img, BUMP_R[0], BUMP_R[1])
+    return img
+
+
+def render_icon(size: int = 128, pad: int = 4) -> Image.Image:
+    """从同一头型模板渲染方形单色图标：3px 描边、白底、NEAREST、无灰阶。
+
+    复用动作素材的头/眼/嘴形状，按包围盒等比放大到 size×size 并居中，
+    所以图标和屏幕上的鳄鱼是同一只，不会另起一套画风。
+    """
+    global SCALE, OX, OY, CW, CH, T
+    saved = (SCALE, OX, OY, CW, CH, T)
+    try:
+        CW = CH = size
+        T = 3
+        # 先按 1:1 量头部包围盒，再等比缩放到留出 pad 的方形里并居中。
+        SCALE, OX, OY = 1.0, 0.0, 0.0
+        bbox = _ink_bbox(_threshold(_head_layer(), size))
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        SCALE = (size - 2 * pad) / max(w, h)
+        OX = (size - SCALE * (bbox[0] + bbox[2])) / 2
+        OY = (size - SCALE * (bbox[1] + bbox[3])) / 2
+        return _threshold(_head_layer(), size)
+    finally:
+        SCALE, OX, OY, CW, CH, T = saved
 
 
 def greedy_rects(im: Image.Image) -> int:
@@ -465,6 +521,12 @@ def sheet(path: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet", type=Path, default=None)
+    ap.add_argument(
+        "--icon",
+        action="store_true",
+        help="另渲染 128×128 插件图标（默认写 plugin/icon.png）",
+    )
+    ap.add_argument("--icon-out", type=Path, default=ROOT / "plugin" / "icon.png")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     for action in ACTIONS:
@@ -472,6 +534,18 @@ def main() -> None:
         path = OUT / f"{action}.png"
         im.save(path, optimize=True)
         print(f"{action:8s} {path.relative_to(ROOT)}  {stats(im)}  rects {greedy_rects(im)}")
+    if args.icon:
+        icon = render_icon()
+        args.icon_out.parent.mkdir(parents=True, exist_ok=True)
+        icon.save(args.icon_out, optimize=True)
+        try:
+            shown = args.icon_out.resolve().relative_to(ROOT)
+        except ValueError:
+            shown = args.icon_out
+        print(
+            f"icon     {shown}  "
+            f"{icon.size[0]}×{icon.size[1]}  {stats(icon)}"
+        )
     if args.sheet:
         sheet(args.sheet)
 
