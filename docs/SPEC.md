@@ -96,7 +96,7 @@
 **FR-UI-01 单任务详情页**
 - 内容：左上品牌「鳄鱼大宠物」12px（副行「Zetrix / DSH pet」9px）、右上模式徽章；状态大字+图标；标题≤3 行；详情一行；进度条；等待页题干/徽章；底部两态。
 - 状态：已验收。
-- 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 53 项（含 layout）。
+- 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 54 项（含 layout）。
 
 **FR-UI-02 双任务**
 - 期望：两行，每行「状态图标 + 标题 2 行 + 状态短语」；不画鳄鱼；Waiting 置顶。
@@ -149,7 +149,7 @@
 **FR-CROC-03 素材契约**
 - 路径 `assets/croc/default/{action}.png`；90×120 单色 PNG（L 模式，只含 0/255），按 1:1 直接绘制在 (300,152)，不再缩放；`sprite::draw_action(elements, x, y, action, scale)` 的 `scale` 参数保留（v1 传 1，供未来更换素材尺寸）；装扮目录 `assets/croc/<outfit>/`；可选第二帧（v1 不用）。
 - 状态：已验收。
-- 证据：6 张 90×120 PNG 由 `scripts/make_croc_v2.py` 可复现；`sprite` 测试断言尺寸 90×120、墨量 6%–50%、包围盒 ≥40×60、单帧矩形数 ≤400、不越出 (300,150)–(390,270)；未知动作不画。
+- 证据：6 张 90×120 PNG 由 `scripts/make_croc_v2.py` 可复现；`sprite` 测试直接解码 PNG 断言尺寸 90×120、墨量 6%–50%、包围盒 ≥40×60、单帧矩形数 ≤400、不越出 (300,152)–(390,272)；未知动作不画。
 
 **FR-CROC-04 手势**
 - 单击回主页、双击静音切换、三击退出（follow=false 并释放设备）、长按无操作。
@@ -217,11 +217,11 @@
 ## 10. 可验证性（FR-VER）
 
 **FR-VER-01 自动化**：`cargo test` 全过（≥65 项）。
-- 状态：已验收。53 lib + 15 bin = **68** 项。
+- 状态：已验收。54 lib + 15 bin = **69** 项。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
-- 性能目标：单帧元素上限从 220 提到 **400**（90×120 素材的贪心矩形比 30×40 多；实测 218–284，见 `src/layout.rs` 的 `layouts_obey_hub_limits`，上限 400；再高应简化素材而不是拆动作）。
+- 性能目标：单帧元素上限从 220 提到 **400**（90×120 素材的贪心矩形比 30×40 多；实测单帧 245–280 个场景元素 = 素材 208–274 个矩形 + 版式约 10，见 `src/layout.rs` 的 `layouts_obey_hub_limits`，上限 400；再高应简化素材而不是拆动作）。
 
 **FR-VER-03 真机**：关键页面推送到设备后由用户拍照确认。
 - 状态：待验证（已有实时推送日志与用户可见画面；照片待用户补）。
