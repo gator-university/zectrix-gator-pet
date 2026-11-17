@@ -2,6 +2,11 @@ use crate::model::{Model, ProgressSource, Status, TASKS_PER_PAGE};
 use crate::sprite;
 use serde_json::{json, Value};
 
+/// 品牌行由一行变两行后，分隔线从 y=30 下移到 y=34。分隔线以下的内容整体
+/// 下移 2px：各组元素之间的相对位置不变，同时让 22px 的状态大字与分隔线
+/// 之间留出呼吸空间，底部两态信息也不会被挤出画布。
+const BODY_SHIFT: i32 = 2;
+
 fn rect(e: &mut Vec<Value>, x: i32, y: i32, w: i32, h: i32, fill: Option<u8>) {
     let mut v = json!({"type":"rect","x":x,"y":y,"w":w,"h":h});
     if let Some(f) = fill {
@@ -198,8 +203,11 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
     let _phase = if animate { frame % 6 } else { 0 };
     let mut e = vec![];
 
-    // 品牌头：只留「鳄鱼大宠物」12px，右上角是当前模式徽章（演示时显示「演示」）。
-    text(&mut e, "鳄鱼大宠物", 16, 18, 12, 168);
+    // 品牌头：中文主行 + 英文副行，右上角是当前模式徽章（演示时显示「演示」）。
+    // 中文 12px、基线 16；英文 9px、基线 28——英文是副行，视觉权重低于中文、
+    // 高于底部注脚。两行都在徽章（y 6..26）下方、品牌行分隔线（y=34）上方。
+    text(&mut e, "鳄鱼大宠物", 16, 16, 12, 168);
+    text(&mut e, "Zetrix / DSH pet", 16, 28, 9, 168);
     let mode = if model.demo.is_some() {
         "演示"
     } else {
@@ -212,7 +220,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
     };
     rect_r(&mut e, 322, 6, 62, 20, 6, Some(0));
     text_white(&mut e, mode, 336, 21, 13, 36);
-    rect(&mut e, 16, 30, 368, 0, None);
+    rect(&mut e, 16, 34, 368, 0, None);
 
     // Waiting 永远置顶；顺序与 model.cycle 的翻页顺序保持一致。
     let active = model.display_order(now);
@@ -238,7 +246,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         } else {
             format!("{} 个任务", tasks.len())
         };
-        text(&mut e, &heading, 20, 52, 15, 320);
+        text(&mut e, &heading, 20, 52 + BODY_SHIFT, 15, 320);
         // 两个任务每个给两行；三个以上压成单行并分页，保证每行都读得全。
         let (row_height, title_max) = match tasks.len() {
             2 => (82, 2usize),
@@ -251,7 +259,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             .take(TASKS_PER_PAGE)
             .enumerate()
         {
-            let y = 62 + i as i32 * row_height;
+            let y = 62 + BODY_SHIFT + i as i32 * row_height;
             let lines = title_lines(&task.event.title, 25, title_max);
             for (k, line) in lines.iter().enumerate() {
                 text(&mut e, line, 20, y + 14 + k as i32 * 19, 16, 368);
@@ -263,7 +271,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         }
     } else if idle {
         // 待命页：没有任务时不占屏也不编造内容，只说「我在等活」。
-        text(&mut e, "待命中", 20, 58, 22, 220);
+        text(&mut e, "待命中", 20, 58 + BODY_SHIFT, 22, 220);
         text(
             &mut e,
             if model.settings.follow_enabled {
@@ -272,15 +280,15 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                 "跟随已关闭"
             },
             20,
-            88,
+            88 + BODY_SHIFT,
             15,
             368,
         );
-        text(&mut e, "有任务时自动上屏", 20, 142, 13, 368);
+        text(&mut e, "有任务时自动上屏", 20, 142 + BODY_SHIFT, 13, 368);
     } else {
         let headline = t.as_ref().map(|t| t.label()).unwrap_or("等待任务");
-        let tx = status_glyph(&mut e, state, 20, 58, 22);
-        text(&mut e, headline, tx, 58, 22, 300 - (tx - 20));
+        let tx = status_glyph(&mut e, state, 20, 58 + BODY_SHIFT, 22);
+        text(&mut e, headline, tx, 58 + BODY_SHIFT, 22, 300 - (tx - 20));
         let title = t.as_ref().map(|t| t.event.title.as_str()).unwrap_or(
             if model.settings.follow_enabled {
                 "DSH 跟随已开启"
@@ -289,7 +297,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             },
         );
         for (line, title) in title_lines(title, 25, 3).iter().enumerate() {
-            text(&mut e, title, 20, 82 + line as i32 * 19, 16, 368);
+            text(&mut e, title, 20, 82 + BODY_SHIFT + line as i32 * 19, 16, 368);
         }
         // AskUserQuestion 上屏：只显示题干 + 「回电脑处理」提示，不列选项。
         let ask = t
@@ -330,20 +338,20 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             &mut e,
             &title_lines(&detail, 40, 1).join(""),
             20,
-            142,
+            142 + BODY_SHIFT,
             13,
             280,
         );
-        // 题干放不下时的第二行（指引框上方，基线 226 不碰到框顶 236）。
+        // 题干放不下时的第二行（指引框上方，基线 226+2 不碰到框顶 236+2）。
         if let Some(q) = &ask {
             let lines = title_lines(q, 32, 2);
             if lines.len() > 1 {
-                text(&mut e, &lines[1], 20, 226, 13, 220);
+                text(&mut e, &lines[1], 20, 226 + BODY_SHIFT, 13, 220);
             }
         }
         if needs_action {
-            rect_r(&mut e, 18, 236, 122, 24, 7, Some(0));
-            text_white(&mut e, "请回到电脑确认", 30, 253, 14, 106);
+            rect_r(&mut e, 18, 236 + BODY_SHIFT, 122, 24, 7, Some(0));
+            text_white(&mut e, "请回到电脑确认", 30, 253 + BODY_SHIFT, 14, 106);
         }
         // 需要人处理时不画进度区：那条指引才是这一刻唯一要说的事。
         let progress = t.as_ref().filter(|_| !needs_action).and_then(|t| {
@@ -353,12 +361,12 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         });
         match progress {
             Some((p, source, steps)) => {
-                rect(&mut e, 20, 156, 256, 13, None);
+                rect(&mut e, 20, 156 + BODY_SHIFT, 256, 13, None);
                 if p > 0 {
                     rect(
                         &mut e,
                         23,
-                        159,
+                        159 + BODY_SHIFT,
                         (250u32 * p as u32 / 100) as i32,
                         7,
                         Some(0),
@@ -371,7 +379,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                     (ProgressSource::Todo, None) => format!("任务清单完成度 {p}%"),
                     (ProgressSource::Agent, _) => format!("Agent 上报进度 {p}%"),
                 };
-                text(&mut e, &label, 20, 184, 12, 264);
+                text(&mut e, &label, 20, 184 + BODY_SHIFT, 12, 264);
             }
             None if working => {
                 let activity = t
@@ -383,7 +391,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                     &mut e,
                     &title_lines(&format!("当前实施状态：{activity}"), 36, 1).join(""),
                     20,
-                    162,
+                    162 + BODY_SHIFT,
                     14,
                     270,
                 );
@@ -392,7 +400,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         }
     }
 
-    // 鳄鱼：单任务/待命页画在右下角 (300,150)，90×120；多任务列表整宽，不画。
+    // 鳄鱼：单任务/待命页画在右下角 (300,150+2)，90×120；多任务列表整宽，不画。
     if !multi {
         let action = if idle {
             // 连续 30 分钟没有活跃任务才睡觉；never-active 的新装状态保持 idle。
@@ -415,10 +423,10 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         } else {
             "idle"
         };
-        sprite::draw_action(&mut e, 300, 150, action, 3);
+        sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 3);
     }
 
-    rect(&mut e, 16, 271, 368, 0, None);
+    rect(&mut e, 16, 271 + BODY_SHIFT, 368, 0, None);
     // 底部两态：有任务 = 上下文占用 + 花絮；空闲 = 电量/Wi-Fi + 等你派活。
     if idle {
         let left = match (model.battery, model.rssi) {
@@ -426,8 +434,8 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             (Some(b), None) => format!("电量 {b}% · Wi-Fi 未知"),
             _ => "设备未连接".to_string(),
         };
-        text(&mut e, &left, 16, 285, 11, 190);
-        text_right(&mut e, "等你派活", 170, 285, 11, 214);
+        text(&mut e, &left, 16, 285 + BODY_SHIFT, 11, 190);
+        text_right(&mut e, "等你派活", 170, 285 + BODY_SHIFT, 11, 214);
     } else {
         let source = match t
             .as_ref()
@@ -441,7 +449,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             Some((_, agent)) if !agent.is_empty() => agent.to_string(),
             _ => "Agent 上报".to_string(),
         };
-        text(&mut e, &source, 16, 285, 11, 190);
+        text(&mut e, &source, 16, 285 + BODY_SHIFT, 11, 190);
         let quip = if model.demo.is_some() {
             "演示画面".to_string()
         } else if !model.quip.is_empty()
@@ -465,7 +473,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             &mut e,
             if needs_action { "设备仅作提示" } else { quip.as_str() },
             170,
-            285,
+            285 + BODY_SHIFT,
             11,
             214,
         );
@@ -583,6 +591,60 @@ pub fn voice_note(title: &str, detail: &str, dots: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 场景里内容匹配的第一条文本元素。
+    fn text_el<'a>(scene: &'a Value, content: &str) -> &'a Value {
+        scene["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "text" && e["content"].as_str() == Some(content))
+            .unwrap_or_else(|| panic!("场景里缺少文本「{content}」"))
+    }
+
+    /// 文本的近似墨迹竖范围：基线往上一个字号（中文字面），往下 1/4 字号（降部）。
+    /// 用来断言文字没有压到横向分隔线上。
+    fn ink_span(el: &Value) -> (i64, i64) {
+        let y = el["y"].as_i64().unwrap();
+        let size = el["size"].as_i64().unwrap_or(12);
+        (y - size, y + size / 4)
+    }
+
+    /// 整宽横向分隔线（rect, w=368, h=0）的 y 坐标：品牌行下、底部各一条。
+    fn separator_ys(scene: &Value) -> Vec<i64> {
+        scene["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["type"] == "rect" && e["w"].as_i64() == Some(368) && e["h"].as_i64() == Some(0)
+            })
+            .map(|e| e["y"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// 三段式版面（品牌行 / 版心 / 底部信息）的分界必须干净：文字不压整宽分隔线，
+    /// 也不越出 400×300 画布。
+    fn assert_bands_clear(scene: &Value) {
+        let seps = separator_ys(scene);
+        assert_eq!(seps.len(), 2, "每条场景都应有品牌行与底部两条分隔线");
+        for el in scene["elements"].as_array().unwrap() {
+            if el["type"] != "text" {
+                continue;
+            }
+            let (top, bottom) = ink_span(el);
+            assert!(top >= 0, "文字「{}」顶部越出画布：{top}", el["content"]);
+            assert!(bottom < 300, "文字「{}」底部越出画布", el["content"]);
+            for sep in &seps {
+                assert!(
+                    bottom < *sep || top > *sep,
+                    "文字「{}」压到分隔线 y={sep}（墨迹 {top}..{bottom}）",
+                    el["content"]
+                );
+            }
+        }
+    }
+
     #[test]
     fn voice_pages_stay_inside_the_canvas() {
         let targets = vec![
@@ -672,6 +734,8 @@ mod tests {
             let pages = count.div_ceil(TASKS_PER_PAGE);
             for page in 0..pages {
                 let v = draw(&m, 62, 0);
+                // 多任务列表也不能压品牌行/底部分隔线，最多 3 行 + 两条状态行。
+                assert_bands_clear(&v);
                 let e = v["elements"].as_array().unwrap();
                 let titles: Vec<_> = e
                     .iter()
@@ -852,21 +916,23 @@ mod tests {
         ] {
             m.demo = Some(s);
             for frame in 0..6 {
-                let v = draw(&m, 100, frame);
-                let e = v["elements"].as_array().unwrap();
+                let scene = draw(&m, 100, frame);
+                let e = scene["elements"].as_array().unwrap();
                 assert!(e.len() <= 200);
-                for v in e {
-                    if v["type"] == "line" {
+                // 品牌行分隔线与底部分隔线把版面切成三段：品牌两行 / 版心 / 底部信息。
+                assert_bands_clear(&scene);
+                for el in e {
+                    if el["type"] == "line" {
                         // 矢量图标（完成的对勾）：坐标是 x1/y1/x2/y2，同样必须在画布内。
-                        assert!(v["x1"].as_i64().unwrap() >= 0);
-                        assert!(v["y1"].as_i64().unwrap() >= 0);
-                        assert!(v["x2"].as_i64().unwrap() < 400);
-                        assert!(v["y2"].as_i64().unwrap() < 300);
-                        assert!(v["width"].as_i64().unwrap() >= 1);
+                        assert!(el["x1"].as_i64().unwrap() >= 0);
+                        assert!(el["y1"].as_i64().unwrap() >= 0);
+                        assert!(el["x2"].as_i64().unwrap() < 400);
+                        assert!(el["y2"].as_i64().unwrap() < 300);
+                        assert!(el["width"].as_i64().unwrap() >= 1);
                         continue;
                     }
-                    assert!(v["x"].as_i64().unwrap() >= 0);
-                    assert!(v["y"].as_i64().unwrap() < 300);
+                    assert!(el["x"].as_i64().unwrap() >= 0);
+                    assert!(el["y"].as_i64().unwrap() < 300);
                 }
             }
         }
@@ -878,12 +944,55 @@ mod tests {
         m.settings.follow_enabled = true;
         m.battery = Some(88);
         m.rssi = Some(-60);
-        let v = draw(&m, 10_000, 0).to_string();
-        assert!(v.contains("鳄鱼大宠物"), "左上只留品牌词");
+        let scene = draw(&m, 10_000, 0);
+        let v = scene.to_string();
+        assert!(v.contains("鳄鱼大宠物"), "左上保留中文品牌词");
+        assert!(v.contains("Zetrix / DSH pet"), "英文产品名作为副行上屏");
         assert!(!v.contains("AI 工作搭子"), "副标题必须删掉");
         assert!(v.contains("待命中"));
         assert!(v.contains("电量 88% · Wi-Fi 一般"));
         assert!(v.contains("等你派活"));
+
+        // 品牌行几何：中文主行 → 英文副行 → 分隔线 → 状态大字，逐层向下。
+        let zh = text_el(&scene, "鳄鱼大宠物");
+        let en = text_el(&scene, "Zetrix / DSH pet");
+        let headline = text_el(&scene, "待命中");
+        assert_eq!(zh["size"].as_i64(), Some(12), "中文主行 12px");
+        assert_eq!(en["size"].as_i64(), Some(9), "英文副行 9px");
+        let (zh_y, en_y) = (zh["y"].as_i64().unwrap(), en["y"].as_i64().unwrap());
+        assert!(zh_y < en_y, "英文基线必须在中文基线之下：{zh_y} / {en_y}");
+
+        // 右上角模式徽章底边之下才有英文副行，两者不叠。
+        let badge = scene["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "rect" && e["x"].as_i64() == Some(322))
+            .expect("右上角模式徽章必须存在");
+        assert!(
+            en_y > badge["y"].as_i64().unwrap() + badge["h"].as_i64().unwrap(),
+            "英文基线必须在徽章之下"
+        );
+
+        // 分隔线夹在英文副行（含降部）与状态大字之间。
+        let seps = separator_ys(&scene);
+        assert_eq!(seps.len(), 2, "品牌行与底部各一条分隔线");
+        let (brand_sep, footer_sep) = (seps[0], seps[1]);
+        assert!(en_y < brand_sep, "英文副行必须在品牌行分隔线之上");
+        assert!(
+            ink_span(zh).1 < brand_sep && ink_span(en).1 < brand_sep,
+            "两行品牌文字都必须完整落在分隔线之上"
+        );
+        assert!(
+            brand_sep < headline["y"].as_i64().unwrap(),
+            "分隔线必须在状态大字之上"
+        );
+        assert!(brand_sep < 40, "分隔线紧跟品牌行，不能侵占版心：{brand_sep}");
+
+        // 底部两态信息仍在底部分隔线之下、画布之内。
+        let footer = text_el(&scene, "等你派活");
+        assert!(ink_span(footer).0 > footer_sep);
+        assert!(ink_span(footer).1 < 300, "底部注脚必须留在画布内");
     }
 
     #[test]
