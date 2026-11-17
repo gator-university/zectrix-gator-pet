@@ -4,10 +4,16 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] 左上第一行「鳄鱼大宠物」12px，第二行「Zetrix / DSH pet」9px；两行左对齐，英文视觉权重低于中文
-- [ ] 分隔线在两个品牌行之下；状态大字/多任务 heading 与分隔线之间保留呼吸空间，不重叠
-- [ ] 单任务、双任务、3+ 任务、等待、完成、出错、待命各页面均不越界，底部两态信息仍完整可见
-- [ ] `src/layout.rs` 测试更新：断言场景文本同时包含「鳄鱼大宠物」与「Zetrix / DSH pet」，且英文基线 < 分隔线 < 状态大字基线
-- [ ] `cargo test` 全过；生成新版式预览 `out/v7-<state>.png` 作为证据
+<!-- 验收证据：分支 ticket/02-brand-header；提交 6dad447（品牌行中英双行）与
+3b6150e（合并 feat/croc-v2）。cargo test 68 项全过，cargo build --release 0 警告。
+测试 header_is_brand_only_and_idle_footer_reports_device / layouts_obey_hub_limits。
+截图 docs/screens/working.png（单任务页）与 docs/screens/header.png（顶部 60px ×3
+最近邻放大，展示中英双行与分隔线）。 -->
+
+- [x] 左上第一行「鳄鱼大宠物」12px，第二行「Zetrix / DSH pet」9px；两行左对齐，英文视觉权重低于中文
+- [x] 分隔线在两个品牌行之下；状态大字/多任务 heading 与分隔线之间保留呼吸空间，不重叠
+- [x] 单任务、双任务、3+ 任务、等待、完成、出错、待命各页面均不越界，底部两态信息仍完整可见
+- [x] `src/layout.rs` 测试更新：断言场景文本同时包含「鳄鱼大宠物」与「Zetrix / DSH pet」，且英文基线 < 分隔线 < 状态大字基线
+- [x] `cargo test` 全过；新版式截图 `docs/screens/{working,waiting,done,error,stopped}.png` 与头部特写 `docs/screens/header.png` 作为证据

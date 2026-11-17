@@ -8,10 +8,10 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 `Windows 10 / 11 x64` · `v0.6.1` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
 
 <p align="center">
-  <img src="docs/screens/live.png" width="420" alt="设备上的一帧：两个任务并行">
+  <img src="docs/screens/working.png" width="420" alt="设备上的一帧：单任务详情，右下角是鳄鱼大宠物">
 </p>
 
-<p align="center"><sub>400×300 的实际排版（<code>dsh-pet preview</code> 渲染）：两个任务并行时每个任务两行标题</sub></p>
+<p align="center"><sub>400×300 的实际排版（<code>dsh-pet preview</code> 渲染）：单任务详情页，右下角是 gator</sub></p>
 
 ## 它能做什么
 
@@ -129,7 +129,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 ## 从源码构建
 
 ```powershell
-cargo test                 # 53 lib + 15 bin = 68
+cargo test                 # 54 lib + 15 bin = 69
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```
@@ -150,7 +150,7 @@ assets\croc\        鳄鱼动作 PNG（default 装扮）
 assets\quips.txt    右下角花絮
 docs\SPEC.md        功能清单与逐项验收（唯一功能规格）
 docs\adr\           架构决策记录（生命周期、命名、素材、刷新、设置页、花絮、90×120 素材契约）
-docs\screens\       版式截图
+docs\screens\       版式截图（live 双任务 / working / waiting / done / error / stopped / header 头部特写）
 GLOSSARY.md         术语表
 ```
 

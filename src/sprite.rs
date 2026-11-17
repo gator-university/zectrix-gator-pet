@@ -2,7 +2,8 @@
 //! 以 1:1 画到 400×300 画布上。
 //!
 //! 素材契约（见 SPEC FR-CROC-03 / FR-CROC-05）：90×120、L 模式、阈值 <128 为墨，
-//! 画在右下角 (300,150)。v1 只有 `default` 一套；以后加装扮只需加目录。
+//! 画在右下角 (300,152)（品牌行下移 2px 后的最终基线）。v1 只有 `default` 一套；
+//! 以后加装扮只需加目录。
 //!
 //! 画法：把位图压成「贪心矩形」再交给 raster——每个矩形是场景里的一个
 //! `rect` 元素。这样一帧只有两三百个元素，比逐像素画上万像素轻得多。
@@ -115,6 +116,17 @@ fn mask(action: &str) -> &'static Vec<Vec<bool>> {
     if let Some(bytes) = embedded(action) {
         if let Ok(img) = image::load_from_memory(bytes) {
             let gray = img.to_luma8();
+            if gray.width() as usize != SPRITE_W || gray.height() as usize != SPRITE_H {
+                // mask() 每个动作只解码一次（之后走缓存），所以这里只会报一次；
+                // 坏素材不至于静默裁剪成半只鳄鱼，能在 pet.log / 测试输出里看到。
+                eprintln!(
+                    "[素材] 动作 {action} 的 PNG 是 {}×{}，契约要求 {}×{}；已按左上角裁剪",
+                    gray.width(),
+                    gray.height(),
+                    SPRITE_W,
+                    SPRITE_H
+                );
+            }
             for y in 0..SPRITE_H.min(gray.height() as usize) {
                 for x in 0..SPRITE_W.min(gray.width() as usize) {
                     if gray.get_pixel(x as u32, y as u32).0[0] < 128 {
@@ -183,10 +195,14 @@ mod tests {
     #[test]
     fn all_actions_have_art() {
         for a in ACTIONS {
-            assert!(embedded(a).is_some(), "动作 {a} 缺少 PNG");
+            let bytes = embedded(a).expect("动作缺少 PNG");
+            // 尺寸必须直接量 PNG 本身：mask() 会预分配 90×120 再 min() 拷贝，
+            // 所以掩码的边长永远等于常量，量它抓不到坏素材。
+            let img = image::load_from_memory(bytes).expect("PNG 必须可解码");
+            assert_eq!(img.width(), SPRITE_W as u32, "动作 {a} 宽度不是 90");
+            assert_eq!(img.height(), SPRITE_H as u32, "动作 {a} 高度不是 120");
+
             let m = mask(a);
-            assert_eq!(m.len(), SPRITE_W, "动作 {a} 宽度不是 90");
-            assert_eq!(m[0].len(), SPRITE_H, "动作 {a} 高度不是 120");
 
             let ink = m.iter().flatten().filter(|px| **px).count();
             let pixels = SPRITE_W * SPRITE_H;
@@ -223,18 +239,19 @@ mod tests {
             );
 
             let mut e = vec![];
-            let n = draw_action(&mut e, 300, 150, a, 1);
+            // 按出厂基线 (300,152) 画：品牌行下移 2px 后的实际位置。
+            let n = draw_action(&mut e, 300, 152, a, 1);
             assert!(n > 20, "动作 {a} 只有 {n} 个矩形，图可能空白");
-            // 90×120 线稿贪婪矩形化后约 210–280 个；上限留给未来微调。
+            // 90×120 线稿贪婪矩形化后实测 208–274 个；上限留给未来微调。
             assert!(n <= 400, "动作 {a} 矩形过多（{n}），场景会太重");
             for v in &e {
                 let x = v["x"].as_i64().unwrap();
                 let y = v["y"].as_i64().unwrap();
                 let w = v["w"].as_i64().unwrap();
                 let h = v["h"].as_i64().unwrap();
-                assert!(x >= 300 && y >= 150, "动作 {a} 有元素画到了 (300,150) 之外");
+                assert!(x >= 300 && y >= 152, "动作 {a} 有元素画到了 (300,152) 之外");
                 assert!(x + w <= 390, "动作 {a} 有元素越过右边界");
-                assert!(y + h <= 270, "动作 {a} 有元素压到底部信息线");
+                assert!(y + h <= 272, "动作 {a} 有元素压到底部信息线");
             }
         }
     }

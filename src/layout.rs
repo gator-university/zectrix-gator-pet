@@ -400,7 +400,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         }
     }
 
-    // 鳄鱼：单任务/待命页画在右下角 (300,150+2)，90×120；多任务列表整宽，不画。
+    // 鳄鱼：单任务/待命页画在右下角 (300,152)（= 150 + BODY_SHIFT），90×120；多任务列表整宽，不画。
     if !multi {
         let action = if idle {
             // 连续 30 分钟没有活跃任务才睡觉；never-active 的新装状态保持 idle。
@@ -423,7 +423,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         } else {
             "idle"
         };
-        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-CROC-04）。
+        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-CROC-03）。
         // 品牌行加高后版式整体下移 2px（ticket 02），素材跟着下移，仍不压底部分隔线。
         sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 1);
     }
@@ -920,8 +920,8 @@ mod tests {
             for frame in 0..6 {
                 let scene = draw(&m, 100, frame);
                 let e = scene["elements"].as_array().unwrap();
-                // 90×120 鳄鱼素材贪婪矩形化后单帧约 240–285 个元素（实测：素材 208–274，
-                // 版式约 10）；ticket 01 明确允许把上限从 200 提到 400，再高就该简化素材。
+                // 90×120 鳄鱼素材贪婪矩形化后，已出图的演示页实测 245–280 个场景元素
+                //（素材 208–274，版式约 10）；unknown 演示 286，仍在 400 上限内。
                 assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
                 // 品牌行分隔线与底部分隔线把版面切成三段：品牌两行 / 版心 / 底部信息。
                 assert_bands_clear(&scene);
@@ -937,6 +937,52 @@ mod tests {
                     }
                     assert!(el["x"].as_i64().unwrap() >= 0);
                     assert!(el["y"].as_i64().unwrap() < 300);
+                }
+            }
+        }
+    }
+
+    /// 鳄鱼矩形压在右下角，单任务/待命页才有；多任务列表整宽不画。
+    fn sprite_rects(scene: &Value) -> Vec<&Value> {
+        scene["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e["type"] == "rect"
+                    && e["x"].as_i64().unwrap_or(0) >= 300
+                    && e["y"].as_i64().unwrap_or(0) >= 152
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sprite_clears_footer_separator() {
+        let mut m = Model::default();
+        for s in [
+            Status::Working,
+            Status::Waiting,
+            Status::Done,
+            Status::Error,
+            Status::Stopped,
+            Status::Unknown,
+        ] {
+            m.demo = Some(s);
+            for frame in 0..6 {
+                let scene = draw(&m, 100, frame);
+                let footer_sep = *separator_ys(&scene).last().expect("底部分隔线");
+                let sprite = sprite_rects(&scene);
+                assert!(
+                    sprite.len() > 20,
+                    "演示状态 {s:?} 第 {frame} 帧没画出鳄鱼（{} 个矩形）",
+                    sprite.len()
+                );
+                for r in sprite {
+                    let bottom = r["y"].as_i64().unwrap() + r["h"].as_i64().unwrap();
+                    assert!(
+                        bottom <= footer_sep,
+                        "演示状态 {s:?} 第 {frame} 帧鳄鱼压到底部分隔线：bottom={bottom}, sep={footer_sep}"
+                    );
                 }
             }
         }
