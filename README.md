@@ -5,7 +5,7 @@
 一只像素小鳄鱼，跟着 DSH 的会话状态换动作。它是 **DeepSeek Harness 插件**：
 DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugins 里，没有别的常驻程序。
 
-`Windows 10 / 11 x64` · `v0.6.1` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
+`Windows 10 / 11 x64` · `v0.7.0` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
 
 <p align="center">
   <img src="docs/screens/working.png" width="420" alt="设备上的一帧：单任务详情，右下角是鳄鱼大宠物">
@@ -81,8 +81,8 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 - 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），按 1:1 直接画在右下角 `(300,152)`，不再放大
 - 风格基线：gator（短吻鳄）——圆头、短宽 U 吻、2px 实心描边、白高光眼睛、浅色肚皮分节线
 - 今后装扮：`assets/croc/<outfit>/<action>.png`，默认 `default`；可选第二帧 `<action>-2.png`（v1 不用）
-- 六张由 `scripts/make_croc_v2.py` 用同一套头/身/腿/尾模板生成，可复现；`--icon` 另出 `plugin/icon.png`
-- 替换形象：用同尺寸、同路径的 6 个文件覆盖即可，不用改代码（契约见 `docs/adr/0007-croc-asset-contract-90x120.md`）
+- 六张母版在 `art/gen-v3/`（gpt-image-2 / image edit 生成，同一角色），转换脚本 `scripts/prep_croc_art.py` 统一裁剪 → 90×120 二值化，并顺带生成 `plugin/icon.png`
+- 替换形象：用同尺寸、同路径的 6 个文件覆盖即可，不用改代码（契约见 `docs/adr/0007-croc-asset-contract-90x120.md`；素材来源见 `docs/adr/0008-ai-generated-croc-art.md`）
 
 ## 花絮（右下角句子）
 

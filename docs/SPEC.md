@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.6.1 · 2026-11-18
+> 版本：0.7.0 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -156,15 +156,15 @@
 - 状态：已验收。
 - 证据：连击 700ms 窗 + 650ms 双击落定；长按确认键日志「按规格无操作（不录音、不投递）」；原长按换造型（六套装扮）随新规格移除。
 
-**FR-CROC-05 形象 v2 风格基线**
+**FR-CROC-05 形象风格基线（v3：AI 生成线稿）**
 - 物种：gator / 短吻鳄（alligator）——圆头、短而宽的 U 形吻部、上颌盖住下颌；不画长 V 形吻与外露齿排。
-- 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），几何按 1:1 绘制在 (300,152)，`scale` 保留、v1 传 1；头身比 chibi（头部约占身高 45%）。
-- 画法：2px 实心黑描边；眼睛 2×2 白高光；肚皮 2–3 条 1px 分节线；短腿短尾。
-- 六动作：`idle` 端咖啡、`working` 敲笔记本、`waiting` 举手 + 问号、`done` 星星 + 点赞、`error` 绷带 + × 眼、`sleep` 闭眼 + Z。
-- 素材契约：`assets/croc/default/{action}.png`；六张由同一套头/身/腿/尾模板派生，是同一只；用户可用 6 个同尺寸同路径文件直接替换，不改代码。
-- 生成：`scripts/make_croc_v2.py`（4× 超采样 + MinFilter 腐蚀描边 + NEAREST 下采样，只输出 0/255）；`--icon` 另渲染 128×128 插件图标。
+- 风格：粗黑描边卡通风、白高光眼、浅色肚皮分节线、短肢体；头身比 chibi（头部约占身高 45%）。
+- 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），按 1:1 绘制在 (300,152)，`scale` 保留、v1 传 1。
+- 六动作：`idle` 端咖啡、`working` 桌前敲笔记本、`waiting` 举手 + 问号、`done` 点赞 + 星星、`error` 创可贴 + × 眼 + 汗、`sleep` 蜷卧闭眼 + Z。
+- 素材契约：`assets/croc/default/{action}.png`，用户可用 6 个同尺寸同路径文件直接替换，不改代码（ADR 0007）。
+- 生成：母版 `art/gen-v3/*.png` 由 gpt-image-2（image edit 模式；idle 以用户参考图为基准、其余以 idle 为角色基准）生成并入库存 512px；`scripts/prep_croc_art.py` 统一裁剪并转换 90×120 二值图，顺带生成 `plugin/icon.png`（ADR 0008）。
 - 状态：已验收。
-- 证据：`assets/croc/default/*.png`；`docs/screens/{working,waiting,done,error,stopped}.png`；`plugin/icon.png`；`src/sprite.rs` 测试 `all_actions_have_art`/`actions_are_pairwise_distinct`；设计记录 `docs/specs/croc-redesign-v2.md`、ADR 0007。
+- 证据：`assets/croc/default/*.png`；`docs/screens/{working,waiting,done,error,stopped}.png`；`plugin/icon.png`；`src/sprite.rs` 测试 `all_actions_have_art`/`actions_are_pairwise_distinct`；`art/gen-v3/` 母版；设计记录 `docs/specs/croc-redesign-v2.md`、ADR 0007/0008。
 
 ## 6. 提示音与手势（FR-AUD）
 
@@ -211,7 +211,7 @@
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `https://github.com/gator-university/zectrix-croc-pet`；本地开发用 link 目录。
 - 状态：待验证（本地 link 安装已验证；Git 地址未建仓/未发布）。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.6.1）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.0）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 10. 可验证性（FR-VER）
