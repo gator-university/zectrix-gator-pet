@@ -1,0 +1,39 @@
+{
+  "name": "zectrix-croc-pet",
+  "version": "0.6.0",
+  "private": true,
+  "description": "鳄鱼大宠物：把 DeepSeek Harness 的会话状态推到 Zectrix Note 4 墨水屏。",
+  "type": "module",
+  "license": "MIT",
+  "author": "gator-university",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "dsh": ">=0.2.1-alpha.2"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./dsh.bundle.patch"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "slots"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "dsh.bundle.patch",
+    "icon.png",
+    "locales",
+    "bin"
+  ]
+}

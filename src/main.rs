@@ -1,7 +1,7 @@
-//! ZECTRIX Note 4 像素宠物（WorkBuddy 版）。
+//! ZECTRIX Note 4 像素宠物（DeepSeek Harness 版）。
 //!
 //! 复用 zectrix-agent-pet 的状态模型、布局与音效逻辑，把原来的 Hub 运行时替换为
-//! 本机光栅化 + zectrix-sdk 局域网直连，并把 Codex 会话跟随换成 WorkBuddy 跟随。
+//! 本机光栅化 + zectrix-sdk 局域网直连，并把 Codex 会话跟随换成 DeepSeek Harness 跟随。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,14 +9,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
-use workbuddy_pet::{
+use dsh_pet::{
     device, layout,
     model::{Event as TaskEvent, Model, Status, Task},
     raster::{self, Fonts},
     sound,
     sprite::Skin,
     uia, voice,
-    workbuddy::{open_readonly_db, Watcher},
+    dsh::Watcher,
 };
 use zectrix_sdk::{Device, ImageFormat};
 
@@ -28,11 +28,11 @@ fn data_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    let dir = base.join("zectrix-workbuddy-pet");
-    // 从早期 workbuddy-pet 版本升级上来时把状态搬过来（只复制、不删源），
+    let dir = base.join("zectrix-dsh-pet");
+    // 从早期 dsh-pet 版本升级上来时把状态搬过来（只复制、不删源），
     // 这样任务历史与设置不会因为换目录而丢。已有新目录就不动。
     if !dir.join("state.json").exists() {
-        let old = base.join("zectrix-workbuddy-pet").join("state.json");
+        let old = base.join("zectrix-dsh-pet").join("state.json");
         if old.is_file() {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::copy(&old, dir.join("state.json"));
@@ -49,30 +49,30 @@ fn out_dir() -> PathBuf {
     data_dir().join("out")
 }
 
-fn workbuddy_root() -> PathBuf {
-    if let Ok(p) = std::env::var("PET4_WORKBUDDY_ROOT") {
+fn dsh_root() -> PathBuf {
+    if let Ok(p) = std::env::var("PET4_DSH_ROOT") {
         return PathBuf::from(p);
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".workbuddy").join("projects")
+    PathBuf::from(home).join(".dsh").join("sessions")
 }
 
-/// 本机是否还有 WorkBuddy 在跑。只看进程名，不读任何对话内容。
-fn workbuddy_running() -> bool {
+/// 本机是否还有 DeepSeek Harness 在跑。只看进程名，不读任何对话内容。
+fn dsh_running() -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let out = std::process::Command::new("tasklist")
-            .args(["/NH", "/FI", "IMAGENAME eq WorkBuddy.exe"])
+            .args(["/NH", "/FI", "IMAGENAME eq DeepSeek Harness.exe"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout)
                 .to_ascii_lowercase()
-                .contains("workbuddy.exe"),
+                .contains("deepseek harness.exe"),
             Err(_) => false,
         }
     }
@@ -94,17 +94,71 @@ fn startup_dir() -> Option<PathBuf> {
 }
 
 fn autostart_entry() -> Option<PathBuf> {
-    startup_dir().map(|d| d.join("zectrix-workbuddy-pet.vbs"))
+    startup_dir().map(|d| d.join("zectrix-dsh-pet.vbs"))
 }
+
+/// 控制面板快捷方式：开始菜单 + 桌面。装好后不用记路径、不用敲命令。
+fn panel_shortcut_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        out.push(
+            PathBuf::from(appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("DSH 宠物.lnk"),
+        );
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let desktop = PathBuf::from(home).join("Desktop");
+        if desktop.is_dir() {
+            out.push(desktop.join("DSH 宠物.lnk"));
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn write_panel_shortcut(exe: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let esc = |s: &str| s.replace('\'', "''");
+    let work = exe
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    for lnk in panel_shortcut_paths() {
+        let script = format!(
+            "$W=New-Object -ComObject WScript.Shell; $s=$W.CreateShortcut('{}'); \
+             $s.TargetPath='{}'; $s.WorkingDirectory='{}'; $s.Description='DSH 宠物 控制面板'; $s.Save()",
+            esc(&lnk.display().to_string()),
+            esc(&exe.display().to_string()),
+            esc(&work)
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+}
+
+#[cfg(not(windows))]
+fn write_panel_shortcut(_exe: &Path) {}
 
 fn watch_script() -> PathBuf {
     data_dir().join("watch.cmd")
 }
 
+/// 计划任务用的看门狗启动脚本：wscript 以隐藏窗口运行，避免出现可见命令行窗口。
+fn supervise_script() -> PathBuf {
+    data_dir().join("supervise.vbs")
+}
+
 /// 自启、计划任务统一指向这份副本：`target\release` 会被 `cargo clean` 抹掉，
 /// 拿构建目录当安装目录，早晚会出现「自启项还在、exe 没了」的静默失效。
 fn guard_bin() -> PathBuf {
-    data_dir().join("bin").join("workbuddy-pet.exe")
+    data_dir().join("bin").join("dsh-pet.exe")
 }
 
 fn heartbeat_path() -> PathBuf {
@@ -128,9 +182,6 @@ fn stop_flag() -> PathBuf {
 /// 心跳多久算新鲜。守护每 5 秒写一次，留 4 倍余量，避免一次磁盘抖动误判为死。
 const HEARTBEAT_FRESH: i64 = 20;
 
-/// 看门狗 10 秒一次检查，留同样的余量。
-const SUPERVISE_FRESH: i64 = 40;
-
 /// 心跳文件内容：第一行 PID，第二行时间戳。
 fn parse_heartbeat(text: &str) -> Option<(u32, i64)> {
     let mut it = text.lines();
@@ -145,11 +196,6 @@ fn write_heartbeat() {
     let _ = std::fs::write(heartbeat_path(), body);
 }
 
-fn write_supervise_heartbeat() {
-    let body = format!("{}\n{}", std::process::id(), now());
-    let _ = std::fs::write(supervise_heartbeat_path(), body);
-}
-
 /// 心跳是否够新。这条路径被看门狗每 10 秒走一次，所以不查进程表——
 /// 只看时间戳，避免每 10 秒拉起一次 tasklist。真正的「进程还在不在」由
 /// `daemon.lock` 里的 PID 在启动时判定。
@@ -161,28 +207,6 @@ fn heartbeat_fresh(path: &Path, fresh: i64) -> Option<(u32, i64)> {
 
 fn guard_alive() -> bool {
     heartbeat_fresh(&heartbeat_path(), HEARTBEAT_FRESH).is_some()
-}
-
-fn supervise_alive() -> bool {
-    heartbeat_fresh(&supervise_heartbeat_path(), SUPERVISE_FRESH).is_some()
-}
-
-/// 更严格的一份判断：心跳新鲜 **且** 该 PID 确实是本程序。
-/// 给一次性命令用（`autostart on/status`、`ensure`）——这些场景几十毫秒不算贵，
-/// 但结论必须准：刚被结束的进程心跳还会新鲜 20 秒，只看心跳会误报「在运行」。
-fn process_running(path: &Path, fresh: i64) -> bool {
-    match heartbeat_fresh(path, fresh) {
-        Some((pid, _)) => pid_is_ours(pid),
-        None => false,
-    }
-}
-
-fn guard_running() -> bool {
-    process_running(&heartbeat_path(), HEARTBEAT_FRESH)
-}
-
-fn supervise_running() -> bool {
-    process_running(&supervise_heartbeat_path(), SUPERVISE_FRESH)
 }
 
 /// 该 PID 是否确实是本程序。只在启动抢锁与 `autostart off` 时调用，频率很低，
@@ -200,7 +224,7 @@ fn pid_is_ours(pid: u32) -> bool {
     };
     String::from_utf8_lossy(&out.stdout)
         .to_ascii_lowercase()
-        .contains("workbuddy-pet.exe")
+        .contains("dsh-pet.exe")
 }
 
 #[cfg(not(windows))]
@@ -236,7 +260,7 @@ fn claim_instance() -> bool {
             return true;
         }
         let Ok(handle) = (unsafe {
-            CreateMutexW(None, BOOL(1), w!("Local\\zectrix-workbuddy-pet-daemon"))
+            CreateMutexW(None, BOOL(1), w!("Local\\zectrix-dsh-pet-daemon"))
         }) else {
             return false;
         };
@@ -309,43 +333,9 @@ fn stop_running() {
     let _ = std::fs::remove_file(lock_path());
 }
 
-/// 拉起守护：优先走 `watch.cmd`（它自带 10 秒重启循环，崩溃能自愈），
-/// 没有脚本时直接起本进程的 `watch`。两种方式都在后台、无窗口、脱离当前会话。
-/// 常驻进程一律用已安装副本：从 `target\release` 里跑起来的那份，
-/// 会在 `cargo clean` 后变成指向空气的进程。
-fn installed_exe() -> PathBuf {
-    let bin = guard_bin();
-    if bin.is_file() {
-        bin
-    } else {
-        std::env::current_exe().unwrap_or(bin)
-    }
-}
-
-fn append_log() -> Result<(std::fs::File, std::fs::File)> {
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(data_dir().join("watch.log"))?;
-    let err = log.try_clone()?;
-    Ok((log, err))
-}
-
-fn detach(cmd: &mut std::process::Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW 不弹黑框；DETACHED_PROCESS 让它不随当前控制台退出。
-        // 注意这两个标志**不能**让它脱离作业对象（job）：`ensure` 被 WorkBuddy 的
-        // hook 调用时，子进程会跟着进同一个 job，回合结束 job 关闭就被一起清掉，
-        // 日志里连一句收尾都没有。真要脱离，得让服务进程代为创建（见 `task_register`）。
-        cmd.creation_flags(0x0800_0000 | 0x0000_0008);
-    }
-}
-
 /// 承载看门狗的计划任务名。
 #[cfg(windows)]
-const TASK_NAME: &str = "zectrix-workbuddy-pet";
+const TASK_NAME: &str = "zectrix-dsh-pet";
 
 /// 任务注册成功后落的标记。判断「有没有装过任务」只读这个文件，不再去调
 /// `schtasks /query`：那个调用在受限环境里会被安全策略拦掉，连调用者一起终止，
@@ -370,86 +360,13 @@ fn schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 
-/// 注册计划任务：每分钟触发一次 `supervise`。
-///
-/// 触发频率选 1 分钟，是因为它同时承担「首次启动」和「被杀后自愈」两件事，
-/// 而 Task Scheduler 默认的多实例策略是 IgnoreNew——看门狗已经在跑时，
-/// 这一分钟的触发**不会**再创建进程，只有它不在了才会起一份。
-/// 恢复窗口因此是 1 分钟，代价接近零。
-///
-/// 关键在于：任务由任务计划服务（svchost）创建进程，父进程不是调用方，
-/// 不继承 WorkBuddy 给 hook 的那个作业对象。直接 `spawn` 的看门狗会被
-/// 回合结束时的 job 清理连带杀掉——日志里连一句收尾都没有，这正是
-/// 「守护每隔几分钟消失一次」的根因。
-#[cfg(windows)]
-fn task_register(exe: &Path) -> Result<()> {
-    let tr = format!("\"{}\" supervise", exe.display());
-    let out = schtasks(&[
-        "/create", "/tn", TASK_NAME, "/tr", &tr, "/sc", "minute", "/mo", "1", "/f",
-    ])
-    .context("调用 schtasks 失败")?;
-    if !out.status.success() {
-        // schtasks 的输出是控制台代码页（中文系统为 GBK），原样转 UTF-8 只会是乱码，
-        // 这里只保留退出码；要看具体原因，用户在 PowerShell 里跑一次同样的命令即可。
-        anyhow::bail!("注册计划任务失败（退出码 {:?}）", out.status.code());
-    }
-    // 标记必须在任务真的建成之后写，否则 status 会谎报「已托管」。
-    let _ = std::fs::write(task_marker(), TASK_NAME);
-    Ok(())
-}
-
 /// 停任务并删除。先 `end` 再 `delete`：只删不体会留下一个正在跑的实例。
 #[cfg(windows)]
 fn task_remove() {
     let _ = schtasks(&["/end", "/tn", TASK_NAME]);
     let _ = schtasks(&["/delete", "/tn", TASK_NAME, "/f"]);
     let _ = std::fs::remove_file(task_marker());
-}
-
-/// 当前进程是否在某个作业对象里。
-///
-/// hook 调 `ensure` 时，WorkBuddy 会把这一串进程塞进 job，回合结束整组清掉。
-/// 看门狗要是从这种环境启动，就一定活不长——它得让位给计划任务拉起的那份。
-#[cfg(windows)]
-fn in_job() -> bool {
-    use windows::Win32::Foundation::BOOL;
-    use windows::Win32::System::JobObjects::IsProcessInJob;
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    let mut result = BOOL(0);
-    unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut result).is_ok() && result.as_bool() }
-}
-
-fn start_guard() -> Result<()> {
-    use std::process::{Command, Stdio};
-
-    std::fs::create_dir_all(data_dir())?;
-    let (log, err) = append_log()?;
-    let mut cmd = Command::new(installed_exe());
-    cmd.arg("watch").stdin(Stdio::null()).stdout(log).stderr(err);
-    if let Some(t) = load_store().target {
-        cmd.arg("--target").arg(t);
-    }
-    detach(&mut cmd);
-    cmd.spawn().context("拉起守护进程失败")?;
-    Ok(())
-}
-
-/// 直接拉起看门狗（常驻，发现守护不在就补一份）。
-///
-/// 这条路径只在「计划任务还没装」或「调用方本来就干净」时用。装过任务之后，
-/// 常驻那份由任务计划服务每分钟检查一次，被杀了也不会超过 1 分钟没人管。
-fn start_supervise() -> Result<()> {
-    use std::process::{Command, Stdio};
-    std::fs::create_dir_all(data_dir())?;
-    let (log, err) = append_log()?;
-    let mut cmd = Command::new(installed_exe());
-    cmd.arg("supervise")
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(err);
-    detach(&mut cmd);
-    cmd.spawn().context("拉起看门狗失败")?;
-    Ok(())
+    let _ = std::fs::remove_file(supervise_script());
 }
 
 /// 复制 exe，遇到「文件被占用」（ERROR_SHARING_VIOLATION / ACCESS_DENIED）时重试：
@@ -471,10 +388,10 @@ fn copy_with_retry(from: &Path, to: &Path, budget: std::time::Duration) -> std::
 }
 
 fn write_autostart(target: Option<&str>) -> Result<()> {
-    let current = std::env::current_exe().context("无法定位 workbuddy-pet.exe")?;
+    let current = std::env::current_exe().context("无法定位 dsh-pet.exe")?;
     let log = data_dir().join("watch.log");
     std::fs::create_dir_all(data_dir())?;
-    // 旧版本用 watch.cmd + stopped.flag 做自愈，现在由看门狗接管，删掉以免残留生效。
+    // 旧版本用 watch.cmd + stopped.flag 做自愈，现在由面板自己托管守护，删掉以免残留生效。
     let _ = std::fs::remove_file(watch_script());
     let _ = std::fs::remove_file(stop_flag());
 
@@ -486,19 +403,15 @@ fn write_autostart(target: Option<&str>) -> Result<()> {
         if let Some(dir) = installed.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // 副本可能正被看门狗或守护执行，而 Windows 不允许覆盖运行中的 exe。
-        // 不先停掉的话，「下载新 exe 再跑一次 autostart on」这条升级路径会静默
-        // 留在旧版本——用户以为换了版本，实际还在跑上一版。
-        if installed.is_file() && (supervise_running() || guard_alive()) {
-            println!("检测到旧版本仍在运行，先停掉再替换副本…");
+        if installed.is_file() && guard_alive() {
+            println!("检测到旧版本的守护仍在运行，先停掉再替换副本…");
             stop_running();
         }
         match copy_with_retry(&current, &installed, std::time::Duration::from_secs(5)) {
             Ok(_) => exe = installed.clone(),
             Err(e) if installed.is_file() => {
-                // 进程刚被杀时映像还要一会儿才释放，重试也没成功就沿用旧副本。
                 eprintln!("无法覆盖已安装副本（{e}），继续使用 {}", installed.display());
-                eprintln!("要换版本：先 `workbuddy-pet autostart off`，再执行一次 on。");
+                eprintln!("要换版本：先在面板里退出，再执行一次 autostart on。");
                 exe = installed.clone();
             }
             Err(e) => {
@@ -507,27 +420,23 @@ fn write_autostart(target: Option<&str>) -> Result<()> {
         }
     }
 
+    // 登录自启现在只拉起**控制面板**（隐藏到托盘），由面板自己启动/管理守护；
+    // 不再注册计划任务、不再有独立看门狗进程。
     let entry = autostart_entry().context("找不到启动文件夹（%APPDATA%）")?;
-    // 登录时拉起的是**看门狗**而不是守护本身：看门狗常驻，发现守护不在就补一份，
-    // 所以守护被结束、或被更新覆盖后，不用等下一次登录就能回来。
     let vbs = format!(
-        "' Generated by \"workbuddy-pet autostart on\": start the watchdog hidden at login.\r\n\
-         CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" supervise\", 0, False\r\n",
+        "' Generated by \"dsh-pet autostart on\": start the control panel in the tray at login.\r\n\
+         CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" panel --tray\", 0, False\r\n",
         exe.display()
     );
     std::fs::write(&entry, vbs)?;
 
-    // 登录自启交给启动文件夹；计划任务只负责「由服务进程创建看门狗」。
-    // 注册失败不致命（vbs 仍能让它开机起来），但要说明后果：
-    // 没有任务时，hook 补起来的看门狗仍在 WorkBuddy 的作业对象里，会被回合清理。
+    // 清掉旧版本的计划任务/看门狗脚本，避免升级后两套控制逻辑打架。
     #[cfg(windows)]
-    match task_register(&exe) {
-        Ok(()) => println!("已注册计划任务：{TASK_NAME}（由任务计划服务托管，不受 WorkBuddy 回合影响）"),
-        Err(e) => {
-            eprintln!("注册计划任务失败：{e:#}");
-            eprintln!("　守护仍能开机自启，但被 WorkBuddy 的 hook 补起来那几份活不过一个回合。");
-        }
+    if task_installed() {
+        task_remove();
+        println!("已移除旧版计划任务：{TASK_NAME}");
     }
+    let _ = std::fs::remove_file(supervise_script());
 
     if let Some(t) = target.filter(|t| !t.trim().is_empty()) {
         // 记住目标，之后 info/status 与自动发现都不会因为没带参数而失效。
@@ -535,213 +444,68 @@ fn write_autostart(target: Option<&str>) -> Result<()> {
         store.target = Some(t.to_string());
         save_store(&store)?;
     }
-    println!("已设置自启：{}", entry.display());
-    println!("守护程序：{}", exe.display());
+    // 开始菜单/桌面放一个「DSH 宠物」快捷方式，双击就是控制面板（不带参数 = 面板）。
+    write_panel_shortcut(&exe);
+    println!("已设置开机启动：{}（登录后隐藏到托盘）", entry.display());
+    println!("控制面板：开始菜单或桌面「DSH 宠物」（也可以直接双击 dsh-pet.exe）");
+    println!("程序：{}", exe.display());
     println!("日志：{}", log.display());
     Ok(())
 }
 
-fn clear_autostart() -> Result<()> {
-    // 先删计划任务：它每分钟就会再起一份看门狗，先停进程等于白停。
-    #[cfg(windows)]
-    if task_installed() {
-        task_remove();
-        println!("已删除计划任务：{TASK_NAME}");
-    }
-    if let Some(entry) = autostart_entry() {
-        match std::fs::remove_file(&entry) {
-            Ok(()) => println!("已移除自启项：{}", entry.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("没有设置过自启。"),
-            Err(e) => return Err(e.into()),
+/// 只清理「开机自启」相关产物，不碰正在运行的面板/守护。
+/// 面板里的开关用这个；命令行 `autostart off` 会额外停掉后台进程。
+/// 旧版本（控制面板/托盘/开机自启）留下的东西：登录自启脚本、桌面与开始菜单快捷方式。
+/// 插件形态不再需要它们；升级后第一次启动自动清掉，避免两套逻辑抢设备。
+fn retire_legacy_autostart() {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let base = PathBuf::from(appdata);
+        targets.push(
+            base.join(r"Microsoft\Windows\Start Menu\Programs\Startup\zectrix-dsh-pet.vbs"),
+        );
+        targets.push(
+            base.join(r"Microsoft\Windows\Start Menu\Programs\Startup\croc-pet.vbs"),
+        );
+        let programs = base.join(r"Microsoft\Windows\Start Menu\Programs");
+        for name in ["DSH 宠物.lnk", "鳄鱼大宠物.lnk"] {
+            targets.push(programs.join(name));
         }
     }
-    // 顺序要紧：看门狗先停，否则它会在 10 秒内把守护再拉起来。
-    stop_running();
-    let _ = std::fs::remove_file(watch_script());
-    println!("已停止看门狗与守护进程。");
-    Ok(())
-}
-
-fn cmd_autostart(args: &Args) -> Result<()> {
-    let action = args
-        .get("action")
-        .or_else(|| args.get("arg0"))
-        .unwrap_or("status")
-        .to_ascii_lowercase();
-    let store = load_store();
-    let skin = Skin::parse(&store.model.settings.pet_skin).unwrap_or_default();
-    let target = args.get("target").map(str::to_string).or(store.target);
-    match action.as_str() {
-        "on" | "enable" | "install" => {
-            write_autostart(target.as_deref())?;
-            // 装完立刻起来，别让用户等到下次登录——「跟随 WorkBuddy」不该有这段空窗。
-            if supervise_running() {
-                println!("看门狗已在运行，未重复启动。");
-            } else {
-                start_supervise()?;
-                println!("已立即启动看门狗；它会维持守护，WorkBuddy 一出现即可跟随。");
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        for name in ["DSH 宠物.lnk", "鳄鱼大宠物.lnk"] {
+            targets.push(PathBuf::from(&profile).join("Desktop").join(name));
+        }
+    }
+    for path in targets {
+        if path.exists() {
+            if std::fs::remove_file(&path).is_ok() {
+                println!("已清理旧版启动项：{}", path.display());
             }
         }
-        "off" | "disable" | "uninstall" => clear_autostart()?,
-        "status" => {
-            let entry = autostart_entry();
-            println!(
-                "自启项：{}",
-                match entry.as_ref().map(|p| p.exists()) {
-                    Some(true) => format!("已启用（{}）", entry.unwrap().display()),
-                    _ => "未设置".into(),
-                }
-            );
-            #[cfg(windows)]
-            println!(
-                "计划任务：{}",
-                if task_installed() {
-                    format!("已注册（{TASK_NAME}，每分钟检查一次，由任务计划服务托管）")
-                } else {
-                    "未注册（重跑 autostart on 可让守护不受 WorkBuddy 回合影响）".into()
-                }
-            );
-            println!(
-                "守护程序：{}",
-                if guard_bin().is_file() {
-                    guard_bin().display().to_string()
-                } else {
-                    "未安装（尚未执行 autostart on）".into()
-                }
-            );
-            match heartbeat_fresh(&supervise_heartbeat_path(), SUPERVISE_FRESH) {
-                Some((pid, ts)) if pid_is_ours(pid) => println!(
-                    "看门狗：运行中（pid {pid}，心跳 {} 秒前）",
-                    now() - ts
-                ),
-                Some((_, ts)) => println!(
-                    "看门狗：已停止（最后心跳 {} 秒前）",
-                    now() - ts
-                ),
-                None => println!("看门狗：未运行"),
+    }
+}
+
+/// 指定的进程是否还活着（父进程用来看面板是否被结束）。
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut code = 0u32;
+                let ok = GetExitCodeProcess(handle, &mut code).is_ok();
+                let _ = CloseHandle(handle);
+                ok && code == STILL_ACTIVE
             }
-            match heartbeat_fresh(&heartbeat_path(), HEARTBEAT_FRESH) {
-                Some((pid, ts)) if pid_is_ours(pid) => println!(
-                    "守护进程：运行中（pid {pid}，心跳 {} 秒前）",
-                    now() - ts
-                ),
-                Some((_, ts)) => println!(
-                    "守护进程：已停止（最后心跳 {} 秒前）",
-                    now() - ts
-                ),
-                None => println!("守护进程：未运行（没有心跳文件）"),
-            }
-            println!(
-                "保存的目标：{}",
-                target.unwrap_or_else(|| "（自动发现）".into())
-            );
-            println!("当前造型：{}（{}）", skin.name(), skin.id());
-            println!(
-                "WorkBuddy 进程：{}",
-                if workbuddy_running() {
-                    "正在运行"
-                } else {
-                    "未运行"
-                }
-            );
-        }
-        other => anyhow::bail!("未知动作 {other}，可用 on / off / status"),
-    }
-    Ok(())
-}
-
-/// 看门狗：常驻，每隔 10 秒确认守护还在，不在就补一份。
-/// 为什么需要它——启动文件夹只在登录那一刻执行一次，进程被结束、被更新覆盖、
-/// 或者自启装好之后根本没重新登录，都会出现「WorkBuddy 在跑、却没人推」。
-/// 它自己也是本程序，心跳写 `watchdog.hb`，`autostart status` 与 `off` 都看这个。
-async fn cmd_supervise(_args: &Args) -> Result<()> {
-    if supervise_taken() {
-        // 已有看门狗在跑：直接退出，不打印——登录自启与手动启动会同时触发，
-        // 安静的第二次启动才不会在日志里制造「启动了两份」的错觉。
-        return Ok(());
-    }
-    // 装了计划任务、而自己正处在作业对象里：这份活不过一个回合，占位反而会把
-    // 真正长命的那份挡在门外（`supervise_taken` 只看心跳新鲜）。
-    #[cfg(windows)]
-    if task_installed() && in_job() {
-        return Ok(());
-    }
-    println!(
-        "看门狗已启动（每 10 秒检查守护）：{}",
-        chrono::Local::now().format("%H:%M:%S")
-    );
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tick.tick().await;
-        write_supervise_heartbeat();
-        if guard_alive() {
-            continue;
-        }
-        match start_guard() {
-            Ok(()) => println!(
-                "[{}] 守护不在，已拉起",
-                chrono::Local::now().format("%H:%M:%S")
-            ),
-            Err(e) => eprintln!("拉起守护失败：{e}"),
+            Err(_) => false,
         }
     }
 }
-
-/// 看门狗自己判断「是否已有一份在跑」，也给 `ensure` 用。
-///
-/// Windows 上要求心跳新鲜**且** PID 确实是本程序：一个刚死掉的看门狗会留下
-/// 最长 20 秒的假心跳，只看心跳的话，紧接着被拉起的这一份会立刻自我否决、
-/// 直接退出，于是「谁都没在跑」。非 Windows 平台没有 PID 核验手段，
-/// 退回只看心跳，宁可漏启动一次也不重复常驻。
-fn supervise_taken() -> bool {
-    if cfg!(windows) {
-        supervise_running()
-    } else {
-        supervise_alive()
-    }
-}
-
-/// 一次性检查：守护不在就拉起。给脚本/人工用，幂等，几十毫秒结束。
-fn cmd_ensure(args: &Args) -> Result<()> {
-    let verbose = args.get("verbose").is_some();
-    let mut started = Vec::new();
-
-    // 计划任务装好、而当前又身处作业对象时，什么都不要拉：
-    // 从这里 spawn 出去的看门狗会被塞进 WorkBuddy 的 hook job，回合结束整组清掉，
-    // 反而是「起来了又消失」。交给任务计划服务，它每分钟检查一次，最多 1 分钟接管。
-    #[cfg(windows)]
-    if task_installed() && in_job() {
-        if verbose {
-            println!("计划任务已托管守护（每分钟检查一次），本进程在作业对象里，不另起一份。");
-        }
-        return Ok(());
-    }
-
-    if !guard_running() {
-        start_guard()?;
-        started.push("守护");
-    }
-    // 看门狗才是兜底：它不在，守护一死就只能等下一次 hook 或登录。
-    // 以前这里只看守护，结果 hook 每次都能把守护拉回来，却永远补不上看门狗。
-    if !supervise_taken() {
-        start_supervise()?;
-        started.push("看门狗");
-    }
-    if started.is_empty() {
-        if verbose {
-            println!("看门狗与守护都在运行，无需拉起。");
-        }
-        return Ok(());
-    }
-    println!(
-        "[{}] 已拉起{}",
-        chrono::Local::now().format("%H:%M:%S"),
-        started.join("、")
-    );
-    Ok(())
-}
-
 
 /// 本机持久化：只存状态缓存、设置与设备目标，不含任何会话正文。
 #[derive(Clone, Serialize, Deserialize)]
@@ -752,6 +516,10 @@ struct Store {
     target: Option<String>,
     #[serde(default = "default_format")]
     format: String,
+    /// 屏幕格式最后一次被显式修改的时刻（毫秒）。父子进程各持一份快照，
+    /// 合并时按它取新——否则守护回写会把面板刚选的 mono 又盖回 gray16。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    format_set_at: u64,
     /// 已经提醒过的指纹（见 `sound::notice_sig`）。持久化是为了让「补提醒」
     /// 在设备超时重连、守护重启后依然不重复响——同一次等待只吵人一次。
     /// 存一组（而不是一个槽位）：多个会话同时等待时，后一个指纹不会把前一个
@@ -782,6 +550,10 @@ struct Store {
     /// 若整份回写会把 `skin set` 刚改的造型盖回去；只有 `skin set` 自己置 true。
     #[serde(skip)]
     skin_explicit: bool,
+    /// 本次 save 是否要**显式**写入跟随/提示音设置。理由同上：守护回写时
+    /// 不能让几分钟前的内存快照盖掉 `dsh-pet set` 刚写进磁盘的值。
+    #[serde(skip)]
+    settings_explicit: bool,
 }
 
 /// 从磁盘读当前造型：守护每帧刷新一次，换肤后最多 2 秒就能上屏，
@@ -794,16 +566,318 @@ fn disk_pet_skin() -> Option<String> {
         .map(str::to_string)
 }
 
+/// 从磁盘读设置（跟随/提示音/音量/动画/陈旧分钟）。`dsh-pet set` 写的就是这里，
+/// 守护每一拍重新读一次，所以改完 2 秒内生效，不需要重启守护。
+fn disk_settings() -> Option<dsh_pet::model::Settings> {
+    let bytes = std::fs::read(state_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    serde_json::from_value(v["model"]["settings"].clone()).ok()
+}
+
+/// 从磁盘只读「屏幕格式」（mono / gray4 / gray16）。守护每拍同步一次，
+/// 避免它内存里的启动值（比如 gray16）在保存状态时把用户在面板里改的格式盖回去。
+fn disk_format() -> Option<(String, u64)> {
+    let bytes = std::fs::read(state_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some((
+        v["format"].as_str()?.to_string(),
+        v["format_set_at"].as_u64().unwrap_or(0),
+    ))
+}
+
+/// 子智能体（agent team / subagent）是否还在跑。
+///
+/// 现场问题：`session-bc15bf0c…` 的父会话回合已经 `turn/end completed`，但它的
+/// 两个子智能体（`origin: subagent`、header 里有 `parentSession`）还有未结束的
+/// 回合——DSH 侧边栏显示「1 个子智能体运行中」，设备却显示「任务完成」。
+/// 这里扫同项目目录下的子会话日志，把「有未结束回合」的父会话标出来。
+#[derive(Default)]
+struct TeamScan {
+    /// 子日志路径 → (文件长度, mtime 秒, parentSession, 是否还有未结束回合)
+    files: std::collections::HashMap<std::path::PathBuf, (u64, i64, Option<String>, bool)>,
+    last_run: Option<std::time::Instant>,
+    busy: std::collections::HashMap<String, i64>,
+}
+
+impl TeamScan {
+    /// 最多每 2 秒走一遍；结果写进 `model.team_busy`。
+    /// 返回 busy 集合是否变化（调用方据此决定要不要落盘给面板看）。
+    fn sync(&mut self, model: &mut dsh_pet::model::Model, root: &std::path::Path) -> bool {
+        if let Some(t) = self.last_run {
+            if t.elapsed() < std::time::Duration::from_secs(2) {
+                model.team_busy = self.busy.clone();
+                return false;
+            }
+        }
+        self.last_run = Some(std::time::Instant::now());
+        let at = now();
+        // 父会话 → 父会话的父（用于把多层子会话一路溯到最上层的任务）
+        let mut parents: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut raw_busy: Vec<String> = Vec::new();
+        if let Ok(projects) = std::fs::read_dir(root) {
+            for project in projects.flatten() {
+                if !project.path().is_dir() {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(project.path()) else {
+                    continue;
+                };
+                for child in entries.flatten() {
+                    let name = child.file_name().to_string_lossy().to_string();
+                    // `session-…` 是主会话，其余（裸 uuid）才是子智能体会话。
+                    if name.starts_with("session-") {
+                        continue;
+                    }
+                    let mut log = child.path().join("session.v4.jsonl.zstd");
+                    if !log.is_file() {
+                        log = child.path().join("session.v3.jsonl.zstd");
+                    }
+                    if !log.is_file() {
+                        continue;
+                    }
+                    let Ok(meta) = std::fs::metadata(&log) else {
+                        continue;
+                    };
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    // 很旧的子会话不值得每次解压。
+                    if at.saturating_sub(mtime) > 12 * 3600 {
+                        continue;
+                    }
+                    let stamp = (meta.len(), mtime);
+                    let entry = self
+                        .files
+                        .entry(log.clone())
+                        .or_insert((0, 0, None, false));
+                    if (entry.0, entry.1) != stamp {
+                        let Ok(bytes) = std::fs::read(&log) else {
+                            continue;
+                        };
+                        let text = dsh_pet::dsh::decode_all_frames(&bytes);
+                        let text = String::from_utf8_lossy(&text);
+                        let mut parent = None;
+                        let mut open_turns = 0i64;
+                        for line in text.lines() {
+                            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                                continue;
+                            };
+                            match v["type"].as_str() {
+                                Some("session") => {
+                                    parent = v["parentSession"].as_str().map(str::to_string);
+                                }
+                                Some("turn/start") => open_turns += 1,
+                                Some("turn/end") => open_turns -= 1,
+                                _ => {}
+                            }
+                        }
+                        *entry = (stamp.0, stamp.1, parent, open_turns > 0);
+                    }
+                    if let Some(parent) = &entry.2 {
+                        parents.insert(
+                            log.parent()
+                                .and_then(|p| p.file_name())
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            parent.clone(),
+                        );
+                    }
+                    if entry.3 {
+                        if let Some(parent) = &entry.2 {
+                            raw_busy.push(parent.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // 已知任务（主会话 id）集合：把子会话的 parentSession 一路往上溯，
+        // 直到落在一个已知主会话上；多层 agent team 也能显示到最上层。
+        let known: std::collections::HashSet<String> = model
+            .tasks
+            .iter()
+            .filter_map(|t| t.event.thread_id.clone())
+            .chain(model.tasks.iter().map(|t| t.event.task_id.clone()))
+            .collect();
+        let mut busy = std::collections::HashMap::new();
+        for parent in raw_busy {
+            let mut cur = parent;
+            for _ in 0..8 {
+                if known.contains(&cur) {
+                    busy.insert(cur, at);
+                    break;
+                }
+                match parents.get(&cur) {
+                    Some(next) if next != &cur => cur = next.clone(),
+                    _ => break,
+                }
+            }
+        }
+        let changed = self.busy != busy;
+        self.busy = busy;
+        model.team_busy = self.busy.clone();
+        changed
+    }
+}
+
+/// 由 DSH 插件写、宠物进程只读的配置：%LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json。
+/// 插件设置页保存后写这个文件；守护每拍比较 mtime，改完 ≤2 秒生效，不用重启。
+fn pet_config_path() -> PathBuf {
+    data_dir().join("pet-config.json")
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct PetConfig {
+    follow: Option<bool>,
+    sound: Option<bool>,
+    volume: Option<u8>,
+    target: Option<String>,
+    format: Option<String>,
+    /// realtime / balance / quiet / minimal
+    mode: Option<String>,
+    refresh_secs: Option<u32>,
+    animation: Option<bool>,
+    stale_minutes: Option<u32>,
+}
+
+fn load_pet_config() -> Option<PetConfig> {
+    let bytes = std::fs::read(pet_config_path()).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 把插件配置套进 store（设置 + 设备地址 + 屏幕格式）。返回是否生效了变化。
+fn apply_pet_config(store: &mut Store) -> bool {
+    let Some(c) = load_pet_config() else {
+        return false;
+    };
+    let mut changed = false;
+    let s = &mut store.model.settings;
+    if let Some(v) = c.follow {
+        if s.follow_enabled != v {
+            s.follow_enabled = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = c.sound {
+        if s.sound_enabled != v {
+            s.sound_enabled = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = c.volume {
+        let v = v.min(100);
+        if s.volume != v {
+            s.volume = v;
+            changed = true;
+        }
+    }
+    if let Some(v) = c.stale_minutes {
+        if s.stale_minutes != v {
+            s.stale_minutes = v;
+            changed = true;
+        }
+    }
+    if let Some(mode) = c.mode.as_deref() {
+        let (animation, refresh) = match mode {
+            "realtime" | "实时" => (true, 0),
+            "balance" | "平衡" => (true, 10),
+            "minimal" | "极简" => (false, 120),
+            _ => (false, 30),
+        };
+        if s.animation != animation || s.refresh_secs != refresh {
+            s.animation = animation;
+            s.refresh_secs = refresh;
+            changed = true;
+        }
+    } else {
+        if let Some(v) = c.animation {
+            if s.animation != v {
+                s.animation = v;
+                changed = true;
+            }
+        }
+        if let Some(v) = c.refresh_secs {
+            if s.refresh_secs != v {
+                s.refresh_secs = v;
+                changed = true;
+            }
+        }
+    }
+    if let Some(t) = c.target {
+        let t = t.trim().to_string();
+        if !t.is_empty() && store.target.as_deref() != Some(t.as_str()) {
+            store.target = Some(t);
+            changed = true;
+        }
+    }
+    if let Some(f) = c.format {
+        if f != store.format {
+            store.format = f;
+            store.format_set_at = now().max(1) as u64;
+            changed = true;
+        }
+    }
+    if changed {
+        println!(
+            "[配置] 插件配置已生效：follow={} 模式={} 音量={} 目标={} 格式={}",
+            s.follow_enabled,
+            match (s.animation, s.refresh_secs) {
+                (true, 0) => "实时",
+                (true, _) => "平衡",
+                (false, 120) => "极简",
+                _ => "安静",
+            },
+            s.volume,
+            store.target.as_deref().unwrap_or("自动发现"),
+            store.format
+        );
+    }
+    changed
+}
+
+/// 把磁盘上的设置套进内存模型；返回是否有变化（有变化时不必刷屏，设置本身不上屏）。
+fn refresh_settings(model: &mut Model) -> bool {
+    let Some(s) = disk_settings() else {
+        return false;
+    };
+    let changed = model.settings.follow_enabled != s.follow_enabled
+        || model.settings.sound_enabled != s.sound_enabled
+        || model.settings.volume != s.volume
+        || model.settings.animation != s.animation
+        || model.settings.stale_minutes != s.stale_minutes
+        || model.settings.refresh_secs != s.refresh_secs;
+    if changed {
+        model.settings.follow_enabled = s.follow_enabled;
+        model.settings.sound_enabled = s.sound_enabled;
+        model.settings.volume = s.volume;
+        model.settings.animation = s.animation;
+        model.settings.stale_minutes = s.stale_minutes;
+        model.settings.refresh_secs = s.refresh_secs;
+    }
+    changed
+}
+
 /// 任务完成后多久没有新任务就交还设备：5 分钟。
 fn default_idle_grace() -> u32 {
     300
 }
 
 fn default_format() -> String {
-    "gray16".into()
+    // 默认 mono（黑白 1 位）：设备实测整屏刷新约 1.1 秒，而 gray16 要 5 秒——
+    // 16 灰阶会走完整的「多段去残影」波形，看起来就是连闪好几次。mono 的
+    // 文字有网点感（Floyd–Steinberg 抖动），但刷新快、闪得少，日常更舒服。
+    // 想要更细腻可以 `set --format gray16`（或面板「高级 / 诊断」里切）。
+    "mono".into()
 }
 
 fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
@@ -847,11 +921,13 @@ impl Default for Store {
             model: Model::default(),
             target: None,
             format: default_format(),
+            format_set_at: 0,
             announced: Vec::new(),
             announced_at: 0,
             released_at: None,
             idle_grace: None,
             skin_explicit: false,
+            settings_explicit: false,
         }
     }
 }
@@ -896,8 +972,9 @@ fn save_store(store: &Store) -> Result<()> {
         if out.target.is_none() {
             out.target = disk.target;
         }
-        if out.format == default_format() && disk.format != default_format() {
+        if disk.format_set_at > out.format_set_at {
             out.format = disk.format;
+            out.format_set_at = disk.format_set_at;
         }
         // 提醒指纹是「谁新谁说了算」：父子进程各持一份快照，只有按时间合并
         // 才不会让慢半拍的那份把刚响过的指纹盖回去（盖回去 = 下轮重连再响）。
@@ -915,6 +992,15 @@ fn save_store(store: &Store) -> Result<()> {
         // 只有 `skin set`（skin_explicit）才有权把它写回去。
         if !store.skin_explicit {
             out.model.settings.pet_skin = disk.model.settings.pet_skin;
+        }
+        // 跟随/提示音设置同理：只有 `dsh-pet set`（settings_explicit）才有权写回。
+        if !store.settings_explicit {
+            out.model.settings.follow_enabled = disk.model.settings.follow_enabled;
+            out.model.settings.sound_enabled = disk.model.settings.sound_enabled;
+            out.model.settings.volume = disk.model.settings.volume;
+            out.model.settings.animation = disk.model.settings.animation;
+            out.model.settings.stale_minutes = disk.model.settings.stale_minutes;
+            out.model.settings.refresh_secs = disk.model.settings.refresh_secs;
         }
     }
     let tmp = path.with_extension("json.tmp");
@@ -976,7 +1062,7 @@ impl Args {
     }
 }
 
-/// v0.4.0 实验：设备录音 → 本机转写 → 投递到 WorkBuddy 输入框。
+/// v0.4.0 实验：设备录音 → 本机转写 → 投递到 DeepSeek Harness 输入框。
 ///
 /// - `voice probe`：定位输入框，只读，不动界面
 /// - `voice paste --text ... [--send]`：把文字贴进输入框（可选回车发送）
@@ -1004,6 +1090,13 @@ fn cmd_voice(args: &Args) -> Result<()> {
             }
         }
         "focus" => println!("{}", voice::focus_probe()?),
+        // 诊断：真的去点侧边栏把目标会话切到前台（会动界面，但不会写任何文字）。
+        // 用法：voice open --title "会话标题"
+        "open" => {
+            let title = args.get("title").context("用法：voice open --title \"会话标题\"")?;
+            voice::open_session("", title)?;
+            println!("已切到会话：{title}");
+        }
         // 诊断：屏幕上「↑↓ 换会话」到底能换到哪些会话，顺序是否和预期一致。
         "targets" => {
             let store = load_store();
@@ -1061,7 +1154,7 @@ fn cmd_voice(args: &Args) -> Result<()> {
             let text = args
                 .get("text")
                 .unwrap_or("把今天的会议纪要整理成三条要点，发到项目群里。");
-            let title = args.get("session").unwrap_or("WorkBuddy 宠物");
+            let title = args.get("session").unwrap_or("DeepSeek Harness 宠物");
             let mut targets = vec![voice::Target {
                 session: "demo-a".into(),
                 title: title.to_string(),
@@ -1107,91 +1200,39 @@ fn parse_status(value: &str) -> Result<Option<Status>> {    Ok(match value.trim(
     })
 }
 
-/// 读各会话的上下文占用。来源：`~/.workbuddy/workbuddy.db` 的 session_usage 表，
-/// `used` 是已用 token、`size` 是窗口大小（如 300000）。
-///
-/// 读库走 `open_readonly_db()`（先直连只读，失败退回复制副本）。
-/// 结果缓存 15 秒：上下文随每轮对话增长，刷新太快只会让墨水屏频繁刷新。
-fn read_contexts() -> std::collections::HashMap<String, (u32, u32)> {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    type Map = std::collections::HashMap<String, (u32, u32)>;
-    static CACHE: std::sync::OnceLock<Mutex<(Instant, Map)>> = std::sync::OnceLock::new();
-    let cache =
-        CACHE.get_or_init(|| Mutex::new((Instant::now() - Duration::from_secs(3600), Map::new())));
-    let Ok(mut guard) = cache.lock() else {
-        return Map::new();
-    };
-    if guard.0.elapsed() < Duration::from_secs(15) {
-        return guard.1.clone();
-    }
-    let mut map = Map::new();
-    if let Some(conn) = open_readonly_db() {
-        let _ = conn.busy_timeout(Duration::from_millis(300));
-        if let Ok(mut stmt) =
-            conn.prepare("select session_id, used, size from session_usage")
-        {
-            if let Ok(rows) = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            }) {
-                for (id, used, size) in rows.flatten() {
-                    if used > 0 && size > 0 {
-                        map.insert(id, (used as u32, size as u32));
-                    }
-                }
-            }
-        }
-    }
-    *guard = (Instant::now(), map.clone());
-    map
-}
-
 fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool) {
     let mut applied = vec![];
     match watcher.scan() {
         Ok(events) => {
             for (ev, at) in events {
                 let keep = ev.clone();
-                if model.apply(ev, "workbuddy", at).unwrap_or(false) {
+                if model.apply(ev, "dsh", at).unwrap_or(false) {
                     applied.push(keep);
                 }
             }
         }
-        Err(e) => eprintln!("读取 WorkBuddy 会话失败: {e}"),
+        Err(e) => eprintln!("读取 DeepSeek Harness 会话失败: {e}"),
     }
     let mut changed = !applied.is_empty();
-    // 定时任务（后台自动化）会话不上屏、不参与占用判定：已跟踪的旧轮次
-    // 要从模型里清出去，否则设备会一直停在它的画面上交还不了。
-    // 每次扫描都全量对一遍——state.json 里持久化的旧任务也能在重启后被清掉。
-    for stem in watcher.automations() {
-        if model.forget_session("workbuddy", stem) {
-            changed = true;
-            println!("[跟随] 定时任务会话不上屏：{stem}");
-        }
-    }
-    // 用户在侧边栏删掉的会话同样要退场。它的 jsonl 还在磁盘上，被删时若停在
+    // 用户在侧边栏归档/删掉的会话要退场。它的日志还在磁盘上，被归档时若停在
     // 未答复的提问上就会一直算「等你处理」——等待优先于已完成，画面会长期停在
     // 一条已经不存在的任务上。每次扫描全量对一遍，state.json 里持久化的旧任务
-    // 也能在重启后被清掉。只查模型里出现过的 id，别拿整张删除表去套。
+    // 也能在重启后被清掉。只查模型里出现过的 id，别拿整张归档表去套。
     if !watcher.deleted().is_empty() {
         let deleted = watcher.deleted();
         let mut victims: Vec<String> = model
             .tasks
             .iter()
-            .filter(|t| t.source == "workbuddy")
+            .filter(|t| t.source == "dsh")
             .filter_map(|t| t.event.thread_id.clone())
             .filter(|id| deleted.contains(id))
             .collect();
         victims.sort();
         victims.dedup();
         for stem in victims {
-            if model.forget_session("workbuddy", &stem) {
+            if model.forget_session("dsh", &stem) {
                 changed = true;
-                println!("[跟随] 会话已删除，退场：{stem}");
+                println!("[跟随] 会话已归档，退场：{stem}");
             }
         }
     }
@@ -1204,7 +1245,7 @@ fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool)
         if let Some(t) = model
             .tasks
             .iter_mut()
-            .find(|t| t.source == "workbuddy" && t.event.task_id == task_id)
+            .find(|t| t.source == "dsh" && t.event.task_id == task_id)
         {
             let at = at.min(tick);
             if at > t.updated_at {
@@ -1212,6 +1253,10 @@ fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool)
                 changed = true;
             }
         }
+    }
+    // 待命页的鳄鱼用这个判断「刚忙完」还是「闲很久了」（30 分钟后睡觉）。
+    if !model.tasks.is_empty() {
+        model.last_active_at = Some(tick);
     }
     // 主卡跟着「已经显示的那条」走：两个会话并行时不来回抢屏。
     model.auto_focus(tick);
@@ -1221,7 +1266,7 @@ fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool)
     let ctx = model
         .current(now)
         .and_then(|t| t.event.thread_id)
-        .and_then(|id| read_contexts().get(&id).copied());
+        .and_then(|id| watcher.context_of(&id));
     let (used, size) = match ctx {
         Some((u, s)) => (Some(u), Some(s)),
         None => (None, None),
@@ -1286,7 +1331,7 @@ async fn scan_and_report(
     let before: Vec<(String, Option<Status>)> = model
         .tasks
         .iter()
-        .filter(|t| t.source == "workbuddy")
+        .filter(|t| t.source == "dsh")
         .map(|t| (t.event.task_id.clone(), Some(t.status())))
         .collect();
     let (events, changed) = scan_into(model, watcher);
@@ -1317,7 +1362,7 @@ async fn scan_and_report(
             let target = model
                 .tasks
                 .iter()
-                .find(|t| t.source == "workbuddy" && t.event.task_id == ev.task_id)
+                .find(|t| t.source == "dsh" && t.event.task_id == ev.task_id)
                 .cloned();
             if let Some(task) = target {
                 announce(dev, model, store, &task).await;
@@ -1327,14 +1372,76 @@ async fn scan_and_report(
     changed
 }
 
+/// 主卡上「值得立刻刷新」的那几个字段的快照，用于节流判定。
+#[derive(Clone, PartialEq)]
+struct CardSig {
+    status: Option<Status>,
+    title: String,
+    detail: String,
+    progress: Option<u8>,
+    ctx_pct: Option<u32>,
+}
+
+/// 取当前主卡快照。上下文百分比只在整数位变化时才算变化（见 scan_into）。
+fn card_sig(model: &Model, at: i64) -> CardSig {
+    let ctx_pct = model
+        .ctx_used
+        .zip(model.ctx_size)
+        .map(|(u, s)| if s == 0 { 0 } else { (u as f32 / s as f32 * 100.0) as u32 });
+    match model.current(at) {
+        Some(t) => CardSig {
+            status: Some(t.status()),
+            title: t.event.title.clone(),
+            detail: t.event.detail.clone(),
+            progress: t.event.progress,
+            ctx_pct,
+        },
+        None => CardSig {
+            status: None,
+            title: String::new(),
+            detail: String::new(),
+            progress: None,
+            ctx_pct,
+        },
+    }
+}
+
+/// 这一拍该不该刷屏。
+///
+/// - 状态切换（工作→等待→完成/停止/出错）、任务换人、等待页文案变化 → **立刻刷**，
+///   这些是用户真正要看的信号；
+/// - 其余（工具活动描述、进度、上下文百分比）→ 受 `refresh_secs` 节流，
+///   默认 0 表示不节流（保持原来实时跟手的行为），设成 30/60 就安静很多。
+fn refresh_due(
+    last: Option<&CardSig>,
+    cur: &CardSig,
+    last_push_at: i64,
+    at: i64,
+    throttle: i64,
+) -> bool {
+    let Some(prev) = last else {
+        return true;
+    };
+    if prev.status != cur.status || prev.title != cur.title {
+        return true;
+    }
+    // 等待页的题干/权限提示变了必须立刻上屏——那就是要人处理的信号。
+    if cur.status == Some(Status::Waiting) && prev.detail != cur.detail {
+        return true;
+    }
+    if throttle <= 0 {
+        return true;
+    }
+    at.saturating_sub(last_push_at) >= throttle
+}
+
 /// 只在画面签名变化时推送。签名涵盖状态、标题、进度与当前选中项，
 /// 没有真实变化就一个字节都不发——电子墨水屏刷新很贵，也不该无谓闪烁。
 /// 把当前模型渲染上屏；画面没变就不重刷。
 ///
-/// 花絮就在这里取：**只有确定要更新页面时**才去 WorkBuddy 界面读一次当前那条，
-/// 读到的内容并进同一帧一起推上去。没有独立的定时轮询——界面自己换了十几条
-/// 而任务状态没变时，设备不跟着闪屏；一旦要更新页面（状态、进度、占用变化，
-/// 或按了键），推上去的就是那一刻界面正在显示的花絮。
+/// 花絮（底部那句）**不再单独触发刷新**：只有主画面确实要更新时才顺便读一次界面
+/// 状态行，把花絮并进同一帧。否则界面状态行每变一次（每个工具调用都变）就会
+/// 白闪一下墨水屏——这正是「每 2 秒闪一次」的另一半原因。
 async fn push_if_changed(
     dev: &Device,
     model: &mut Model,
@@ -1353,11 +1460,12 @@ async fn push_if_changed(
     }
     let phase = if model.settings.animation { frame } else { 0 };
     let mut scene = layout::draw(model, now(), phase);
-    let mut sig = scene.to_string();
+    let sig = scene.to_string();
     if last_sig.as_ref() == Some(&sig) {
+        // 主画面没变：连界面都不去读，安静地返回。
         return false;
     }
-    // 真的要刷新页面了，顺带把界面当刻的花絮取回来，和这一帧同步上屏。
+    // 主画面确实要更新了，顺带把界面当刻的花絮取回来，和这一帧一起上屏。
     // 读不到（窗口最小化、气泡已关、UIA 被占）就沿用上一句，绝不阻塞推送。
     if let Some(quip) = uia::current_quip() {
         if model.set_live_quip(&quip) {
@@ -1367,11 +1475,6 @@ async fn push_if_changed(
                 eprintln!("配置保存失败: {e}");
             }
             scene = layout::draw(model, now(), phase);
-            sig = scene.to_string();
-            // 花絮不在这一屏上（比如完成页）时，别为了它白刷一次墨水屏。
-            if last_sig.as_ref() == Some(&sig) {
-                return false;
-            }
         }
     }
     let png = match raster::to_png(&scene, fonts) {
@@ -1381,10 +1484,21 @@ async fn push_if_changed(
             return false;
         }
     };
+    let show_started = std::time::Instant::now();
     match dev.show_with_format(&png, fmt).await {
         Ok(()) => match model.current(now()) {
-            Some(t) => println!("已推送：{} · {}", t.label(), t.event.title),
-            None => println!("已推送：等待任务"),
+            Some(t) => println!(
+                "[{}] 已推送：{} · {}（{:.2}s）",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                t.label(),
+                t.event.title,
+                show_started.elapsed().as_secs_f32()
+            ),
+            None => println!(
+                "[{}] 已推送：等待任务（{:.2}s）",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                show_started.elapsed().as_secs_f32()
+            ),
         },
         // 结果未知时按约定不重发，也不当作失败。
         Err(zectrix_sdk::Error::ResultUnknown) => {
@@ -1432,7 +1546,7 @@ async fn push_scene(
 /// 可以投递的会话：正在跑/等确认的排前面，其余按最近活动补到最多 8 个。
 ///
 /// **id 用 `thread_id`（基础会话 UUID），不是 `task_id`**：task_id 带轮次后缀
-/// （`…-u1794204456`），而深链 `workbuddy://chat/<id>` 只认基础 id。之前用
+///（`…-t3`），而侧边栏一行对应的是**基础会话**。投递前要靠标题去侧边栏里
 /// task_id，选「别的会话」时其实切不过去，文字会落回原来那个会话里。
 ///
 /// 候选范围是「Watcher 扫得到的会话」（最近 12 小时有活动）：包括已经答完的。
@@ -1455,7 +1569,7 @@ fn voice_targets(model: &Model, at: i64) -> Vec<voice::Target> {
 }
 
 fn push_target(out: &mut Vec<voice::Target>, t: &Task) {
-    if t.source != "workbuddy" {
+    if t.source != "dsh" {
         return;
     }
     let id = t
@@ -1476,6 +1590,7 @@ fn push_target(out: &mut Vec<voice::Target>, t: &Task) {
 ///
 /// 转写失败就把进程丢掉重起：whisper 崩过一次之后，同一个进程再问也是坏的，
 /// 留着只会让后面每一段都失败。
+#[allow(dead_code)]
 async fn transcribe_voice(asr: &mut Option<voice::Asr>, wav: &Path) -> Result<String> {
     if asr.is_none() {
         *asr = Some(tokio::task::spawn_blocking(voice::Asr::spawn).await??);
@@ -1504,10 +1619,11 @@ async fn transcribe_voice(asr: &mut Option<voice::Asr>, wav: &Path) -> Result<St
 }
 
 /// 把草稿投进目标会话的输入框。只粘贴、不回车——识别错字还有机会在电脑上改。
+#[allow(dead_code)]
 async fn deliver_voice(draft: voice::Draft) -> Result<String> {
     let text = draft.text.clone();
     let target = draft.target().cloned();
-    // 目标就是当前显示的那个会话就不切：切会话要唤起深链，会抢焦点、动窗口，
+    // 目标就是当前显示的那个会话就不切：切会话会抢焦点、动窗口，
     // 而单会话场景压根不需要——之前「一按确认窗口就缩小」正是这类多余动作。
     let need_switch = target
         .as_ref()
@@ -1519,10 +1635,10 @@ async fn deliver_voice(draft: voice::Draft) -> Result<String> {
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         if let Some(t) = target.filter(|_| need_switch) {
-            voice::open_session(&t.session)?;
-            // 深链切会话要时间：窗口起来、组件重建完再粘贴，否则粘到上一个会话里。
-            // 实测 800ms 偶尔不够（会话多、列表在滚动），给到 1.2 秒。
-            std::thread::sleep(Duration::from_millis(1200));
+            // 点侧边栏切会话（UIA SelectionItem），并等窗口标题确认真的切过去了。
+            voice::open_session(&t.session, &t.title)?;
+            // 切会话后组件要重建：给输入框一点时间，否则文字会粘到上一个会话里。
+            std::thread::sleep(Duration::from_millis(900));
         }
         voice::deliver(&text, false)
     })
@@ -1625,16 +1741,19 @@ fn with_model_inner(args: &Args, store: &mut Store) -> Model {
             model
         }
         None => {
-            let mut watcher = Watcher::new(workbuddy_root());
+            let mut watcher = Watcher::new(dsh_root());
             if let Some(stem) = args.get("session") {
                 // 只看这一个会话：否则当前任务会被其它会话更新的记录顶掉。
                 let prefix = format!("{stem}-");
                 model
                     .tasks
-                    .retain(|t| t.source != "workbuddy" || t.event.task_id.starts_with(&prefix));
+                    .retain(|t| t.source != "dsh" || t.event.task_id.starts_with(&prefix));
                 watcher = watcher.only(stem);
             }
             scan_into(&mut model, &mut watcher);
+            // 预览/手动推图也要认「子智能体还在跑」，否则设备显示和 DSH 界面不一致。
+            let mut team = TeamScan::default();
+            team.sync(&mut model, &dsh_root());
             // 单会话预览不落盘：避免把其它会话的任务从状态缓存里抹掉。
             if args.get("session").is_none() {
                 store.model = model.clone();
@@ -1672,9 +1791,9 @@ fn cmd_skin(args: &Args) -> Result<()> {
                     s.desc()
                 );
             }
-            println!("\n切换：workbuddy-pet skin set <id>");
+            println!("\n切换：dsh-pet skin set <id>");
             println!("设备上：长按上/下键挨个换（设备正在显示宠物时即可，换完立刻上屏并记住）");
-            println!("临时试看：workbuddy-pet preview --demo working --skin <id> --out <路径>");
+            println!("临时试看：dsh-pet preview --demo working --skin <id> --out <路径>");
             Ok(())
         }
         "current" | "now" => {
@@ -1684,7 +1803,7 @@ fn cmd_skin(args: &Args) -> Result<()> {
         "set" => {
             let id = pos
                 .get(1)
-                .context("用法：workbuddy-pet skin set <pixel|abacus|fortune|astro>")?;
+                .context("用法：dsh-pet skin set <pixel|abacus|fortune|astro>")?;
             set_skin(id)
         }
         other => set_skin(other),
@@ -1701,13 +1820,138 @@ fn set_skin(value: &str) -> Result<()> {
     store.skin_explicit = true;
     save_store(&store)?;
     println!("已切换造型：{}（{}）", skin.name(), skin.id());
-    println!("守护下一帧自动生效；想立刻看一次：workbuddy-pet push --demo working");
+    println!("守护下一帧自动生效；想立刻看一次：dsh-pet push --demo working");
+    Ok(())
+}
+
+/// `on` / `off` / `true` / `false` / `1` / `0` / `开` / `关`。
+fn parse_onoff(value: &str) -> Result<bool> {
+    Ok(match value.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "开" => true,
+        "off" | "false" | "0" | "no" | "关" => false,
+        other => anyhow::bail!("只能是 on / off，收到 {other}"),
+    })
+}
+
+fn onoff_label(value: bool) -> &'static str {
+    if value {
+        "开"
+    } else {
+        "关"
+    }
+}
+
+/// 查看 / 修改跟随与提示音设置（`dsh-pet set ...`）。
+///
+/// 只改 `state.json` 里的 `model.settings`；守护每一拍重新读磁盘，所以改完 2 秒内
+/// 生效，不需要重启守护。`--follow off` 会让守护释放设备（回到待命、不再占用），
+/// 这是「暂时让它别上屏」的开关；要连自启一起停掉用 `autostart off`。
+fn cmd_set(args: &Args) -> Result<()> {
+    let mut store = load_store();
+    let mut touched = false;
+    if let Some(v) = args.get("volume") {
+        let n: u8 = v
+            .parse()
+            .with_context(|| format!("--volume 需要 0-100 的整数，收到 {v}"))?;
+        store.model.settings.volume = n.min(100);
+        touched = true;
+    }
+    if let Some(v) = args.get("sound") {
+        store.model.settings.sound_enabled = parse_onoff(v)?;
+        touched = true;
+    }
+    if let Some(v) = args.get("follow") {
+        store.model.settings.follow_enabled = parse_onoff(v)?;
+        touched = true;
+    }
+    if let Some(v) = args.get("animation") {
+        store.model.settings.animation = parse_onoff(v)?;
+        touched = true;
+    }
+    if let Some(v) = args.get("stale") {
+        let n: u32 = v
+            .parse()
+            .with_context(|| format!("--stale 需要分钟数，收到 {v}"))?;
+        store.model.settings.stale_minutes = n.max(1);
+        touched = true;
+    }
+    if let Some(v) = args.get("refresh") {
+        let n: u32 = v
+            .parse()
+            .with_context(|| format!("--refresh 需要秒数（0 = 不节流），收到 {v}"))?;
+        store.model.settings.refresh_secs = n;
+        touched = true;
+    }
+    if let Some(v) = args.get("format") {
+        // 只接受 mono / gray4 / gray16；写回统一的名字，守护下一拍热切换。
+        let f = device::format(v)?;
+        store.format = device::format_name(f).to_string();
+        store.format_set_at = chrono::Local::now().timestamp_millis() as u64;
+        touched = true;
+    }
+    // 一键「安静模式」：关动画 + 30 秒节流。嫌墨水屏一闪一闪时用这个，
+    // 比单独调两项省事；`--calm off` 恢复实时跟随。
+    if let Some(v) = args.get("calm") {
+        let calm = parse_onoff(v)?;
+        store.model.settings.animation = !calm;
+        store.model.settings.refresh_secs = if calm { 30 } else { 0 };
+        touched = true;
+    }
+    if !touched {
+        let s = &store.model.settings;
+        println!("跟随：{}", onoff_label(s.follow_enabled));
+        println!(
+            "提示音：{}（音量 {} / 100）",
+            onoff_label(s.sound_enabled),
+            s.volume
+        );
+        println!("动画：{}", onoff_label(s.animation));
+        if s.refresh_secs == 0 {
+            println!("刷新节流：关（内容变化就刷，最多 2 秒一次）");
+        } else {
+            println!("刷新节流：至少 {} 秒一次（状态切换仍立即刷）", s.refresh_secs);
+        }
+        println!("陈旧判定：{} 分钟无更新降级为「状态待确认」", s.stale_minutes);
+        println!(
+            "屏幕格式：{}（mono 刷新最快/最不闪，gray4 折中，gray16 最细腻）",
+            store.format
+        );
+        println!();
+        println!("改法示例：");
+        println!("  dsh-pet set --calm on            安静模式：关动画 + 30 秒节流（推荐先试这个）");
+        println!("  dsh-pet set --animation off      只关动画");
+        println!("  dsh-pet set --refresh 60         内容更新至少隔 60 秒才刷");
+        println!("  dsh-pet set --format mono        黑白 1 位：整屏刷新快 4 倍、闪得少（默认）");
+        println!("  dsh-pet set --sound off          完全静音");
+        println!("  dsh-pet set --volume 20          只把提示音调小");
+        println!("  dsh-pet set --follow off         暂停跟随，释放设备");
+        return Ok(());
+    }
+    store.settings_explicit = true;
+    save_store(&store)?;
+    let s = &store.model.settings;
+    println!(
+        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}",
+        onoff_label(s.follow_enabled),
+        onoff_label(s.sound_enabled),
+        s.volume,
+        onoff_label(s.animation),
+        if s.refresh_secs == 0 {
+            "关".to_string()
+        } else {
+            format!("{} 秒", s.refresh_secs)
+        },
+        s.stale_minutes,
+        store.format
+    );
+    println!("守护下一拍生效，不需要重启。");
     Ok(())
 }
 
 /// 图鉴里的下一只/上一只，走到头绕回去。
 ///
 /// 单独拎出来是为了能单测：`cycle_skin` 要落盘，测试里不该碰 state.json。
+#[allow(dead_code)]
 fn step_skin(cur: Skin, step: i32) -> Skin {
     let n = Skin::ALL.len() as i32;
     let at = Skin::ALL.iter().position(|s| *s == cur).unwrap_or(0) as i32;
@@ -1720,19 +1964,6 @@ fn step_skin(cur: Skin, step: i32) -> Skin {
 /// `skin set` 与守护之间的唯一同步点），只改内存会被它当场盖回去。
 /// `skin_explicit` 只在这次写入时置位，否则 `save_store` 的合并规则会认为
 /// 「磁盘上的旧值更权威」，把刚换的猫吞掉。
-fn cycle_skin(model: &mut Model, store: &mut Store, step: i32) -> Skin {
-    let cur = Skin::parse(&model.settings.pet_skin).unwrap_or_default();
-    let next = step_skin(cur, step);
-    model.settings.pet_skin = next.id().into();
-    store.model = model.clone();
-    store.skin_explicit = true;
-    if let Err(e) = save_store(store) {
-        eprintln!("造型保存失败：{e}");
-    }
-    store.skin_explicit = false;
-    next
-}
-
 async fn cmd_preview(args: &Args) -> Result<()> {
     let mut store = load_store();
     let model = with_model(args, &mut store);
@@ -1755,7 +1986,7 @@ async fn cmd_preview(args: &Args) -> Result<()> {
 }
 
 async fn cmd_sessions(_args: &Args) -> Result<()> {
-    let mut watcher = Watcher::new(workbuddy_root());
+    let mut watcher = Watcher::new(dsh_root());
     println!("会话根目录：{}", watcher.root().display());
     let events = watcher.scan()?;
     if events.is_empty() {
@@ -1827,10 +2058,10 @@ fn confirm(prompt: &str) -> bool {
 /// 每一步都允许失败而不中断——连不上设备仍能看预览、设自启，修正后重跑即可。
 async fn cmd_init(args: &Args) -> Result<()> {
     let mut store = load_store();
-    println!("WorkBuddy 宠物 · 初始化\n");
+    println!("DeepSeek Harness 宠物 · 初始化\n");
 
     // 1. 现状：把「程序当前认到的配置」先摆出来，用户才能判断哪里不对。
-    let sessions = workbuddy_root();
+    let sessions = dsh_root();
     println!("数据目录      {}", data_dir().display());
     println!(
         "状态缓存      {}（{} 个任务）",
@@ -1838,13 +2069,13 @@ async fn cmd_init(args: &Args) -> Result<()> {
         store.model.tasks.len()
     );
     println!(
-        "WorkBuddy    会话 {} ｜进程 {}",
+        "DeepSeek Harness    会话 {} ｜进程 {}",
         if sessions.is_dir() {
             "已找到"
         } else {
-            "未找到（先启动一次 WorkBuddy）"
+            "未找到（先启动一次 DeepSeek Harness）"
         },
-        if workbuddy_running() {
+        if dsh_running() {
             "正在运行"
         } else {
             "未运行"
@@ -1938,7 +2169,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
 
     // 3. 预览：先让用户看到要推到设备上的到底是什么。
     println!("\n[2/3] 生成预览");
-    let mut watcher = Watcher::new(workbuddy_root());
+    let mut watcher = Watcher::new(dsh_root());
     scan_into(&mut store.model, &mut watcher);
     let scene = layout::draw(&store.model, now(), 0);
     let png = raster::to_png(&scene, &Fonts::load()?)?;
@@ -1973,11 +2204,11 @@ async fn cmd_init(args: &Args) -> Result<()> {
     if confirm("  登录 Windows 时自动在后台运行？") {
         write_autostart(target.as_deref())?;
     } else {
-        println!("  已跳过；之后可运行 `workbuddy-pet autostart on --target <IP>`");
+        println!("  已跳过；之后可运行 `dsh-pet autostart on --target <IP>`");
     }
 
     println!(
-        "\n初始化结束。日常使用：`workbuddy-pet watch{}`",
+        "\n初始化结束。日常使用：`dsh-pet watch{}`",
         target.map(|t| format!(" --target {t}")).unwrap_or_default()
     );
     Ok(())
@@ -2066,6 +2297,10 @@ async fn announce(dev: &Device, model: &Model, store: &mut Store, task: &Task) {
 
 async fn cmd_run(args: &Args) -> Result<()> {
     let mut store = load_store();
+    // 插件设置页的配置优先于 state.json：DSH 插件一保存，下一拍就生效。
+    if apply_pet_config(&mut store) {
+        store.settings_explicit = true;
+    }
     if let Some(v) = args.get("volume").and_then(|v| v.parse::<u8>().ok()) {
         store.model.settings.volume = v.min(100);
     }
@@ -2075,7 +2310,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
     if args.has("no-animation") {
         store.model.settings.animation = false;
     }
-    let fmt = device::format(args.get("format").unwrap_or(&store.format))?;
+    let mut fmt = device::format(args.get("format").unwrap_or(&store.format))?;
     // 显式地址优先并记住，避免每次都得带 --target。
     if let Some(t) = args.get("target").map(str::to_string) {
         if store.target.as_deref() != Some(t.as_str()) {
@@ -2094,7 +2329,13 @@ async fn cmd_run(args: &Args) -> Result<()> {
             model.settings.pet_skin = s.id().into();
         }
     }
-    let mut watcher = Watcher::new(workbuddy_root());
+    // 守护模式（standby）下跟随被手动关掉：别去占设备，直接回待命。
+    // 判在 `device::open` 之前——否则会在用户说「先别上屏」之后还去抢一次连接。
+    if args.has("standby") && !model.settings.follow_enabled {
+        println!("跟随已关闭：不占用设备。");
+        return Ok(());
+    }
+    let mut watcher = Watcher::new(dsh_root());
     let fonts = Fonts::load()?;
 
     let dev = device::open(target.as_deref()).await?;
@@ -2105,15 +2346,19 @@ async fn cmd_run(args: &Args) -> Result<()> {
         dev.summary.address,
         device::format_name(fmt)
     );
+    let mut status_at = now();
     if let Ok(s) = dev.status().await {
         println!(
             "电量 {:?}% | RSSI {:?} dBm",
             s.battery_percent, s.wifi_rssi_dbm
         );
+        model.battery = s.battery_percent;
+        model.rssi = s.wifi_rssi_dbm.map(i16::from);
+        model.battery_at = Some(now());
     }
     CONNECTED_AT.store(now(), Ordering::Relaxed);
 
-    let watch = args.has("exit-with-workbuddy");
+    let watch = args.has("exit-with-dsh");
     // 待命模式（守护用）：任务结束就交还设备。手动 `run` 默认一直占着，便于调试。
     let standby = args.has("standby");
     let grace = args
@@ -2123,21 +2368,55 @@ async fn cmd_run(args: &Args) -> Result<()> {
         .unwrap_or_else(|| store.idle_grace());
     let mut frame = 0usize;
     let mut last_sig: Option<String> = None;
-    // 语音投递：录音只能由设备发起、且必须持有连接，所以它天然只在「设备已被
-    // 占用」时可用——不常驻、不额外抢设备，任务结束就随连接一起消失。
-    let mut asr: Option<voice::Asr> = None;
-    let mut draft: Option<voice::Draft> = None;
+    // 语音输入按新版规格从设备手势里移除：确认键长按不再触发录音转写。
+    // `voice` 诊断命令仍在（`dsh-pet voice ...`），设备侧只保留单击/双击/三击。
     // 设备正在录音时固件占着采集，推送和响铃都会拿到 Busy——这一拍直接跳过，
     // 等 RecordingFinished 再恢复，别让日志里刷一串「推送失败」。
     let mut recording = false;
-    let mut scan_tick = tokio::time::interval(Duration::from_secs(2));
+    // 设备手势：确认键「双击 = 静音/恢复」「三击 = 退出回普通界面」。
+    // 固件只上报单键短按/长按，没有组合键，双击/三击在这里用时间窗识别：
+    // 1 次=回首页（原有行为），2 次=静音，3 次=退出。双击会等 650ms 看有没有
+    // 第三次，避免「想退出却先被静音」。
+    let mut clicks: (i64, u8) = (0, 0); // (最后一次确认短按的毫秒时间戳, 连击数)
+    // 1 秒一拍：状态变化先攒进冷却闸门，但到点要能在 1 秒内推出去，
+    // 不能因为扫描间隔没到而拖成 4 秒。
+    let mut scan_tick = tokio::time::interval(Duration::from_secs(1));
     scan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // 先扫一次再推：否则会把「还没读到会话」的空画面先刷上屏。
-    scan_and_report(&mut model, &mut watcher, &mut store, &dev, false).await;
+    // 连上设备后先「等画面稳定」再推第一帧：刚连上时 DSH 的回合事件往往还在
+    // 接连落盘，立刻推一帧、2 秒后又因为状态变了再推一帧，看起来就是连续闪。
+    // 这里最多观察 2 秒，连续两次扫描状态一致就收手，只推最终那一帧。
+    // 子智能体检测：父会话回合结束后，队友（subagent）可能还在跑。
+    let mut team = TeamScan::default();
+    let mut settle_prev: Option<CardSig> = None;
+    // 设备刚从默认界面切过来时，固件自己要刷一次过渡画面；先让它落定，
+    // 别在过渡动画中间再推一帧（会叠加成连闪）。
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    for _ in 0..4 {
+        scan_and_report(&mut model, &mut watcher, &mut store, &dev, false).await;
+        team.sync(&mut model, &dsh_root());
+        let sig = card_sig(&model, now());
+        let stable = settle_prev.as_ref() == Some(&sig);
+        settle_prev = Some(sig);
+        if stable {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(450)).await;
+    }
+    let mut last_push_at = now();
     if push_if_changed(&dev, &mut model, &mut store, &fonts, fmt, frame, &mut last_sig).await {
         frame = (frame + 1) % 6;
+        last_push_at = now();
     }
+    // 两次刷新之间的最小间隔：状态抖动（子任务开始/结束、多会话轮流上报）
+    // 很容易在几秒内触发好几次刷新，墨水屏每次都整屏闪。冷却期内的变化先攒着，
+    // 到点只推最后的状态——看到的是「一次闪」而不是「连闪」。
+    const PUSH_COOLDOWN_SECS: i64 = 3;
+    let mut push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
+    let mut pending_push = false;
+    // 屏幕上现在是什么：节流判定用它区分「状态切换（必须立刻刷）」和
+    // 「工具活动/进度这类细节（可以等 refresh_secs）」。
+    let mut last_card = Some(card_sig(&model, now()));
     // 首扫静默是为了不把历史回放当成新提醒，但如果此刻屏幕上正停在「等你处理」，
     // 那是一次真正的漏报——设备超时重连、守护重启都会走到这里，等待页会无声出现。
     // 这里补一次提醒；同一提示只响一次（指纹落盘），所以反复重连不会反复响。
@@ -2153,31 +2432,112 @@ async fn cmd_run(args: &Args) -> Result<()> {
     let outcome = loop {
         tokio::select! {
             _ = scan_tick.tick() => {
-                if watch && !workbuddy_running() {
-                    println!("WorkBuddy 已退出：正常断开设备，回到待命。");
+                // DSH 插件/面板退出或被结束：子进程自己收尾，别留下孤儿占着设备。
+                if args
+                    .get("watch-pid")
+                    .or_else(|| args.get("parent"))
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_some_and(|p| !pid_alive(p))
+                {
+                    println!("DSH 已退出：释放设备，宠物退出。");
+                    break Ok(());
+                }
+                if watch && !dsh_running() {
+                    println!("DeepSeek Harness 已退出：正常断开设备，回到待命。");
                     break Ok(());
                 }
                 // 录音期间设备在采集，任何推送都会 Busy：这一拍什么都不做。
                 if recording {
                     continue;
                 }
-                // 语音草稿到点就丢：设备不在手边时不能一直占着屏幕，
-                // 也不该让它把设备一直锁在这里。
-                if draft.as_ref().is_some_and(|d| now() >= d.expires_at) {
-                    println!("[语音] {} 秒内没确认，丢弃这段识别结果", voice::PREVIEW_SECS);
-                    draft = None;
-                    // 清掉签名，下面这一拍就会把主界面重新推回去。
+                // 每拍把磁盘设置读回来：`dsh-pet set --sound/--volume/--follow`
+                // 改完 2 秒内生效，不需要重启守护。
+                refresh_settings(&mut model);
+                // 插件设置页写的 pet-config.json：再套一次，插件配置优先于 state.json。
+                if apply_pet_config(&mut store) {
+                    model.settings = store.model.settings.clone();
+                    if args.get("format").is_none() {
+                        if let Ok(new_fmt) = device::format(&store.format) {
+                            fmt = new_fmt;
+                        }
+                    }
                     last_sig = None;
+                    pending_push = true;
+                    push_not_before = now();
+                }
+                // 屏幕格式（mono / gray4 / gray16）由面板或 CLI 写 state.json：
+                // 下一拍热切换，不用重启守护；格式变了就强推一帧，别让签名挡住。
+                if let Some((wanted, ts)) = disk_format() {
+                    if wanted != store.format || ts > store.format_set_at {
+                        let changed = wanted != store.format;
+                        store.format = wanted;
+                        store.format_set_at = ts;
+                        if changed {
+                            if let Ok(new_fmt) = device::format(&store.format.clone()) {
+                                println!("[屏幕] 刷新格式切换为 {}（下一帧生效）", store.format);
+                                fmt = new_fmt;
+                                last_sig = None;
+                                pending_push = true;
+                                push_not_before = now();
+                            }
+                        }
+                    }
+                }
+                // 待命页要显示设备电量与 Wi-Fi：每 5 分钟刷新一次设备状态，
+                // 别让空闲页面永远停在连接那一刻的读数上。
+                if now().saturating_sub(status_at) >= 300 {
+                    status_at = now();
+                    if let Ok(s) = dev.status().await {
+                        model.battery = s.battery_percent;
+                        model.rssi = s.wifi_rssi_dbm.map(i16::from);
+                        model.battery_at = Some(now());
+                    }
+                }
+                // 双击确认：两次短按后 650ms 内没有第三次点击，才落定「静音切换」。
+                // 放在扫描 tick 里判断，省掉一条额外的定时分支；最坏晚 2 秒生效。
+                if clicks.1 == 2
+                    && chrono::Local::now().timestamp_millis() - clicks.0 >= 650
+                {
+                    clicks = (0, 0);
+                    model.settings.sound_enabled = !model.settings.sound_enabled;
+                    store.model = model.clone();
+                    store.settings_explicit = true;
+                    if let Err(e) = save_store(&store) {
+                        eprintln!("设置保存失败: {e}");
+                    }
+                    store.settings_explicit = false;
+                    model.quip = if model.settings.sound_enabled {
+                        "提示音已开"
+                    } else {
+                        "已静音"
+                    }
+                    .into();
+                    println!("[手势] 双击确认 → {}", model.quip);
+                    // 屏幕右下角给个即时反馈（下一帧会被真实花絮替换）。
+                    let scene = layout::draw(
+                        &model,
+                        now(),
+                        if model.settings.animation { frame } else { 0 },
+                    );
+                    push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
+                    last_card = Some(card_sig(&model, now()));
+                    // 手势反馈已经闪了一次，主画面别紧跟着再闪：一并走冷却闸门。
+                    last_push_at = now();
+                    push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
+                    pending_push = false;
                 }
                 // 交还设备的判定放在扫描之前：判定用上一拍的状态，
                 // grace 以秒计，差一拍不影响，却让「跟随已关闭」时也能正常释放。
-                // 草稿还在等确认时先别撒手：一释放，用户就按不出「确认」了。
+                // 跟随被手动关掉时立刻释放：这是「暂时别上屏」的开关，不该等宽限期。
+                let follow = model.settings.follow_enabled;
                 if standby
-                    && draft.is_none()
-                    && may_release(&model, now(), grace)
-                    && !session_writing(&model)
+                    && (!follow || (may_release(&model, now(), grace) && !session_writing(&model)))
                 {
-                    println!("任务已结束（{grace} 秒内没有活跃任务）：释放设备，回到待命。");
+                    if follow {
+                        println!("任务已结束（{grace} 秒内没有活跃任务）：释放设备，回到待命。");
+                    } else {
+                        println!("跟随已关闭：释放设备，回到待命（`dsh-pet set --follow on` 可恢复）。");
+                    }
                     // 记下交还时刻：外层重新待命后，冷却期内不再立刻抢回来。
                     store.released_at = Some(now());
                     let _ = save_store(&store);
@@ -2186,87 +2546,79 @@ async fn cmd_run(args: &Args) -> Result<()> {
                 if !model.settings.follow_enabled {
                     continue;
                 }
-                if scan_and_report(&mut model, &mut watcher, &mut store, &dev, true).await
-                    && draft.is_none()
-                    && push_if_changed(&dev, &mut model, &mut store, &fonts, fmt, frame, &mut last_sig)
-                        .await
-                {
-                    frame = (frame + 1) % 6;
+                // 扫描到变化：先只标记「想刷新」，真正的推送统一走下面的冷却闸门。
+                let changed = scan_and_report(&mut model, &mut watcher, &mut store, &dev, true).await;
+                // 子智能体状态也要每拍更新：父会话「已完成」但队友还在跑时，
+                // 主卡应显示「队友在跑」而不是完成（DSH 侧边栏也是这么显示的）。
+                if team.sync(&mut model, &dsh_root()) {
+                    // 子智能体开始/结束：落盘，面板端也能马上看到。
+                    store.model = model.clone();
+                    let _ = save_store(&store);
+                }
+                if changed {
+                    let at = now();
+                    let sig = card_sig(&model, at);
+                    if refresh_due(
+                        last_card.as_ref(),
+                        &sig,
+                        last_push_at,
+                        at,
+                        model.settings.refresh_secs as i64,
+                    ) {
+                        pending_push = true;
+                    }
+                }
+                // 冷却期内攒着不推；到点一次性推当前最新状态，避免连续整屏闪。
+                if pending_push && now() >= push_not_before {
+                    if push_if_changed(
+                        &dev, &mut model, &mut store, &fonts, fmt, frame, &mut last_sig,
+                    )
+                    .await
+                    {
+                        frame = (frame + 1) % 6;
+                        last_push_at = now();
+                        push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
+                        last_card = Some(card_sig(&model, now()));
+                        pending_push = false;
+                    }
                 }
             }
             event = dev.next_event() => {
                 match event {
                     Ok(Some(zectrix_sdk::Event::Key { key, action })) => {
                         println!("[按键] {key:?} {action:?}");
-                        // 语音草稿优先吃三个短按：这时上下键是「投给谁」，
-                        // 确认键是「粘贴」，都不能再执行主页面的含义。
-                        if let Some(mut d) = draft.take() {
-                            let taken = matches!(
-                                (key, action),
-                                (zectrix_sdk::Key::Up, zectrix_sdk::KeyAction::Short)
-                                    | (zectrix_sdk::Key::Down, zectrix_sdk::KeyAction::Short)
-                                    | (zectrix_sdk::Key::Confirm, zectrix_sdk::KeyAction::Short)
-                            );
-                            if taken {
-                                match (key, action) {
-                                    (zectrix_sdk::Key::Up, _) => {
-                                        d.cycle(-1);
-                                        draft = Some(d);
-                                    }
-                                    (zectrix_sdk::Key::Down, _) => {
-                                        d.cycle(1);
-                                        draft = Some(d);
-                                    }
-                                    _ => {
-                                        if d.text.trim().is_empty() {
-                                            println!("[语音] 没有可用文字，丢弃");
-                                            last_sig = None;
-                                        } else {
-                                            match deliver_voice(d.clone()).await {
-                                                Ok(what) => {
-                                                    println!("[语音] {what}");
-                                                    last_sig = None;
-                                                }
-                                                Err(e) => {
-                                                    // 失败不丢文本：多半是窗口没在前台、
-                                                    // 剪贴板被占这类一次性问题，再按一次就行。
-                                                    eprintln!("[语音] 投递失败: {e}");
-                                                    d.hint = Some(format!("投递失败：{e}"));
-                                                    d.expires_at = now() + voice::PREVIEW_SECS;
-                                                    draft = Some(d);
-                                                }
-                                            }
-                                        }
-                                    }
+                        // 确认键连击：1 次=回首页，2 次=静音切换，3 次=退出回普通界面。
+                        // 双击不立刻执行：等 650ms 确认没有第三次点击，才在下一拍落定
+                        // （见扫描 tick 里的 pending_double_click），避免想退出时先被静音。
+                        if matches!(
+                            (key, action),
+                            (zectrix_sdk::Key::Confirm, zectrix_sdk::KeyAction::Short)
+                        ) {
+                            let at = chrono::Local::now().timestamp_millis();
+                            let count = if clicks.1 > 0 && at - clicks.0 <= 700 {
+                                clicks.1 + 1
+                            } else {
+                                1
+                            };
+                            clicks = (at, count);
+                            if count >= 3 {
+                                // 三击：退出到普通界面。停跟随 → 守护回到待命、释放设备；
+                                // 要再回来，在插件设置页把「跟随」打开即可。
+                                model.settings.follow_enabled = false;
+                                store.model = model.clone();
+                                store.settings_explicit = true;
+                                store.released_at = Some(now());
+                                if let Err(e) = save_store(&store) {
+                                    eprintln!("设置保存失败: {e}");
                                 }
-                                if let Some(d) = draft.as_ref() {
-                                    let scene = layout::voice(d, now());
-                                    push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
-                                } else if draft.is_none() {
-                                    // 投递成功或丢弃：立刻把主界面推回去，不等下一次扫描。
-                                    if push_if_changed(
-                                        &dev,
-                                        &mut model,
-                                        &mut store,
-                                        &fonts,
-                                        fmt,
-                                        frame,
-                                        &mut last_sig,
-                                    )
-                                    .await
-                                    {
-                                        frame = (frame + 1) % 6;
-                                    }
-                                }
-                                continue;
+                                println!(
+                                    "[手势] 三击确认 → 退出到普通界面（跟随已暂停，控制面板里可恢复）"
+                                );
+                                break Ok(());
                             }
-                            // 长按换造型之类的其它手势：收起草稿，按键照常处理。
-                            println!("[语音] 收起草稿，按键交给常规操作");
-                            last_sig = None;
                         }
-                        // 短按翻任务、长按换造型：两个手势各占一个，互不抢。
-                        // 设备只上报「上下短按」「上下长按」「确认短按」三种
-                        // （确认长按被固件的录音流程消费），所以能用的组合正好够。
+                        // 允许的手势：上下短按翻任务/翻页，确认单击回首页、
+                        // 双击静音、三击退出；长按按规格不做动作。
                         let handled = match (key, action) {
                             // 上下键只在任务之间翻页/选择；选项交互已取消
                             //（设备无法替你点电脑上的选项，等待时只提示回电脑）。
@@ -2281,17 +2633,6 @@ async fn cmd_run(args: &Args) -> Result<()> {
                             // 确认 = 回到首页并恢复自动跟随；不批准任何操作。
                             (zectrix_sdk::Key::Confirm, zectrix_sdk::KeyAction::Short) => {
                                 model.selected = None;
-                                true
-                            }
-                            // 长按：照着 Buddy 图鉴挨个换，换完立刻上屏。
-                            (zectrix_sdk::Key::Up, zectrix_sdk::KeyAction::Long) => {
-                                let s = cycle_skin(&mut model, &mut store, -1);
-                                println!("[造型] 长按上键 → {}（{}）", s.name(), s.id());
-                                true
-                            }
-                            (zectrix_sdk::Key::Down, zectrix_sdk::KeyAction::Long) => {
-                                let s = cycle_skin(&mut model, &mut store, 1);
-                                println!("[造型] 长按下键 → {}（{}）", s.name(), s.id());
                                 true
                             }
                             _ => false,
@@ -2309,96 +2650,26 @@ async fn cmd_run(args: &Args) -> Result<()> {
                             .await
                         {
                             frame = (frame + 1) % 6;
+                            last_push_at = now();
+                            last_card = Some(card_sig(&model, now()));
                         }
                     }
                     Ok(Some(zectrix_sdk::Event::RecordingStarted)) => {
-                        // 长按确认键：固件进入录音，设备自己显示「正在聆听」。
-                        // 主机侧什么都不用推，只需要知道「现在别碰设备」。
+                        // 新版规格：长按确认键不做动作。固件仍会上报录音事件，
+                        // 这里只标记「设备正忙」，不转写、不粘贴、不推送。
                         recording = true;
-                        println!("[语音] 开始录音（松开确认键结束）");
+                        println!("[手势] 长按确认键：按规格无操作（不录音、不投递）");
                     }
                     Ok(Some(zectrix_sdk::Event::RecordingFinished { audio, reason })) => {
+                        // 长按无操作：录音数据直接丢弃，设备回到主画面。
                         recording = false;
-                        // 松手即到：设备侧的录音条已经收起，屏幕现在是空的。
-                        // 这里必须一路走完「落盘 → 转写 → 给用户看」，中间不能
-                        // 把设备晾在那儿——用户刚说完话，正等着看它听成了什么。
-                        let pcm = audio.map(|a| a.samples).unwrap_or_default();
-                        let seconds = pcm.len() as f32 / 16_000.0;
-                        if seconds < 0.4 {
-                            // 误触确认键：固件也会给一个空/极短的录音，别当命令处理。
-                            println!("[语音] 录音 {seconds:.1} 秒（{reason:?}），太短，忽略");
-                            continue;
+                        if let Some(audio) = audio {
+                            println!(
+                                "[手势] 忽略长按录音（{} 秒，{reason:?}）",
+                                audio.samples.len() as f32 / 16_000.0
+                            );
                         }
-                        let clip = match voice::save_wav(&out_dir().join("recordings"), &pcm) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("录音保存失败: {e}");
-                                continue;
-                            }
-                        };
-                        println!(
-                            "[语音] 录音 {:.1} 秒 → {}（{reason:?}）",
-                            clip.seconds,
-                            clip.path.display()
-                        );
-                        let scene = layout::voice_note(
-                            "正在识别…",
-                            "松手后在本机转写，音频不上传云端",
-                            2,
-                        );
-                        push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
-                        // 首次要载模型（几秒），之后每段只剩推理时间。
-                        match transcribe_voice(&mut asr, &clip.path).await {
-                            Ok(text) if text.trim().is_empty() => {
-                                println!("[语音] 识别结果为空");
-                                let scene =
-                                    layout::voice_note("没听清", "靠近设备再说一次，或直接打字", 0);
-                                push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
-                            }
-                            Ok(text) => {
-                                let targets = voice_targets(&model, now());
-                                let mut d = voice::Draft::new(
-                                    text,
-                                    clip.seconds,
-                                    targets,
-                                    now(),
-                                );
-                                // 默认选中屏幕上正在显示的那个会话：多数时候
-                                // 用户就是对着当前这轮在说话。id 必须用
-                                // thread_id（基础 UUID）——它才是深链认的 id。
-                                if let Some(cur) = model.current(now()) {
-                                    let cur_id = cur
-                                        .event
-                                        .thread_id
-                                        .clone()
-                                        .unwrap_or_else(|| cur.event.task_id.clone());
-                                    d.current = Some(cur_id.clone());
-                                    if let Some(i) =
-                                        d.targets.iter().position(|t| t.session == cur_id)
-                                    {
-                                        d.index = i;
-                                    }
-                                }
-                                println!(
-                                    "[语音] 识别完成（{} 字，{} 个会话可选）：{}",
-                                    d.text.chars().count(),
-                                    d.targets.len(),
-                                    d.text
-                                );
-                                let scene = layout::voice(&d, now());
-                                push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
-                                draft = Some(d);
-                            }
-                            Err(e) => {
-                                eprintln!("[语音] 转写失败: {e}");
-                                let scene = layout::voice_note(
-                                    "转写失败",
-                                    &format!("{e}（先说一次短句试试）"),
-                                    0,
-                                );
-                                push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
-                            }
-                        }
+                        last_sig = None;
                     }
                     Ok(Some(zectrix_sdk::Event::Disconnected { reason })) => {
                         break Err(anyhow::anyhow!("设备连接已结束（{reason:?}），按约定不自动重连"));
@@ -2420,15 +2691,42 @@ async fn cmd_run(args: &Args) -> Result<()> {
 }
 
 /// 待命：只读会话文件，不连设备，等到出现活跃任务（正在工作/等你处理）为止。
-/// 返回 `true` = 该去占用设备了；`false` = WorkBuddy 已退出，回外层重新等。
+/// 返回 `true` = 该去占用设备了；`false` = DeepSeek Harness 已退出，回外层重新等。
 /// 这里刻意不响铃、不推屏：设备还没连上，也还不该被占用。
-async fn wait_for_task(store: &mut Store, watcher: &mut Watcher) -> Result<bool> {
+async fn wait_for_task(
+    store: &mut Store,
+    watcher: &mut Watcher,
+    parent: Option<u32>,
+) -> Result<bool> {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 待命阶段也要看「子智能体是否还在跑」：父会话可能早已 turn/end，
+    // 但只要队友还在跑，就该占回设备显示「队友在跑」。
+    let mut team = TeamScan::default();
     loop {
         tick.tick().await;
-        if !workbuddy_running() {
-            println!("WorkBuddy 已退出：结束待命。");
+        if parent.is_some_and(|p| !pid_alive(p)) {
+            println!("控制面板已退出：结束待命。");
+            return Ok(false);
+        }
+        // 外层待命也要读设置：`dsh-pet set --follow off` 之后不能再用启动时的旧快照
+        // 判断「要不要占设备」，否则刚释放又立刻被拉起来。
+        refresh_settings(&mut store.model);
+        // 插件设置页（pet-config.json）优先：保存后最多 2 秒生效。
+        if apply_pet_config(store) {
+            store.settings_explicit = true;
+            let _ = save_store(store);
+        }
+        // 屏幕格式也要每拍同步：待命阶段保存状态时不能用启动时的格式旧值盖掉用户的修改。
+        if let Some((wanted, ts)) = disk_format() {
+            if wanted != store.format || ts > store.format_set_at {
+                println!("[屏幕] 刷新格式切换为 {wanted}（下次占用时生效）");
+                store.format = wanted;
+                store.format_set_at = ts;
+            }
+        }
+        if !dsh_running() {
+            println!("DeepSeek Harness 已退出：结束待命。");
             return Ok(false);
         }
         if !store.model.settings.follow_enabled {
@@ -2439,6 +2737,13 @@ async fn wait_for_task(store: &mut Store, watcher: &mut Watcher) -> Result<bool>
             if let Err(e) = save_store(store) {
                 eprintln!("配置保存失败: {e}");
             }
+        }
+        // 队友还在跑：即使父会话没有新记录，也要算「有活跃工作」。
+        if team.sync(&mut store.model, &dsh_root()) {
+            let _ = save_store(store);
+        }
+        if !store.model.team_busy.is_empty() {
+            println!("检测到子智能体仍在运行：准备占用设备。");
         }
         for ev in events {
             println!(
@@ -2461,9 +2766,12 @@ async fn wait_for_task(store: &mut Store, watcher: &mut Watcher) -> Result<bool>
             let ready = store
                 .released_at
                 .is_none_or(|r| now().saturating_sub(r) >= RELEASE_LEASE);
-            let fresh = store
-                .released_at
-                .is_none_or(|r| store.model.tasks.iter().any(|t| t.updated_at > r));
+            let fresh = store.released_at.is_none_or(|r| {
+                // 有新记录，或者此刻正有人在等你处理（等待态不会再写日志，
+                // 但设备就是那条通知的出口，必须重新占上）。
+                store.model.tasks.iter().any(|t| t.updated_at > r)
+                    || store.model.needs_action(now())
+            });
             let working = store
                 .model
                 .running(now())
@@ -2476,7 +2784,7 @@ async fn wait_for_task(store: &mut Store, watcher: &mut Watcher) -> Result<bool>
     }
 }
 
-/// 守护：WorkBuddy 一启动就进入待命（只读会话、不占设备），一有任务才开始占用
+/// 守护：DeepSeek Harness 一启动就进入待命（只读会话、不占设备），一有任务才开始占用
 /// 设备推送；任务全部结束并静默 `idle_grace` 秒就交还设备，回到待命。
 /// 设备休眠/空闲会主动断开（Timeout），这类断线按 15 秒步长退避重连，
 /// 连续失败 5 次才停（避免反复抢占设备）。ResultUnknown 不重发、不抢连接——
@@ -2497,50 +2805,61 @@ fn device_hint(e: &anyhow::Error) -> Option<&'static str> {
     }
 }
 
-/// 最近 `WRITING_WINDOW` 秒内还有**正在跟随的**会话文件在增长：说明那边的活没停。
+/// 最近 `WRITING_WINDOW` 秒内还有**正在跟随的**会话日志在增长：说明那边的活没停。
 /// 屏幕上的状态可能没变（同一轮里持续在跑），但这时候把设备交还，下一次扫描
-/// 又会把它抢回来——先等它停笔。只认模型里跟踪的会话，定时任务等不上屏的
+/// 又会把它抢回来——先等它停笔。只认模型里跟踪的会话，已归档/子代理等不上屏的
 /// 文件不能拿来续命，否则设备会被它们永久占住。
 fn session_writing(model: &Model) -> bool {
     let tracked: std::collections::HashSet<&str> = model
         .tasks
         .iter()
-        .filter(|t| t.source == "workbuddy")
+        .filter(|t| t.source == "dsh")
         .filter_map(|t| t.event.thread_id.as_deref())
         .collect();
     if tracked.is_empty() {
         return false;
     }
-    let Ok(projects) = std::fs::read_dir(workbuddy_root()) else {
+    let Ok(projects) = std::fs::read_dir(dsh_root()) else {
         return false;
     };
     let deadline = now() - WRITING_WINDOW;
     for project in projects.flatten() {
-        let dir = project.path();
-        if !dir.is_dir() {
+        let proj_dir = project.path();
+        if !proj_dir.is_dir() {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(sessions) = std::fs::read_dir(&proj_dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        for session in sessions.flatten() {
+            let session_dir = session.path();
+            let dir_name = session_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !tracked.contains(dir_name) {
                 continue;
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if !tracked.contains(stem) {
-                continue;
-            }
-            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            let Ok(logs) = std::fs::read_dir(&session_dir) else {
                 continue;
             };
-            let secs = modified
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if secs >= deadline {
-                return true;
+            for log in logs.flatten() {
+                let name = log.file_name();
+                let name = name.to_string_lossy();
+                // 会话日志：`session.v4.jsonl.zstd`（跨版本迁移会并存旧 .vN，取到哪份都算）。
+                if !name.starts_with("session") || !name.ends_with(".jsonl.zstd") {
+                    continue;
+                }
+                let Ok(modified) = log.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                let secs = modified
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if secs >= deadline {
+                    return true;
+                }
             }
         }
     }
@@ -2568,6 +2887,7 @@ async fn cmd_watch(args: &Args) -> Result<()> {
 
     // 显式给了地址就记住：下次 `watch` / `run` / `push` 不带参数也能连上。
     let mut store = load_store();
+    apply_pet_config(&mut store);
     if let Some(t) = args.get("target").map(str::to_string) {
         if store.target.as_deref() != Some(t.as_str()) {
             store.target = Some(t);
@@ -2601,14 +2921,27 @@ async fn cmd_watch(args: &Args) -> Result<()> {
             write_heartbeat();
         }
     });
-    let mut watcher = Watcher::new(workbuddy_root());
+    retire_legacy_autostart();
+    let mut watcher = Watcher::new(dsh_root());
+    // DSH 插件 spawn 时传 `--watch-pid <DSH Host pid>`；旧面板形态传 `--parent`。
+    // 父进程消失就自退（DSH 崩溃/被强杀时 dispose 不会执行，只能靠这条兜底）。
+    let parent = args
+        .get("watch-pid")
+        .or_else(|| args.get("parent"))
+        .and_then(|v| v.parse::<u32>().ok());
     loop {
-        if !workbuddy_running() {
+        if let Some(p) = parent {
+            if !pid_alive(p) {
+                println!("DSH 已退出：宠物收尾，释放设备。");
+                return Ok(());
+            }
+        }
+        if !dsh_running() {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
-        println!("检测到 WorkBuddy，进入待命（只读会话，不占用设备）。");
-        if !wait_for_task(&mut store, &mut watcher).await? {
+        println!("检测到 DeepSeek Harness，进入待命（只读会话，不占用设备）。");
+        if !wait_for_task(&mut store, &mut watcher, parent).await? {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -2619,13 +2952,13 @@ async fn cmd_watch(args: &Args) -> Result<()> {
         };
         session
             .flags
-            .push(("exit-with-workbuddy".into(), "true".into()));
+            .push(("exit-with-dsh".into(), "true".into()));
         session.flags.push(("standby".into(), "true".into()));
         let mut fails = 0u32;
         let mut exhausted = false;
         loop {
             match cmd_run(&session).await {
-                // 任务结束交还设备、或 WorkBuddy 退出：都回外层重新待命。
+                // 任务结束交还设备、或 DeepSeek Harness 退出：都回外层重新待命。
                 Ok(()) => break,
                 Err(e) => {
                     eprintln!("本次会话异常结束：{e}");
@@ -2647,7 +2980,7 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                         exhausted = true;
                         break;
                     }
-                    if !workbuddy_running() {
+                    if !dsh_running() {
                         break;
                     }
                     let wait = 15 * fails as u64;
@@ -2703,50 +3036,53 @@ async fn cmd_sound(args: &Args) -> Result<()> {
 
 fn usage() {
     println!(
-        r#"ZECTRIX Note 4 像素宠物（WorkBuddy 版）
+        r#"鳄鱼大宠物 · ZECTRIX Note 4 墨水屏（DeepSeek Harness 插件）
 
-用法：
-  workbuddy-pet init    [--target IP|ID]                           首次使用引导：检查配置 → 连设备 → 预览 → 确认推送 → 自启
-  workbuddy-pet preview [--demo <状态>] [--out 路径] [--frame N] [--session <ID>] [--skin <id>]
-                                                          渲染 400×300 预览，不连设备（--session 只看该会话）
-  workbuddy-pet scene   [--demo <状态>]                            打印布局 JSON（调试用）
-  workbuddy-pet sessions                                           列出可跟随的本机会话、状态与清单进度
-  workbuddy-pet skin     list|set <id>|current                        查看/切换 Buddy 图鉴造型（守护下一帧生效）
-  workbuddy-pet check   [--target IP|ID]                           只核对设备，不推画面
-  workbuddy-pet sound   --status waiting|done [--target IP|ID] [--volume 0-100]
-                                                          只播放一次提示音
-  workbuddy-pet quip                                       看一眼此刻从 WorkBuddy 界面读到的花絮（诊断用）
-  workbuddy-pet push    [--demo <状态>] [--target IP|ID] [--format gray16|gray4|mono]
-                                                          单次推送后立即断开
-  workbuddy-pet run     [--target IP|ID] [--format F] [--volume 0-100] [--no-sound] [--no-animation]
-                                                          常驻：跟随状态、按键翻页、提示音
-  workbuddy-pet watch   [--target IP|ID] [--idle-grace 秒]         守护：WorkBuddy 一启动就待命，有任务才占用设备，
-                                                          任务结束 5 分钟内没有新任务即交还并回到待命
-  workbuddy-pet autostart on|off|status [--target IP|ID]           开机自启 + 看门狗；on 会装一份副本到数据目录、
-                                                          立刻启动看门狗（不依赖下次登录），并写自启项
-  workbuddy-pet ensure  [--verbose]                                看门狗入口：WorkBuddy 在跑、守护不在跑就拉起；
-                                                          幂等，可安全重复调用
-  workbuddy-pet where                                              显示数据与配置路径
-  workbuddy-pet forget                                             删除本机状态缓存
+  DSH 启动时会自动拉起宠物（`watch`），退出时自动收尾；一般不需要手动运行。
+  设置：DeepSeek Harness → 设置 → Plugins → 鳄鱼大宠物（跟随/模式/声音/设备 IP/格式）。
+
+诊断命令：
+  dsh-pet preview [--demo <状态>] [--out 路径] [--frame N] [--session <ID>]
+                                           渲染 400×300 预览，不连设备
+  dsh-pet scene   [--demo <状态>]          打印布局 JSON（调试用）
+  dsh-pet sessions                         列出可跟随的本机会话、状态与清单进度
+  dsh-pet set     [--sound on|off] [--volume 0-100] [--follow on|off] [--animation on|off]
+                  [--refresh 秒] [--calm on|off] [--format mono|gray4|gray16]
+                                           查看/修改跟随与刷新设置（2 秒内生效）
+  dsh-pet check   [--target IP|ID]         只核对设备，不推画面
+  dsh-pet sound   --status waiting|done [--target IP|ID] [--volume 0-100]
+                                           只播放一次提示音
+  dsh-pet push    [--demo <状态>] [--target IP|ID] [--format mute]
+                                           单次推送后立即断开
+  dsh-pet watch   [--watch-pid PID] [--idle-grace 秒]
+                                           守护：有任务才占用设备，任务结束 5 分钟无新任务即交还
+  dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
+                                           语音链路诊断
+  dsh-pet where                            显示数据与配置路径
+  dsh-pet forget                           删除本机状态缓存
 
 状态：working / waiting / done / error / stopped / unknown / idle
-  演示状态带「演示」标记，不写入任务历史，也不代表真实任务进度。
-造型：pixel 像素喵 / abacus 金算喵 / fortune 暴富喵 / astro 星际喵
-
 设备需与电脑同一局域网，并在设备上开启「设置 → 网络同步 → 待机保持 Wi-Fi」。
 "#
     );
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args = Args::parse(std::env::args().skip(1).collect());
-    let cmd = args.cmd.clone();
     // `--version` / `-V`：只打版本号，别掉进 usage 分支。
     if args.cmd == "version" || args.cmd == "-V" || args.has("version") {
-        println!("workbuddy-pet {}", env!("CARGO_PKG_VERSION"));
+        println!("dsh-pet {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    let runtime = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
+    if let Err(e) = runtime.block_on(async_main(args)) {
+        eprintln!("错误: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn async_main(args: Args) -> Result<()> {
+    let cmd = args.cmd.clone();
     let result = match cmd.as_str() {
         "preview" | "scene" => {
             if cmd == "scene" {
@@ -2759,12 +3095,13 @@ async fn main() {
         }
         "sessions" | "ls" => cmd_sessions(&args).await,
         "skin" | "buddy" | "pet" => cmd_skin(&args),
+        "set" | "settings" | "config" => cmd_set(&args),
         "init" | "setup" | "guide" => cmd_init(&args).await,
         "check" => cmd_check(&args).await,
         "sound" | "tone" => cmd_sound(&args).await,
         "voice" | "say" => cmd_voice(&args),
         "uia" | "tree" => {
-            // 诊断用：把 WorkBuddy 窗口的可访问性树打出来，定位输入框与发送按钮。
+            // 诊断用：把 DeepSeek Harness 窗口的可访问性树打出来，定位输入框与发送按钮。
             let nodes = uia::dump_nodes();
             println!("共 {} 个节点（只列可聚焦 / 可编辑 / 按钮）", nodes.len());
             for (i, n) in nodes.iter().enumerate() {
@@ -2791,28 +3128,38 @@ async fn main() {
             Ok(())
         }
         "quip" => {
-            // 诊断用：看一眼此刻从 WorkBuddy 界面读到的花絮是什么。
+            // 诊断用：看一眼此刻从 DeepSeek Harness 界面读到的状态是什么。
             match uia::current_quip() {
-                Some(quip) => println!("界面当前花絮：{quip}"),
-                None => println!("没读到花絮（窗口不在、气泡被关掉，或此刻不在任务中）"),
+                Some(quip) => println!("界面当前状态：{quip}"),
+                None => {
+                    // 读不到时把候选节点摊出来，方便判断是「树没长出来」还是
+                    // 「界面确实没有状态行」（比如空闲）。
+                    let nodes = uia::dump_nodes();
+                    println!("没读到状态行（节点 {} 个）", nodes.len());
+                    for n in nodes.iter().filter(|n| {
+                        n.name.contains("正在") || n.name.contains("深度求索中")
+                    }) {
+                        println!("  候选 {} class={} name={}", n.control, n.class, n.name);
+                    }
+                    if let Some(q) = uia::pick_from_nodes(&nodes) {
+                        println!("  按诊断节点重建后应读到：{q}");
+                    }
+                }
             }
             Ok(())
         }
         "push" | "once" => cmd_push(&args).await,
         "run" | "start" => cmd_run(&args).await,
         "watch" | "daemon" => cmd_watch(&args).await,
-        "autostart" | "startup" => cmd_autostart(&args),
-        "ensure" | "watchdog" => cmd_ensure(&args),
-        "supervise" | "supervisor" => cmd_supervise(&args).await,
         "balance" | "credit" => {
             println!("积分余额是云端数据、本地读不到，该显示项已下线；");
-            println!("左下角现在显示当前会话的上下文占用（读 workbuddy.db 的 session_usage）。");
+            println!("左下角现在显示当前会话的上下文占用（读 DSH 会话日志里的 token 用量 / contextWindow）。");
             Ok(())
         }
         "where" => {
             println!("配置: {}", state_path().display());
             println!("输出: {}", out_dir().display());
-            println!("会话: {}", workbuddy_root().display());
+            println!("会话: {}", dsh_root().display());
             Ok(())
         }
         "forget" => {
@@ -2832,15 +3179,15 @@ async fn main() {
         }
     };
     if let Err(e) = result {
-        eprintln!("错误: {e}");
-        std::process::exit(1);
+        return Err(e);
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workbuddy_pet::model::ProgressSource;
+    use dsh_pet::model::ProgressSource;
 
     fn event(seq: u64, status: Status) -> TaskEvent {
         TaskEvent {
@@ -2853,14 +3200,14 @@ mod tests {
             progress: None,
             progress_source: ProgressSource::Agent,
             progress_steps: None,
-            agent: "WorkBuddy".into(),
+            agent: "DeepSeek Harness".into(),
         }
     }
 
     fn model_with(seq: u64, status: Status, at: i64) -> Model {
         let mut m = Model::default();
         m.settings.follow_enabled = true;
-        m.apply(event(seq, status), "workbuddy", at).unwrap();
+        m.apply(event(seq, status), "dsh", at).unwrap();
         m
     }
 
@@ -2894,15 +3241,15 @@ mod tests {
             progress: None,
             progress_source: ProgressSource::Agent,
             progress_steps: None,
-            agent: "WorkBuddy".into(),
+            agent: "DeepSeek Harness".into(),
         };
         let mut m = Model::default();
         m.settings.follow_enabled = true;
-        m.apply(mk("a-u1", "sess-a", 1, Status::Working), "workbuddy", 100)
+        m.apply(mk("a-u1", "sess-a", 1, Status::Working), "dsh", 100)
             .unwrap();
-        m.apply(mk("a-u2", "sess-a", 2, Status::Done), "workbuddy", 110)
+        m.apply(mk("a-u2", "sess-a", 2, Status::Done), "dsh", 110)
             .unwrap();
-        m.apply(mk("b-u1", "sess-b", 1, Status::Done), "workbuddy", 120)
+        m.apply(mk("b-u1", "sess-b", 1, Status::Done), "dsh", 120)
             .unwrap();
 
         let targets = voice_targets(&m, 130);
@@ -2911,7 +3258,7 @@ mod tests {
         assert!(ids.contains(&"sess-b"), "别的会话也要能选：{ids:?}");
         assert!(
             !ids.iter().any(|id| id.contains("-u")),
-            "必须用基础会话 id，深链才认：{ids:?}"
+            "必须用基础会话 id，不能用带轮次后缀的 task_id：{ids:?}"
         );
         assert_eq!(
             ids.iter().filter(|id| **id == "sess-b").count(),
@@ -2938,12 +3285,12 @@ mod tests {
         let mut m = model_with(1, Status::Done, 200);
         assert!(!may_release(&m, 230, 60));
         // 宽限期内用户又发了一条：继续占着，不必断开再重连。
-        m.apply(event(2, Status::Working), "workbuddy", 230)
+        m.apply(event(2, Status::Working), "dsh", 230)
             .unwrap();
         assert!(!may_release(&m, 231, 60));
         assert!(!may_release(&m, 400, 60));
         // 再次结束后重新计时。
-        m.apply(event(3, Status::Done), "workbuddy", 410).unwrap();
+        m.apply(event(3, Status::Done), "dsh", 410).unwrap();
         assert!(!may_release(&m, 410, 60));
         assert!(may_release(&m, 470, 60));
     }
@@ -2965,7 +3312,7 @@ mod tests {
 
         // 确认处理完、这一轮结束：从结束那一刻起算，满 grace 才交还。
         let mut done = m.clone();
-        done.apply(event(2, Status::Done), "workbuddy", 5_000)
+        done.apply(event(2, Status::Done), "dsh", 5_000)
             .unwrap();
         assert!(!may_release(&done, 5_299, 300));
         assert!(may_release(&done, 5_300, 300));
@@ -3072,5 +3419,73 @@ mod tests {
         let back: Store = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.model.settings.pet_skin, "astro");
         assert!(!back.skin_explicit);
+    }
+
+    #[test]
+    fn onoff_parser_accepts_common_forms() {
+        for v in ["on", "ON", "true", "1", "yes", "开"] {
+            assert!(parse_onoff(v).unwrap(), "{v} 应解析为开");
+        }
+        for v in ["off", "OFF", "false", "0", "no", "关"] {
+            assert!(!parse_onoff(v).unwrap(), "{v} 应解析为关");
+        }
+        assert!(parse_onoff("maybe").is_err(), "乱七八糟的值必须报错，不能猜");
+        assert_eq!(onoff_label(true), "开");
+        assert_eq!(onoff_label(false), "关");
+    }
+
+    fn card(status: Status, detail: &str) -> CardSig {
+        CardSig {
+            status: Some(status),
+            title: "任务".into(),
+            detail: detail.into(),
+            progress: None,
+            ctx_pct: Some(10),
+        }
+    }
+
+    #[test]
+    fn refresh_throttle_keeps_urgent_transitions_immediate() {
+        // 第一次总要刷。
+        assert!(refresh_due(None, &card(Status::Working, "a"), 0, 100, 30));
+        // 状态切换立刻刷。
+        assert!(refresh_due(
+            Some(&card(Status::Working, "a")),
+            &card(Status::Done, "a"),
+            100,
+            101,
+            30
+        ));
+        // 工作中「工具活动」这类细节变化：节流期内不刷，到点才刷。
+        assert!(!refresh_due(
+            Some(&card(Status::Working, "a")),
+            &card(Status::Working, "b"),
+            100,
+            101,
+            30
+        ));
+        assert!(refresh_due(
+            Some(&card(Status::Working, "a")),
+            &card(Status::Working, "b"),
+            100,
+            130,
+            30
+        ));
+        // 等待页的题干变化必须立刻刷（那是要人处理的信号）。
+        assert!(refresh_due(
+            Some(&card(Status::Waiting, "问题一")),
+            &card(Status::Waiting, "问题二"),
+            100,
+            101,
+            60
+        ));
+        // 节流为 0 = 不节流，每拍都可刷。
+        assert!(refresh_due(
+            Some(&card(Status::Working, "a")),
+            &card(Status::Working, "b"),
+            100,
+            100,
+            0
+        ));
     }
 }

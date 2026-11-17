@@ -1,5 +1,5 @@
 <#
-  One-shot installer for workbuddy-pet (Windows 10/11 x64).
+  One-shot installer for dsh-pet (Windows 10/11 x64).
 
   Usage:
     powershell -ExecutionPolicy Bypass -File scripts\install.ps1
@@ -117,7 +117,7 @@ if ($SkipTests) {
 Pop-Location
 
 Step '[5/5] verify'
-$exe = Join-Path $script:repo 'target\release\workbuddy-pet.exe'
+$exe = Join-Path $script:repo 'target\release\dsh-pet.exe'
 if (-not (Test-Path $exe)) { Fail 5 "exe not found: $exe" }
 Info ("exe        : {0} ({1:N1} MB)" -f $exe, ((Get-Item $exe).Length / 1MB))
 & $exe where
@@ -150,7 +150,7 @@ if ($DeviceIp -ne '') {
 Write-Host ''
 Write-Host 'DONE' -ForegroundColor Green
 Info "exe     : $exe"
-Info 'next    : start WorkBuddy, then run one of these:'
+Info 'next    : start DeepSeek Harness, then run one of these:'
 Info "            & `"$exe`" watch                          # follow tasks until you press Ctrl+C"
 Info "            & `"$exe`" autostart on --target <IP>      # run in background at login"
 Info '          (PowerShell needs the & before a quoted path; cmd does not)'

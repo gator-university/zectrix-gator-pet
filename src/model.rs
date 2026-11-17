@@ -66,9 +66,17 @@ pub struct Task {
     pub source: String,
     pub updated_at: i64,
     pub stale: bool,
+    /// 这条会话自己的回合已经结束，但它的子智能体（agent team / subagent）
+    /// 还有未结束的回合在跑。DSH 侧边栏会显示「N 个子智能体运行中」，
+    /// 所以设备也不该把它当成「任务完成」。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagent_busy: bool,
 }
 impl Task {
     pub fn label(&self) -> &'static str {
+        if self.subagent_busy {
+            return "子智能体运行中";
+        }
         if self.status() == Status::Waiting && self.event.detail.starts_with("权限审批") {
             "等待权限审批"
         } else {
@@ -76,6 +84,9 @@ impl Task {
         }
     }
     pub fn status(&self) -> Status {
+        if self.subagent_busy {
+            return Status::Working;
+        }
         if self.stale && !self.event.status.terminal() {
             Status::Unknown
         } else {
@@ -94,6 +105,12 @@ pub struct Settings {
     pub stale_minutes: u32,
     pub sound_enabled: bool,
     pub volume: u8,
+    /// 常规刷新节流：两次「内容更新」之间至少隔多少秒（0 = 不节流，每 2 秒都可刷）。
+    ///
+    /// 墨水屏每次刷屏会闪一下，而「正在执行命令」这类细节会频繁变化；节流后
+    /// 状态切换（工作/等待/完成/出错）仍然立刻上屏，只有细节变化要等这个间隔。
+    #[serde(default)]
+    pub refresh_secs: u32,
     /// 当前 Buddy 造型 id（sprite::Skin）。老 state.json 没这个字段，
     /// `default_pet_skin` 让它退回像素喵，升级不会把画面换成别的猫。
     #[serde(default = "default_pet_skin")]
@@ -112,6 +129,9 @@ impl Default for Settings {
             stale_minutes: 15,
             sound_enabled: true,
             volume: 90,
+            // 默认不节流，保持原有「跟着 Agent 实时动」的行为；嫌闪的人用
+            // `dsh-pet set --calm on` 一键切成安静模式（关动画 + 30 秒节流）。
+            refresh_secs: 0,
             pet_skin: default_pet_skin(),
         }
     }
@@ -124,17 +144,34 @@ pub struct Model {
     pub tasks: Vec<Task>,
     #[serde(default)]
     pub settings: Settings,
-    /// 当前展示会话的上下文占用（已用 / 窗口），来自 WorkBuddy 的
-    /// workbuddy.db `session_usage.used/size`——本地精确可读、实时更新，
+    /// 当前展示会话的上下文占用（已用 / 窗口），来自 DSH 会话日志里的
+    /// token 用量与 `contextWindow`——本地精确可读、实时更新，
     /// 比手填的云端积分余额可靠，也直接决定「还能聊多久」。
     #[serde(default)]
     pub ctx_used: Option<u32>,
     #[serde(default)]
     pub ctx_size: Option<u32>,
-    /// 底部花絮短语。优先用推送时刻从 WorkBuddy 界面读到的真花絮
+    /// 最近一次连上设备时读到的电量（%）与 Wi-Fi 信号（dBm）。
+    /// 空闲页左下角显示「电量 N% · Wi-Fi 良好/一般/弱」；设备不在手边时
+    /// 没有新读数，就显示最后一次的，不编造。
+    /// 最近一次有活跃任务的时间（秒）。待命页用它决定鳄鱼是 `idle` 还是 `sleep`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rssi: Option<i16>,
+    /// 底部花絮短语。优先用推送时刻从 DeepSeek Harness 界面读到的真状态
     /// （见 `set_live_quip`）；读不到时退回内置短语池轮换。
     #[serde(default)]
     pub quip: String,
+    /// 子智能体还在跑的**父会话**（键 = 父会话 id，值 = 最近一次确认时间）。
+    /// 父会话自己的回合可能已经 `turn/end completed`，但 agent team 的子智能体
+    /// 还有未结束的回合；DSH 界面会显示「N 个子智能体运行中」，这里跟着显示。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub team_busy: std::collections::HashMap<String, i64>,
     #[serde(skip)]
     pub selected: Option<String>,
     #[serde(skip)]
@@ -161,22 +198,57 @@ const QUIPS: [&str; 16] = [
     "正在给灵感浇水",
 ];
 
+/// 花絮池：优先读可替换的 `assets/quips.txt`（一行一句，`#` 开头为注释，
+/// 超过 20 字截断），找不到或为空时退回内置池。路径优先级：
+/// `DSH_PET_QUIPS` 环境变量 → exe 同目录 `assets/quips.txt` / `quips.txt`
+/// → 当前目录 `assets/quips.txt`（开发仓库直接跑时）。
+pub fn quip_pool() -> &'static Vec<String> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Vec<String>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(p) = std::env::var("DSH_PET_QUIPS") {
+            candidates.push(p.into());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("assets").join("quips.txt"));
+                candidates.push(dir.join("quips.txt"));
+            }
+        }
+        candidates.push(std::path::PathBuf::from("assets/quips.txt"));
+        for path in candidates {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut out: Vec<String> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                out.push(line.chars().take(20).collect());
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        QUIPS.iter().map(|s| s.to_string()).collect()
+    })
+}
+
 /// 轮换一条与当前不同的短语。用纳秒做伪随机即可——没必要引入 rand。
 fn next_quip(current: &str) -> String {
+    let pool = quip_pool();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as usize)
         .unwrap_or(0);
-    let mut idx = nanos % QUIPS.len();
-    if QUIPS[idx] == current {
-        idx = (idx + 1) % QUIPS.len();
+    let mut idx = nanos % pool.len();
+    if pool[idx] == current {
+        idx = (idx + 1) % pool.len();
     }
-    QUIPS[idx].to_string()
-}
-
-/// 花絮短语池（测试与文档用）。
-pub fn quip_pool() -> &'static [&'static str] {
-    &QUIPS
+    pool[idx].clone()
 }
 
 /// 花絮在 400×300 画面上只占右下角一条（11 号字、约 214px 宽），
@@ -207,7 +279,7 @@ pub fn clean(s: &str, max: usize) -> String {
         .take(max)
         .collect()
 }
-pub const TASKS_PER_PAGE: usize = 4;
+pub const TASKS_PER_PAGE: usize = 3;
 
 /// 主卡换人需要新任务领先这么多秒。两个会话并行时各自每几秒写一条记录，
 /// 时间差一直很小；只有对方确实领先一大截（自己长时间没动）才值得换屏。
@@ -217,12 +289,14 @@ impl Model {
     /// 重建一次派生的跟随缓存（沿用上游迁移语义）；外部 Agent 事件与设置保留。
     /// 版本 2：轮次 ID 改为时间戳格式（-u<ts>），旧的序号式 ID（-t<N>）全部作废，
     /// 否则尾读重数后的新事件会被旧任务的 seq 挡在门外。
+    /// 版本 3：跟随源从 DeepSeek Harness 换成 DeepSeek Harness（`dsh`），上一版的
+    /// 任务缓存整批退场，免得设备停在一条早就没人跟的会话上。
     pub fn migrate_cache(&mut self) -> bool {
-        if self.cache_version >= 2 {
+        if self.cache_version >= 3 {
             return false;
         }
-        self.tasks.retain(|t| t.source != "workbuddy");
-        self.cache_version = 2;
+        self.tasks.retain(|t| t.source != "dsh" && t.source != "dsh");
+        self.cache_version = 3;
         true
     }
 
@@ -286,6 +360,7 @@ impl Model {
                 source: source.into(),
                 updated_at: at,
                 stale: false,
+                subagent_busy: false,
             };
         } else {
             self.tasks.push(Task {
@@ -293,6 +368,7 @@ impl Model {
                 source: source.into(),
                 updated_at: at,
                 stale: false,
+                subagent_busy: false,
             });
         }
         self.tasks
@@ -337,7 +413,7 @@ impl Model {
             .unwrap_or(Status::Unknown)
     }
 
-    /// 把推送时刻从 WorkBuddy 界面读到的真花絮写上屏。
+    /// 把推送时刻从 DeepSeek Harness 界面读到的真状态写上屏。
     ///
     /// 只保留拟人短句本身（去掉「准备中」前缀，超长截断），返回画面是否变了。
     /// 读界面的活由 `uia` 模块负责，这里只做落库判定，便于单测。
@@ -357,7 +433,7 @@ impl Model {
         let mut tasks: Vec<_> = self
             .tasks
             .iter()
-            .filter(|t| t.source != "workbuddy" || self.settings.follow_enabled)
+            .filter(|t| t.source != "dsh" || self.settings.follow_enabled)
             .cloned()
             .collect();
         tasks.sort_by_key(|t| std::cmp::Reverse((t.updated_at, t.event.seq)));
@@ -370,6 +446,24 @@ impl Model {
             {
                 t.stale = true;
             }
+            // 会话自己的回合结束了，但它的子智能体还在跑（DSH 侧边栏显示
+            // 「N 个子智能体运行中」）：仍按「工作中」显示，不能当成完成。
+            let sid = t
+                .event
+                .thread_id
+                .as_deref()
+                .unwrap_or(t.event.task_id.as_str());
+            t.subagent_busy = self.team_busy.contains_key(sid)
+                || self
+                    .team_busy
+                    .keys()
+                    .any(|parent| sid.starts_with(parent.as_str()));
+            if t.subagent_busy {
+                // 队友在跑：当作「刚刚有活动」，否则会被陈旧判定压成待确认，
+                // 释放判定也会误以为「没有新记录」而把设备交还。
+                t.stale = false;
+                t.updated_at = t.updated_at.max(now);
+            }
         }
         tasks
     }
@@ -379,7 +473,7 @@ impl Model {
         self.visible(now)
             .into_iter()
             .filter(|t| {
-                if t.source == "workbuddy" {
+                if t.source == "dsh" {
                     if let Some(id) = &t.event.thread_id {
                         if !seen.insert(id.clone()) {
                             return false;
@@ -461,6 +555,7 @@ impl Model {
                 source: "demo".into(),
                 updated_at: now,
                 stale: false,
+                subagent_busy: false,
             });
         }
         let active = self.running(now);
@@ -498,10 +593,22 @@ impl Model {
             .map(|t| t.status() == Status::Waiting)
             .unwrap_or(false)
     }
+    /// 设备上的显示顺序：Waiting 永远置顶（最该被看见的是「有事等你处理」），
+    /// 其余按最近更新时间倒序。翻页与渲染必须用同一个顺序，否则按键会「翻回原页」。
+    pub fn display_order(&self, now: i64) -> Vec<Task> {
+        let mut tasks = self.running(now);
+        tasks.sort_by(|a, b| {
+            (b.status() == Status::Waiting)
+                .cmp(&(a.status() == Status::Waiting))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        tasks
+    }
+
     pub fn cycle(&mut self, step: i32, now: i64) {
         self.demo = None;
         // 单个活跃任务时上下键无事可做：翻到历史任务只会让人困惑。
-        let active = self.running(now);
+        let active = self.display_order(now);
         if active.len() <= 1 {
             return;
         }
@@ -550,14 +657,14 @@ mod tests {
         let mut m = Model::default();
         m.settings.follow_enabled = true;
         m.settings.volume = 35;
-        m.apply(ev(1, Status::Stopped), "workbuddy", 100).unwrap();
+        m.apply(ev(1, Status::Stopped), "dsh", 100).unwrap();
         m.apply(ev(1, Status::Done), "agent", 100).unwrap();
         assert!(m.migrate_cache());
         assert_eq!(m.tasks.len(), 1);
         assert_eq!(m.tasks[0].source, "agent");
         assert!(m.settings.follow_enabled);
         assert_eq!(m.settings.volume, 35);
-        m.apply(ev(2, Status::Working), "workbuddy", 101).unwrap();
+        m.apply(ev(2, Status::Working), "dsh", 101).unwrap();
         let mut restored: Model = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert!(!restored.migrate_cache());
         assert_eq!(restored.tasks.len(), 2);
@@ -568,32 +675,32 @@ mod tests {
         m.settings.follow_enabled = true;
         let mut e = ev(1, Status::Working);
         e.thread_id = Some("chat-a".into());
-        m.apply(e.clone(), "workbuddy", 10).unwrap();
+        m.apply(e.clone(), "dsh", 10).unwrap();
         e.task_id = "new-turn".into();
         e.seq = 2;
         e.status = Status::Done;
-        m.apply(e.clone(), "workbuddy", 10).unwrap();
+        m.apply(e.clone(), "dsh", 10).unwrap();
         assert!(m.running(11).is_empty());
         e.task_id = "other".into();
         e.thread_id = Some("chat-b".into());
         e.status = Status::Working;
-        m.apply(e.clone(), "workbuddy", 12).unwrap();
+        m.apply(e.clone(), "dsh", 12).unwrap();
         e.task_id = "third".into();
         e.thread_id = Some("chat-c".into());
         e.status = Status::Waiting;
-        m.apply(e, "workbuddy", 13).unwrap();
+        m.apply(e, "dsh", 13).unwrap();
         assert_eq!(m.running(14).len(), 2);
         assert_eq!(m.running(14)[0].event.task_id, "other");
         assert_eq!(m.running(14)[1].status(), Status::Waiting);
         // 有会话在跑就显示在跑的那条；等待确认的排它后面。
         assert_eq!(m.current(14).unwrap().event.task_id, "other");
         assert_eq!(m.current(14).unwrap().status(), Status::Working);
-        m.selected = Some("workbuddy:new-turn".into());
+        m.selected = Some("dsh:new-turn".into());
         assert_eq!(m.current(14).unwrap().status(), Status::Working);
         let mut update = m.running(14)[0].event.clone();
         update.seq += 1;
         update.status = Status::Waiting;
-        m.apply(update, "workbuddy", 15).unwrap();
+        m.apply(update, "dsh", 15).unwrap();
         assert_eq!(m.running(15)[0].event.task_id, "other");
         assert!(m.running(2000).len() == 2);
         // 等待确认不会自己过期：20 分钟后仍留在列表里——屏幕必须一直显示它，
@@ -609,14 +716,14 @@ mod tests {
         let mut a = ev(1, Status::Working);
         a.task_id = "a".into();
         a.thread_id = Some("ta".into());
-        m.apply(a, "workbuddy", 100).unwrap();
+        m.apply(a, "dsh", 100).unwrap();
         m.auto_focus(100);
-        assert_eq!(m.selected.as_deref(), Some("workbuddy:a"));
+        assert_eq!(m.selected.as_deref(), Some("dsh:a"));
 
         let mut b = ev(1, Status::Working);
         b.task_id = "b".into();
         b.thread_id = Some("tb".into());
-        m.apply(b, "workbuddy", 110).unwrap();
+        m.apply(b, "dsh", 110).unwrap();
         m.auto_focus(110);
         assert_eq!(
             m.current(110).unwrap().event.task_id,
@@ -628,7 +735,7 @@ mod tests {
         let mut done = ev(2, Status::Done);
         done.task_id = "a".into();
         done.thread_id = Some("ta".into());
-        m.apply(done, "workbuddy", 120).unwrap();
+        m.apply(done, "dsh", 120).unwrap();
         m.auto_focus(120);
         assert_eq!(m.current(120).unwrap().event.task_id, "b");
     }
@@ -644,19 +751,19 @@ mod tests {
         waiting.task_id = "old".into();
         waiting.thread_id = Some("chat-a".into());
         waiting.detail = "有写入操作等你确认 · 请回电脑点允许".into();
-        m.apply(waiting, "workbuddy", 100).unwrap();
+        m.apply(waiting, "dsh", 100).unwrap();
 
         let mut working = ev(2, Status::Working);
         working.task_id = "live".into();
         working.thread_id = Some("chat-b".into());
-        m.apply(working, "workbuddy", 200).unwrap();
+        m.apply(working, "dsh", 200).unwrap();
         assert_eq!(m.current(210).unwrap().event.task_id, "live");
 
         // 没人干活时才轮到等待确认的那条——它才是需要人处理的。
         let mut done = ev(3, Status::Done);
         done.task_id = "live".into();
         done.thread_id = Some("chat-b".into());
-        m.apply(done, "workbuddy", 300).unwrap();
+        m.apply(done, "dsh", 300).unwrap();
         assert_eq!(m.current(310).unwrap().event.task_id, "old");
         assert_eq!(m.current(310).unwrap().status(), Status::Waiting);
     }
@@ -666,13 +773,13 @@ mod tests {
         let mut m = Model::default();
         // 真实场景：上一轮的 completed 记录延迟落盘，排在新一轮 user 之后，
         // 同一 task 先被判完成；随后的工具活动必须能把任务复活。
-        assert!(m.apply(ev(1, Status::Working), "workbuddy", 10).unwrap());
-        assert!(m.apply(ev(2, Status::Done), "workbuddy", 11).unwrap());
-        assert!(m.apply(ev(3, Status::Working), "workbuddy", 12).unwrap());
+        assert!(m.apply(ev(1, Status::Working), "dsh", 10).unwrap());
+        assert!(m.apply(ev(2, Status::Done), "dsh", 11).unwrap());
+        assert!(m.apply(ev(3, Status::Working), "dsh", 12).unwrap());
         assert_eq!(m.current(13).unwrap().status(), Status::Working);
         // 终态改终态仍然拒绝
-        assert!(m.apply(ev(4, Status::Error), "workbuddy", 13).unwrap());
-        assert!(m.apply(ev(5, Status::Done), "workbuddy", 14).is_err());
+        assert!(m.apply(ev(4, Status::Error), "dsh", 13).unwrap());
+        assert!(m.apply(ev(5, Status::Done), "dsh", 14).is_err());
     }
     #[test]
     fn ordered_idempotent_and_terminal() {
@@ -700,7 +807,7 @@ mod tests {
     fn sources_are_isolated_and_demo_is_not_persisted() {
         let mut m = Model::default();
         m.settings.follow_enabled = false;
-        m.apply(ev(1, Status::Working), "workbuddy", 10).unwrap();
+        m.apply(ev(1, Status::Working), "dsh", 10).unwrap();
         assert!(m.current(11).is_none());
         m.apply(ev(1, Status::Waiting), "agent", 11).unwrap();
         m.demo = Some(Status::Done);
@@ -715,24 +822,24 @@ mod tests {
         let mut m = Model::default();
         let mut e = ev(1, Status::Working);
         e.thread_id = Some("chat-a".into());
-        m.apply(e.clone(), "workbuddy", 10).unwrap();
+        m.apply(e.clone(), "dsh", 10).unwrap();
         e.task_id = "turn-2".into();
         e.seq = 2;
-        m.apply(e, "workbuddy", 11).unwrap();
+        m.apply(e, "dsh", 11).unwrap();
         let mut other = ev(3, Status::Working);
         other.thread_id = Some("chat-b".into());
-        m.apply(other, "workbuddy", 12).unwrap();
-        m.selected = Some("workbuddy:turn-2".into());
+        m.apply(other, "dsh", 12).unwrap();
+        m.selected = Some("dsh:turn-2".into());
 
-        assert!(m.forget_session("workbuddy", "chat-a"));
+        assert!(m.forget_session("dsh", "chat-a"));
         assert!(
             m.tasks.iter().all(|t| t.event.thread_id.as_deref() != Some("chat-a")),
             "该会话的所有轮次都要退场"
         );
         assert_eq!(m.selected, None, "指向被移除任务的选中项必须清掉");
         assert_eq!(m.current(13).unwrap().event.thread_id.as_deref(), Some("chat-b"));
-        assert!(!m.forget_session("workbuddy", "chat-a"), "重复清理不应再报变化");
-        assert!(!m.forget_session("workbuddy", "chat-x"), "不存在的会话不算变化");
+        assert!(!m.forget_session("dsh", "chat-a"), "重复清理不应再报变化");
+        assert!(!m.forget_session("dsh", "chat-x"), "不存在的会话不算变化");
     }
 
     #[test]

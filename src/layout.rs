@@ -28,25 +28,148 @@ fn text_right(e: &mut Vec<Value>, s: &str, x: i32, y: i32, size: i32, width: i32
     e.push(json!({"type":"text","content":s,"x":x,"y":y,"size":size,"width_limit":width,"align":"right","weight":"regular"}));
 }
 fn title_lines(value: &str, width: usize, max: usize) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    let mut used = 0.0;
+    // 先按「词」切：连续的 ASCII 字母数字（含 - _ . / :）算一个词，避免
+    // `workbuddy` 被拦腰截成 `workb` / `uddy`；中文与标点每字一个 token。
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_ascii = false;
     for ch in value.chars() {
-        // 本机渲染用微软雅黑：ASCII 实宽约为 CJK 的 0.3 倍，按 1 估会把单词拦腰截断
-        let w = if ch.is_ascii() { 0.6 } else { 2.0 };
-        if used + w > width as f32 {
+        let ascii_word =
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '@');
+        if ascii_word {
+            if !cur_ascii && !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_ascii = true;
+        } else {
+            // ASCII 词到这就结束；中文/标点每个字都是一个可断行点（不能整段当一词，
+            // 否则「阅读 producer-board-kit 并规划团队开发方式」会在前半段就换行，
+            // 右边白白空出一大块）。
+            if cur_ascii && !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            cur_ascii = false;
+            tokens.push(ch.to_string());
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    let score =
+        |s: &str| -> f32 { s.chars().map(|c| if c.is_ascii() { 0.6 } else { 2.0 }).sum() };
+    let mut lines: Vec<String> = vec![String::new()];
+    let mut used = 0.0f32;
+    for token in tokens {
+        let tw = score(&token);
+        // 单个 token 就超过一行（超长 URL 之类）：退回按字符硬切。
+        if tw > width as f32 {
+            for ch in token.chars() {
+                let cw = if ch.is_ascii() { 0.6 } else { 2.0 };
+                if used + cw > width as f32 && !lines.last().unwrap().is_empty() {
+                    if lines.len() == max {
+                        truncate_last(&mut lines);
+                        return lines;
+                    }
+                    lines.push(String::new());
+                    used = 0.0;
+                }
+                lines.last_mut().unwrap().push(ch);
+                used += cw;
+            }
+            continue;
+        }
+        if used + tw > width as f32 && !lines.last().unwrap().is_empty() {
             if lines.len() == max {
-                let last = lines.last_mut().unwrap();
-                last.pop();
-                last.push('…');
-                break;
+                truncate_last(&mut lines);
+                return lines;
             }
             lines.push(String::new());
             used = 0.0;
         }
-        lines.last_mut().unwrap().push(ch);
-        used += w;
+        // 行首的空白丢掉，避免下一行以空格开头。
+        let token = if lines.last().unwrap().is_empty() {
+            token.trim_start().to_string()
+        } else {
+            token
+        };
+        used += score(&token);
+        lines.last_mut().unwrap().push_str(&token);
+    }
+    for line in &mut lines {
+        *line = line.trim_end().to_string();
     }
     lines
+}
+
+fn truncate_last(lines: &mut [String]) {
+    if let Some(last) = lines.last_mut() {
+        last.pop();
+        last.push('…');
+    }
+}
+
+/// 状态图标：墨水屏上比文字更快认出来。选的都是中文系统字体覆盖的字符。
+/// 「完成」例外：字体里没有像样的对勾（`✓` 缺字、`√` 是根号），所以对勾
+/// 用 `draw_check` 直接画矢量线，不走字体。
+pub fn status_icon(status: Option<Status>) -> &'static str {
+    match status {
+        Some(Status::Working) => "●",
+        Some(Status::Waiting) => "！",
+        Some(Status::Done) => "", // 完成用矢量对勾，见 draw_check
+        Some(Status::Error) => "×",
+        Some(Status::Stopped) => "■",
+        Some(Status::Unknown) | None => "?",
+    }
+}
+
+fn line(e: &mut Vec<Value>, x1: i32, y1: i32, x2: i32, y2: i32, width: i32) {
+    e.push(json!({
+        "type": "line",
+        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+        "width": width, "fill": 0
+    }));
+}
+
+/// 矢量对勾：从左下出发到拐点，再拉向右上；圆头粗线，和文字基线对齐。
+fn draw_check(e: &mut Vec<Value>, x: i32, baseline: i32, size: i32) {
+    let s = size as f32;
+    let th = (s * 0.14).round().max(2.0) as i32;
+    let mid_x = x + (s * 0.32) as i32;
+    let mid_y = baseline - (s * 0.12) as i32;
+    line(
+        e,
+        x,
+        baseline - (s * 0.44) as i32,
+        mid_x,
+        mid_y,
+        th,
+    );
+    line(
+        e,
+        mid_x,
+        mid_y,
+        x + (s * 0.98) as i32,
+        baseline - (s * 0.86) as i32,
+        th,
+    );
+}
+
+/// 画一个状态图标，返回后续文字应该从哪个 x 开始。
+fn status_glyph(
+    e: &mut Vec<Value>,
+    status: Option<Status>,
+    x: i32,
+    baseline: i32,
+    size: i32,
+) -> i32 {
+    if status == Some(Status::Done) {
+        draw_check(e, x, baseline, size);
+        x + (size as f32 * 1.28) as i32
+    } else {
+        text(e, status_icon(status), x, baseline, size, size * 2);
+        x + (size as f32 * 1.05) as i32
+    }
 }
 /// 千分位格式化：2023.15 → "2,023.15"（与设置页显示一致）。
 /// 左下角的上下文占用：`上下文 40% · 剩 181K`。
@@ -72,91 +195,109 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
     let state = t.as_ref().map(|t| t.status());
     let working = state == Some(Status::Working);
     let animate = working && model.settings.animation;
-    let phase = if animate { frame % 6 } else { 0 };
+    let _phase = if animate { frame % 6 } else { 0 };
     let mut e = vec![];
-    // 需要人处理时，界面让位给「回电脑操作」指引，不再做任务/选项导航。
+
+    // 品牌头：只留「鳄鱼大宠物」12px，右上角是当前模式徽章（演示时显示「演示」）。
+    text(&mut e, "鳄鱼大宠物", 16, 18, 12, 168);
+    let mode = if model.demo.is_some() {
+        "演示"
+    } else {
+        match (model.settings.animation, model.settings.refresh_secs) {
+            (true, 0) => "实时",
+            (true, _) => "平衡",
+            (false, 0..=45) => "安静",
+            (false, _) => "极简",
+        }
+    };
+    rect_r(&mut e, 322, 6, 62, 20, 6, Some(0));
+    text_white(&mut e, mode, 336, 21, 13, 36);
+    rect(&mut e, 16, 30, 368, 0, None);
+
+    // Waiting 永远置顶；顺序与 model.cycle 的翻页顺序保持一致。
+    let active = model.display_order(now);
+    let tasks: Vec<&crate::model::Task> = active.iter().collect();
+    // 完成画面固定 5 秒，然后回待命画面（设备是否交还由 main 的 grace 规则决定）。
+    let done_recent = t
+        .as_ref()
+        .is_some_and(|t| t.status() == Status::Done && now.saturating_sub(t.updated_at) < 5);
+    let idle = tasks.is_empty() && !done_recent;
     let needs_action = state == Some(Status::Waiting);
-    text(&mut e, "ZECTRIX / WORKBUDDY PET", 16, 19, 12, 260);
-    // 右上角实时/演示徽章：圆角黑底白字、加大、靠右上对齐；文字在徽章内居中
-    //（水平：2 字 28px 在 58 宽内居中；垂直：14 号字帽高约 10px，基线取 8+(22+10)/2=24）。
-    rect_r(&mut e, 326, 8, 58, 22, 7, Some(0));
-    text_white(
-        &mut e,
-        if model.demo.is_some() {
-            "演示"
-        } else {
-            "实时"
-        },
-        341,
-        24,
-        14,
-        30,
-    );
-    text(&mut e, "AI 工作搭子", 16, 59, 28, 340);
-    rect(&mut e, 16, 82, 368, 0, None);
-    let active = model.running(now);
-    if active.len() > 1 && model.demo.is_none() {
-        let pages = active.len().div_ceil(TASKS_PER_PAGE);
+    let multi = tasks.len() > 1 && model.demo.is_none();
+
+    if multi {
+        let pages = tasks.len().div_ceil(TASKS_PER_PAGE);
         let page = model
             .selected
             .as_ref()
-            .and_then(|key| active.iter().position(|t| &t.key() == key))
+            .and_then(|key| tasks.iter().position(|t| &t.key() == key))
             .unwrap_or(0)
             / TASKS_PER_PAGE;
         let heading = if pages > 1 {
-            format!("{} 个任务 · {}/{}", active.len(), page + 1, pages)
+            format!("{} 个任务 · {}/{}", tasks.len(), page + 1, pages)
         } else {
-            format!("{} 个任务", active.len())
+            format!("{} 个任务", tasks.len())
         };
-        text(&mut e, &heading, 20, 112, 20, 224);
-        let row_height = match active.len() {
-            2 => 62,
-            3 => 45,
-            _ => 36,
+        text(&mut e, &heading, 20, 52, 15, 320);
+        // 两个任务每个给两行；三个以上压成单行并分页，保证每行都读得全。
+        let (row_height, title_max) = match tasks.len() {
+            2 => (82, 2usize),
+            3 => (64, 1),
+            _ => (50, 1),
         };
-        for (i, task) in active
+        for (i, task) in tasks
             .iter()
             .skip(page * TASKS_PER_PAGE)
             .take(TASKS_PER_PAGE)
             .enumerate()
         {
-            let y = 143 + i as i32 * row_height;
-            let title = title_lines(&task.event.title, 24, 1).join("");
-            text(&mut e, &title, 20, y, 17, 220);
-            let status = match task.event.progress {
-                Some(p) => format!("{} · {}%", task.label(), p),
-                // 无百分比时用最近活动描述补位，让每行都能回答「在干什么」。
-                None => {
-                    if task.status() == Status::Working && !task.event.detail.is_empty() {
-                        format!("{} · {}", task.label(), task.event.detail)
-                    } else {
-                        task.label().into()
-                    }
-                }
-            };
-            text(&mut e, &status, 20, y + 16, 11, 220);
+            let y = 62 + i as i32 * row_height;
+            let lines = title_lines(&task.event.title, 25, title_max);
+            for (k, line) in lines.iter().enumerate() {
+                text(&mut e, line, 20, y + 14 + k as i32 * 19, 16, 368);
+            }
+            let status = task_status_text(task);
+            let status_y = y + 14 + lines.len() as i32 * 19 + 2;
+            let tx = status_glyph(&mut e, Some(task.status()), 20, status_y, 12);
+            text(&mut e, &status, tx, status_y, 11, 368 - (tx - 20));
         }
+    } else if idle {
+        // 待命页：没有任务时不占屏也不编造内容，只说「我在等活」。
+        text(&mut e, "待命中", 20, 58, 22, 220);
+        text(
+            &mut e,
+            if model.settings.follow_enabled {
+                "DSH 在线，等你派活"
+            } else {
+                "跟随已关闭"
+            },
+            20,
+            88,
+            15,
+            368,
+        );
+        text(&mut e, "有任务时自动上屏", 20, 142, 13, 368);
     } else {
         let headline = t.as_ref().map(|t| t.label()).unwrap_or("等待任务");
-        text(&mut e, headline, 20, 116, 22, 224);
+        let tx = status_glyph(&mut e, state, 20, 58, 22);
+        text(&mut e, headline, tx, 58, 22, 300 - (tx - 20));
         let title = t.as_ref().map(|t| t.event.title.as_str()).unwrap_or(
             if model.settings.follow_enabled {
-                "WorkBuddy 跟随已开启"
+                "DSH 跟随已开启"
             } else {
-                "本机 WorkBuddy 跟随已关闭"
+                "本机 DSH 跟随已关闭"
             },
         );
-        for (line, title) in title_lines(title, 24, 3).iter().enumerate() {
-            text(&mut e, title, 20, 146 + line as i32 * 21, 18, 220);
+        for (line, title) in title_lines(title, 25, 3).iter().enumerate() {
+            text(&mut e, title, 20, 82 + line as i32 * 19, 16, 368);
         }
         // AskUserQuestion 上屏：只显示题干 + 「回电脑处理」提示，不列选项。
-        // 设备无法点击电脑上的选项，列出选项只会让人误以为能在设备上选。
         let ask = t
             .as_ref()
             .filter(|t| t.status() == Status::Waiting)
             .map(|t| t.event.detail.clone())
             .filter(|d| {
-                !d.is_empty() && !d.starts_with("WorkBuddy 等待") && !d.starts_with("权限审批")
+                !d.is_empty() && !d.starts_with("DSH 等待") && !d.starts_with("权限审批")
             });
         let detail = t
             .as_ref()
@@ -168,41 +309,41 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                 } else if t.status() == Status::Waiting {
                     match &ask {
                         Some(q) => q.clone(),
-                        None => "请回到 WorkBuddy 确认".to_string(),
+                        None => "请回到电脑确认".to_string(),
                     }
                 } else if t.status() == Status::Done {
                     "本轮任务已结束".to_string()
                 } else if t.status() == Status::Working {
-                    // 活动描述留给下方进度区显示，这里避免重复。
                     "持续跟踪任务执行".to_string()
                 } else {
                     t.event.detail.clone()
                 }
             })
-            .unwrap_or(if model.settings.follow_enabled {
-                "在本机 WorkBuddy 中开始一个任务".to_string()
-            } else {
-                "请在网页开启跟随或接入 Agent".to_string()
+            .unwrap_or_else(|| {
+                if model.settings.follow_enabled {
+                    "在本机 DSH 中开始一个任务".to_string()
+                } else {
+                    "请在网页开启跟随或接入 Agent".to_string()
+                }
             });
         text(
             &mut e,
-            &title_lines(&detail, 30, 1).join(""),
+            &title_lines(&detail, 40, 1).join(""),
             20,
-            213,
+            142,
             13,
-            220,
+            280,
         );
-        // 题干放不下时的第二行（指引框上方，13 号字基线 230 不碰到框顶 240）。
+        // 题干放不下时的第二行（指引框上方，基线 226 不碰到框顶 236）。
         if let Some(q) = &ask {
-            let lines = title_lines(q, 30, 2);
+            let lines = title_lines(q, 32, 2);
             if lines.len() > 1 {
-                text(&mut e, &lines[1], 20, 230, 13, 220);
+                text(&mut e, &lines[1], 20, 226, 13, 220);
             }
         }
-        // 需要人处理时：圆角黑底白字徽章，一句话说清去哪确认；整体靠左对齐。
         if needs_action {
-            rect_r(&mut e, 18, 238, 122, 24, 7, Some(0));
-            text_white(&mut e, "请回到电脑确认", 30, 255, 14, 106);
+            rect_r(&mut e, 18, 236, 122, 24, 7, Some(0));
+            text_white(&mut e, "请回到电脑确认", 30, 253, 14, 106);
         }
         // 需要人处理时不画进度区：那条指引才是这一刻唯一要说的事。
         let progress = t.as_ref().filter(|_| !needs_action).and_then(|t| {
@@ -212,18 +353,17 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         });
         match progress {
             Some((p, source, steps)) => {
-                rect(&mut e, 20, 228, 212, 13, None);
+                rect(&mut e, 20, 156, 256, 13, None);
                 if p > 0 {
                     rect(
                         &mut e,
                         23,
-                        231,
-                        (206u32 * p as u32 / 100) as i32,
+                        159,
+                        (250u32 * p as u32 / 100) as i32,
                         7,
                         Some(0),
                     );
                 }
-                // 来源不同，措辞必须不同：清单完成度不是 Agent 上报的进度。
                 let label = match (source, steps) {
                     (ProgressSource::Todo, Some((done, total))) => {
                         format!("任务清单 {done}/{total} · {p}%")
@@ -231,10 +371,8 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                     (ProgressSource::Todo, None) => format!("任务清单完成度 {p}%"),
                     (ProgressSource::Agent, _) => format!("Agent 上报进度 {p}%"),
                 };
-                text(&mut e, &label, 20, 258, 12, 218);
+                text(&mut e, &label, 20, 184, 12, 264);
             }
-            // 没有可核对的百分比时，进度条区域改为文字描述当前实施状态
-            //（来自最近一次工具活动，只取工具名，不含任何参数或正文）。
             None if working => {
                 let activity = t
                     .as_ref()
@@ -243,58 +381,121 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                     .unwrap_or("处理中，暂无活动明细");
                 text(
                     &mut e,
-                    &title_lines(&format!("当前实施状态：{activity}"), 34, 1).join(""),
+                    &title_lines(&format!("当前实施状态：{activity}"), 36, 1).join(""),
                     20,
-                    236,
+                    162,
                     14,
-                    300,
+                    270,
                 );
             }
             None => {}
         }
     }
-    // 图鉴造型：30×40 点阵、4 倍像素，落在右侧 120×160 的区域。
-    // 形象、服装与道具由 sprite 按 skin 画，这里只决定位置与动画拍。
-    let skin = sprite::Skin::parse(&model.settings.pet_skin).unwrap_or_default();
-    sprite::draw(&mut e, 254, 98, 4, skin, state, phase);
+
+    // 鳄鱼：单任务/待命页画在右下角 (300,150)，90×120；多任务列表整宽，不画。
+    if !multi {
+        let action = if idle {
+            // 连续 30 分钟没有活跃任务才睡觉；never-active 的新装状态保持 idle。
+            if model
+                .last_active_at
+                .is_some_and(|l| now.saturating_sub(l) > 1800)
+            {
+                "sleep"
+            } else {
+                "idle"
+            }
+        } else if needs_action {
+            "waiting"
+        } else if working {
+            "working"
+        } else if done_recent {
+            "done"
+        } else if matches!(state, Some(Status::Error) | Some(Status::Stopped)) {
+            "error"
+        } else {
+            "idle"
+        };
+        sprite::draw_action(&mut e, 300, 150, action, 3);
+    }
 
     rect(&mut e, 16, 271, 368, 0, None);
-    // 左下角：当前展示会话的上下文占用（读 WorkBuddy 的 session_usage.used/size）。
-    // 选它的原因：本地精确可读、实时更新，且直接决定「还能聊多久」——
-    // 云端积分余额本地拿不到，手填快照会失真，已下线。
-    let source = match t
-        .as_ref()
-        .map(|t| (t.source.as_str(), t.event.agent.as_str()))
-    {
-        Some(("demo", _)) => "演示数据".to_string(),
-        Some(("workbuddy", _)) => match ctx_label(model) {
-            Some(label) => label,
-            None => "WorkBuddy 本机".to_string(),
-        },
-        Some((_, agent)) if !agent.is_empty() => agent.to_string(),
-        _ => "Agent 上报".to_string(),
-    };
-    text(&mut e, &source, 16, 285, 11, 143);
-    // 右下角：等待确认时保持回电脑指引；其余显示随任务变动轮换的花絮短语
-    // （WorkBuddy UI 的等待文案是前端随机的，磁盘拿不到，这里是同风格同步换）。
-    let quip = if model.quip.is_empty() {
-        "跟随中"
+    // 底部两态：有任务 = 上下文占用 + 花絮；空闲 = 电量/Wi-Fi + 等你派活。
+    if idle {
+        let left = match (model.battery, model.rssi) {
+            (Some(b), Some(r)) => format!("电量 {b}% · Wi-Fi {}", wifi_word(r)),
+            (Some(b), None) => format!("电量 {b}% · Wi-Fi 未知"),
+            _ => "设备未连接".to_string(),
+        };
+        text(&mut e, &left, 16, 285, 11, 190);
+        text_right(&mut e, "等你派活", 170, 285, 11, 214);
     } else {
-        model.quip.as_str()
-    };
-    text_right(
-        &mut e,
-        if needs_action {
-            "设备仅作提示"
+        let source = match t
+            .as_ref()
+            .map(|t| (t.source.as_str(), t.event.agent.as_str()))
+        {
+            Some(("demo", _)) => "演示数据".to_string(),
+            Some(("dsh", _)) => match ctx_label(model) {
+                Some(label) => label,
+                None => "DSH 本机".to_string(),
+            },
+            Some((_, agent)) if !agent.is_empty() => agent.to_string(),
+            _ => "Agent 上报".to_string(),
+        };
+        text(&mut e, &source, 16, 285, 11, 190);
+        let quip = if model.demo.is_some() {
+            "演示画面".to_string()
+        } else if !model.quip.is_empty()
+            && crate::model::quip_pool()
+                .iter()
+                .any(|q| q == &model.quip)
+        {
+            model.quip.clone()
         } else {
-            quip
-        },
-        170,
-        285,
-        11,
-        214,
-    );
+            // 状态文件里可能是旧版本留下的句子（或 quips.txt 已被替换）：
+            // 不在当前池里就换一句，不要显示过时文案。
+            let pool = crate::model::quip_pool();
+            let pick = if pool.is_empty() {
+                "跟随中".to_string()
+            } else {
+                pool[(frame as usize) % pool.len()].clone()
+            };
+            pick
+        };
+        text_right(
+            &mut e,
+            if needs_action { "设备仅作提示" } else { quip.as_str() },
+            170,
+            285,
+            11,
+            214,
+        );
+    }
     json!({"canvas":{"w":400,"h":300},"elements":e})
+}
+
+/// 每行状态短语：进度百分比 > 活动描述 > 纯状态名。
+fn task_status_text(task: &crate::model::Task) -> String {
+    match task.event.progress {
+        Some(p) => format!("{} · {}%", task.label(), p),
+        None => {
+            if task.status() == Status::Working && !task.event.detail.is_empty() {
+                format!("{} · {}", task.label(), task.event.detail)
+            } else {
+                task.label().into()
+            }
+        }
+    }
+}
+
+/// RSSI → 人话。设备贴近路由器约 -40，隔个房间 -60 上下，-70 以下就弱了。
+fn wifi_word(rssi: i16) -> &'static str {
+    if rssi >= -55 {
+        "良好"
+    } else if rssi >= -68 {
+        "一般"
+    } else {
+        "弱"
+    }
 }
 
 /// 语音投递确认页：识别文本 + 目标会话 + 还能等几秒。
@@ -530,9 +731,9 @@ mod tests {
                 progress: None,
                 progress_source: crate::model::ProgressSource::Todo,
                 progress_steps: None,
-                agent: "WorkBuddy".into(),
+                agent: "DeepSeek Harness".into(),
             },
-            "workbuddy",
+            "dsh",
             1,
         )
         .unwrap();
@@ -550,7 +751,7 @@ mod tests {
         ev.seq = 2;
         ev.progress = Some(43);
         ev.progress_steps = Some((3, 7));
-        m.apply(ev, "workbuddy", 2).unwrap();
+        m.apply(ev, "dsh", 2).unwrap();
         let s = draw(&m, 3, 0).to_string();
         assert!(s.contains("任务清单 3/7 · 43%"));
         assert!(!s.contains("当前实施状态"));
@@ -570,18 +771,18 @@ mod tests {
                 progress: None,
                 progress_source: crate::model::ProgressSource::Todo,
                 progress_steps: None,
-                agent: "WorkBuddy".into(),
+                agent: "DeepSeek Harness".into(),
             },
-            "workbuddy",
+            "dsh",
             1,
         )
         .unwrap();
         // 没有上下文数据时保持原标签；花絮短语随 apply 已换好、且来自短语池。
         let s = draw(&m, 2, 0).to_string();
-        assert!(s.contains("WorkBuddy 本机"), "无上下文数据回退原标签");
+        assert!(s.contains("DSH 本机"), "无上下文数据回退原标签");
         assert!(!s.contains("上下选任务"), "按键提示已下线");
         assert!(
-            crate::model::quip_pool().contains(&m.quip.as_str()),
+            crate::model::quip_pool().iter().any(|q| q == &m.quip),
             "花絮必须来自短语池"
         );
 
@@ -624,9 +825,9 @@ mod tests {
                 progress: None,
                 progress_source: crate::model::ProgressSource::Todo,
                 progress_steps: None,
-                agent: "WorkBuddy".into(),
+                agent: "DeepSeek Harness".into(),
             },
-            "workbuddy",
+            "dsh",
             1,
         )
         .unwrap();
@@ -655,10 +856,130 @@ mod tests {
                 let e = v["elements"].as_array().unwrap();
                 assert!(e.len() <= 200);
                 for v in e {
+                    if v["type"] == "line" {
+                        // 矢量图标（完成的对勾）：坐标是 x1/y1/x2/y2，同样必须在画布内。
+                        assert!(v["x1"].as_i64().unwrap() >= 0);
+                        assert!(v["y1"].as_i64().unwrap() >= 0);
+                        assert!(v["x2"].as_i64().unwrap() < 400);
+                        assert!(v["y2"].as_i64().unwrap() < 300);
+                        assert!(v["width"].as_i64().unwrap() >= 1);
+                        continue;
+                    }
                     assert!(v["x"].as_i64().unwrap() >= 0);
                     assert!(v["y"].as_i64().unwrap() < 300);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn header_is_brand_only_and_idle_footer_reports_device() {
+        let mut m = Model::default();
+        m.settings.follow_enabled = true;
+        m.battery = Some(88);
+        m.rssi = Some(-60);
+        let v = draw(&m, 10_000, 0).to_string();
+        assert!(v.contains("鳄鱼大宠物"), "左上只留品牌词");
+        assert!(!v.contains("AI 工作搭子"), "副标题必须删掉");
+        assert!(v.contains("待命中"));
+        assert!(v.contains("电量 88% · Wi-Fi 一般"));
+        assert!(v.contains("等你派活"));
+    }
+
+    #[test]
+    fn done_screen_hands_over_to_idle_after_five_seconds() {
+        let mut m = Model::default();
+        m.apply(
+            crate::model::Event {
+                task_id: "task-1".into(),
+                thread_id: None,
+                seq: 1,
+                status: Status::Done,
+                title: "整理今天的待办".into(),
+                detail: String::new(),
+                progress: None,
+                progress_source: crate::model::ProgressSource::Agent,
+                progress_steps: None,
+                agent: "Test".into(),
+            },
+            "agent",
+            1_000,
+        )
+        .unwrap();
+        m.quip = "测试花絮".into();
+        let done = draw(&m, 1_004, 0).to_string();
+        assert!(done.contains("任务完成"), "完成后先停留");
+        let idle = draw(&m, 1_006, 0).to_string();
+        assert!(idle.contains("待命中"), "5 秒后回待命页");
+        assert!(!idle.contains("任务完成"));
+    }
+
+    #[test]
+    fn waiting_task_is_pinned_first_and_pages_show_numbers() {
+        let mut m = Model::default();
+        for (i, status) in [
+            Status::Working,
+            Status::Working,
+            Status::Waiting,
+            Status::Working,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            m.apply(
+                crate::model::Event {
+                    task_id: format!("task-{i}"),
+                    thread_id: None,
+                    seq: 1,
+                    status,
+                    title: format!("任务{}", i),
+                    detail: String::new(),
+                    progress: None,
+                    progress_source: crate::model::ProgressSource::Agent,
+                    progress_steps: None,
+                    agent: "Test".into(),
+                },
+                "agent",
+                100 + i as i64,
+            )
+            .unwrap();
+        }
+        m.quip = "测试花絮".into();
+        let page1 = draw(&m, 200, 0);
+        let s = page1.to_string();
+        assert!(s.contains("4 个任务 · 1/2"), "四个任务要显示页码");
+        // Waiting 置顶：第一行必须是等待中的任务。
+        let first_title = page1["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["content"].as_str().is_some_and(|s| s.starts_with("任务")))
+            .next()
+            .and_then(|e| e["content"].as_str())
+            .unwrap()
+            .to_string();
+        assert_eq!(first_title, "任务2", "等待任务必须排第一");
+        m.cycle(1, 200);
+        let page2 = draw(&m, 200, 0).to_string();
+        assert!(page2.contains("4 个任务 · 2/2"));
+        assert!(page2.contains("任务0"), "第二页显示剩下的一条");
+    }
+
+    #[test]
+    fn quips_file_is_editable_and_lines_fit_the_footer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/quips.txt");
+        let text = std::fs::read_to_string(path).expect("assets/quips.txt 必须存在");
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert!(!lines.is_empty(), "花絮文件不能为空");
+        for line in lines {
+            assert!(
+                line.chars().count() <= 20,
+                "花絮超过 20 字会在底部串行：{line}"
+            );
         }
     }
 }

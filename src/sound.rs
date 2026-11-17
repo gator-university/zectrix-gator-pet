@@ -122,11 +122,12 @@ mod tests {
                 progress: None,
                 progress_source: crate::model::ProgressSource::Agent,
                 progress_steps: None,
-                agent: "WorkBuddy".into(),
+                agent: "DeepSeek Harness".into(),
             },
-            source: "workbuddy".into(),
+            source: "dsh".into(),
             updated_at: 1_700_000_000,
             stale: false,
+            subagent_busy: false,
         }
     }
 

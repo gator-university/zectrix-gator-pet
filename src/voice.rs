@@ -1,22 +1,22 @@
-//! 语音输入（v0.4.0 开发中）：设备录音 → 本机转写 → 投递到 WorkBuddy 输入框。
+//! 语音输入：设备录音 → 本机转写 → 投递到 DeepSeek Harness 输入框。
 //!
 //! 设备侧的录音由 `zectrix_sdk::Event` 直接给 16 kHz 单声道 PCM（长按确认键，
 //! 松开结束）；这里只负责主机侧两件事：
 //!
 //! 1. **转写**：SDK 不提供语音识别，必须另做。这里调一个可配置的外部命令
 //!    （默认 whisper CLI），`{wav}` 是占位符，识别结果取 stdout——换引擎只改命令。
-//! 2. **投递**：WorkBuddy 没有对外的「发消息」接口（`workbuddy://chat/<id>` 只能
-//!    切会话，没有预填/自动发送参数），只能走界面：找到输入框的 Edit 节点 →
-//!    `SetFocus` → 剪贴板 + Ctrl+V（可选回车发送）。
+//! 2. **投递**：DSH 没有对外的「发消息 / 预填输入框」接口，只能走界面：找到输入框
+//!    的 Edit 节点 → `SetFocus` → 剪贴板 + Ctrl+V（可选回车发送）。
+//!    切会话也是走界面：点侧边栏那一行（`SelectionItem`），相当于用户自己点一下。
+//!    `dsh://` 深链只支持 `dsh://open`（把窗口叫出来），不认会话 id，帮不上。
 //!
-//! 实测要点（2026-11-09，WorkBuddy 5.9.3）：
-//! - 输入框是树里唯一的 Edit（ControlType=50004），可聚焦，但**名字为空**；
+//! 实测要点（2026-11-15，DeepSeek Harness 0.2.2-rc.1）：
+//! - 输入框是树里面积最大的 Edit（类名 `GRgSLq_input`，可聚焦，名字是占位文案）；
 //! - `ElementFromPoint` 会被 Chromium 的 `Input Occlusion Window` 挡住，
 //!   所以不要靠坐标点击定位，直接 `SetFocus` 到节点更稳；
-//! - 窗口的无障碍树会「退化」：实测出现过整棵树只剩 9 个节点（只剩一个 D3D
-//!   合成面 + 标题栏），此时定位必然失败——必须如实报错，不能瞎点；
-//! - 该窗口类名为 `Chrome_WidgetWin_1`，标题是 `WorkBuddy`；用深链
-//!   `workbuddy://chat/<会话 id>` 可以把目标会话切到前台（切会话用得上）。
+//! - 窗口的无障碍树会「退化」：客户端刚连上时可能只有标题栏那几个节点，
+//!   必须重试等它长全——定位/切会话都按这个前提写；
+//! - 该窗口类名为 `Chrome_WidgetWin_1`，标题是 `<会话标题> — DeepSeek Harness`。
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct Clip {
     pub peak: u16,
 }
 
-/// 一次语音投递的候选会话。`session` 用来拼深链，`title` 只上屏。
+/// 一次语音投递的候选会话。`session` 是基础会话 id，`title` 用来在侧边栏里定位那一行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub session: String,
@@ -235,10 +235,10 @@ impl Drop for Asr {
 
 /// Python 解释器：优先显式环境变量，其次 python.org 的默认安装位置。
 ///
-/// 不能用 PATH 里的 `python` 兜底就完事——WorkBuddy 自带的 3.13 也在 PATH 里，
+/// 不能用 PATH 里的 `python` 兜底就完事——DeepSeek Harness 自带的 3.13 也在 PATH 里，
 /// 但 torch/whisper 装在 3.12 的 user site 下，走错解释器会报「没有 whisper」。
 pub fn python_exe() -> PathBuf {
-    if let Ok(p) = std::env::var("WORKBUDDY_PET_PYTHON") {
+    if let Ok(p) = std::env::var("DSH_PET_PYTHON") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
@@ -263,7 +263,7 @@ pub fn python_exe() -> PathBuf {
 /// 写到数据目录。这样下载单文件的人不用再找配套文件，而想改脚本的人把它放到
 /// exe 同目录就能覆盖。
 pub fn worker_script() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("WORKBUDDY_PET_ASR_SCRIPT") {
+    if let Ok(p) = std::env::var("DSH_PET_ASR_SCRIPT") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
         }
@@ -297,7 +297,7 @@ const WORKER_SOURCE: &str = include_str!("../scripts/asr_worker.py");
 fn embedded_script() -> Option<PathBuf> {
     let base = std::env::var("LOCALAPPDATA").ok()?;
     let path = PathBuf::from(base)
-        .join("zectrix-workbuddy-pet")
+        .join("zectrix-dsh-pet")
         .join("asr_worker.py");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
@@ -308,7 +308,7 @@ fn embedded_script() -> Option<PathBuf> {
     Some(path)
 }
 
-/// 把文本送进 WorkBuddy 输入框；`send` 为真时再按一次回车。
+/// 把文本送进 DeepSeek Harness 输入框；`send` 为真时再按一次回车。
 pub fn deliver(text: &str, send: bool) -> Result<()> {
     if text.trim().is_empty() {
         anyhow::bail!("没有可发送的文本");
@@ -334,9 +334,13 @@ pub fn list_windows() -> Vec<String> {
     imp::list_windows()
 }
 
-/// 把目标会话切到前台（WorkBuddy 自己处理深链，重复打开同一会话是幂等的）。
-pub fn open_session(session: &str) -> Result<()> {
-    imp::open_session(session)
+/// 把目标会话切到前台（点侧边栏那一行，等价于用户自己点一下）。
+///
+/// DSH 的 `dsh://` 深链只负责「把窗口叫出来」（`dsh://open`），不认会话 id，
+/// 所以切会话只能走界面。好消息是侧边栏每一行在可访问性树里是一个 TreeItem，
+/// 带 `SelectionItem` 模式——`Select()` 一步就能切过去，和用户手点完全等价。
+pub fn open_session(session: &str, title: &str) -> Result<()> {
+    imp::open_session(session, title)
 }
 
 #[cfg(windows)]
@@ -353,8 +357,10 @@ mod imp {
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ValuePatternId,
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
+        IUIAutomationSelectionItemPattern, IUIAutomationValuePattern, TreeScope_Descendants,
+        UIA_ButtonControlTypeId, UIA_ControlTypePropertyId, UIA_EditControlTypeId,
+        UIA_InvokePatternId, UIA_SelectionItemPatternId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL,
@@ -464,7 +470,7 @@ mod imp {
     pub fn focus_probe() -> Result<String> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 WorkBuddy 窗口"))?;
+            let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 DeepSeek Harness 窗口"))?;
             let before = foreground_desc();
             let ok = bring_to_front(hwnd);
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -489,21 +495,280 @@ mod imp {
         }
     }
 
-    pub fn open_session(session: &str) -> Result<()> {
-        // 必须清掉 ELECTRON_RUN_AS_NODE：从 Electron 派生的 shell 里带这个变量，
-        // 会把 URL 当脚本路径交给 node，直接报 MODULE_NOT_FOUND。
-        let url = format!("workbuddy://chat/{session}");
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .env_remove("ELECTRON_RUN_AS_NODE")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("唤起深链失败")?;
-        if !status.success() {
-            anyhow::bail!("唤起深链失败：{status}");
+    /// 目标会话切到前台：等价于用户在侧边栏点那一下。
+    ///
+    /// DSH 的 `dsh://` 深链只负责「把窗口叫出来」（`dsh://open`），不认会话 id，
+    /// 所以切会话只能走界面。好消息是侧边栏每一行在可访问性树里是 `TreeItem`
+    /// （类名含 `sessionRow`），带 `SelectionItem` 模式，`Select()` 一步就能切过去，
+    /// 和用户手点完全等价：
+    ///
+    /// 1. 把主窗口提到前台（抢不到前台就不动界面，避免在别的程序里瞎点）；
+    /// 2. 侧边栏收起时先点「展开侧边栏」；
+    /// 3. 在已渲染的行里按标题找目标；找不到就退到搜索框筛一次；
+    /// 4. 选中后轮询窗口标题，**确认真的切过去了**才返回。
+    ///
+    /// 找不到/切不过去时如实报错：宁可这次不粘贴，也不能把话贴进错的会话。
+    pub fn open_session(session: &str, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("目标会话没有标题，无法在侧边栏定位（会话 id {session}）");
+        }
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let hwnd =
+                find_window().ok_or_else(|| anyhow::anyhow!("没找到 DeepSeek Harness 窗口"))?;
+            if bring_to_front(hwnd) {
+                return select_session_row(hwnd, title);
+            }
+        }
+        anyhow::bail!(
+            "没能把 DeepSeek Harness 切到前台，这次不切会话（避免在别的窗口里误点）；点一下窗口再按确认键"
+        )
+    }
+
+    /// 在侧边栏里选中标题匹配的那一行，并等窗口标题真的变过去。
+    fn select_session_row(hwnd: HWND, title: &str) -> Result<()> {
+        // 已经在目标会话上：什么都不用点（也避免多一次无谓的选中）。
+        if window_title(hwnd).contains(title) {
+            return Ok(());
+        }
+        let automation: IUIAutomation = unsafe {
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                .context("初始化 UI Automation 失败")?
+        };
+        let mut expanded = false;
+        let mut searched = false;
+        let mut clicks = 0;
+        for attempt in 0..12 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            if let Some(row) = find_row(&automation, hwnd, title) {
+                clicks += 1;
+                unsafe { select_row(&row) }.context("选中会话行失败")?;
+                if wait_switched(hwnd, title) {
+                    if searched {
+                        let _ = unsafe { clear_search(&automation, hwnd) };
+                    }
+                    return Ok(());
+                }
+                if clicks >= 2 {
+                    anyhow::bail!("点了会话行，但窗口没有切到「{title}」");
+                }
+                continue;
+            }
+            // 行还没长出来：先展开侧边栏，再退到搜索框筛一次。
+            if !expanded && attempt == 1 {
+                let _ = unsafe { expand_sidebar(&automation, hwnd) };
+                expanded = true;
+            }
+            if !searched && attempt == 4 {
+                if unsafe { search_session(&automation, hwnd, title) }.is_ok() {
+                    searched = true;
+                    // 搜索结果渲染出来要一点时间，多等一拍。
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            }
+        }
+        if searched {
+            let _ = unsafe { clear_search(&automation, hwnd) };
+        }
+        anyhow::bail!("侧边栏里没找到「{title}」这个会话；把它切到最近（或展开侧边栏）再按确认键")
+    }
+
+    /// 等窗口标题反映目标会话（最多 2.5 秒）。
+    fn wait_switched(hwnd: HWND, title: &str) -> bool {
+        let short: String = title.chars().take(12).collect();
+        for _ in 0..25 {
+            let now = window_title(hwnd);
+            if now.contains(title) || (!short.is_empty() && now.contains(&short)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// 诊断开关：设置 DSH_PET_DEBUG_UIA 后打印找到的每一行，排查切会话用。
+    fn debug_uia() -> bool {
+        std::env::var_os("DSH_PET_DEBUG_UIA").is_some()
+    }
+
+    /// 侧边栏里标题匹配的行。完整标题优先，被截断时退到前 12 个字符。
+    ///
+    /// 两种行都算：正常侧边栏的 `sessionRow`，以及搜索框筛出来的
+    /// `searchResultRow`（它是 `<button>` 语义的 TreeItem，同样可选中/点击）。
+    /// 同一档位下优先正常的会话行。
+    fn find_row(
+        automation: &IUIAutomation,
+        hwnd: HWND,
+        title: &str,
+    ) -> Option<IUIAutomationElement> {
+        let root = unsafe { automation.ElementFromHandle(hwnd) }.ok()?;
+        let condition = unsafe {
+            automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_TreeItemControlTypeId.0),
+            )
+        }
+        .ok()?;
+        let found = unsafe { root.FindAll(TreeScope_Descendants, &condition) }.ok()?;
+        let count = unsafe { found.Length() }.ok()?;
+        let short: String = title.chars().take(12).collect();
+        // 分数越小越好：0 完整标题+会话行，1 完整标题+搜索结果，
+        // 2 前缀+会话行，3 前缀+搜索结果。
+        let mut best: Option<(u8, IUIAutomationElement)> = None;
+        for index in 0..count {
+            let Ok(element) = (unsafe { found.GetElement(index) }) else {
+                continue;
+            };
+            let class = unsafe { element.CurrentClassName() }
+                .ok()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let is_search = class.contains("searchResultRow");
+            if !is_search && !class.contains("sessionRow") {
+                continue;
+            }
+            let name = unsafe { element.CurrentName() }
+                .ok()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            if debug_uia() {
+                eprintln!("[uia] TreeItem {index} class={class:?} name={name:?}");
+            }
+            let score = if name.contains(title) {
+                if is_search {
+                    1
+                } else {
+                    0
+                }
+            } else if !short.is_empty() && name.contains(&short) {
+                if is_search {
+                    3
+                } else {
+                    2
+                }
+            } else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(b, _)| score < *b) {
+                best = Some((score, element));
+            }
+        }
+        best.map(|(_, element)| element)
+    }
+
+    /// 把搜索框清空，别把侧边栏留在「筛选结果」状态。
+    unsafe fn clear_search(automation: &IUIAutomation, hwnd: HWND) -> Result<()> {
+        unsafe {
+            let root = automation.ElementFromHandle(hwnd)?;
+            let condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_EditControlTypeId.0),
+            )?;
+            let found = root.FindAll(TreeScope_Descendants, &condition)?;
+            let count = found.Length()?;
+            for index in 0..count {
+                let Ok(element) = found.GetElement(index) else {
+                    continue;
+                };
+                let name = element
+                    .CurrentName()
+                    .ok()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if name.contains("搜索会话") {
+                    let pattern: IUIAutomationValuePattern =
+                        element.GetCurrentPatternAs(UIA_ValuePatternId)?;
+                    pattern.SetValue(&BSTR::from(""))?;
+                    return Ok(());
+                }
+            }
         }
         Ok(())
+    }
+
+    /// 真的选中一行。Chromium 的会话行只暴露 SelectionItem，没有 Invoke。
+    unsafe fn select_row(row: &IUIAutomationElement) -> Result<()> {
+        unsafe {
+            if let Ok(pattern) =
+                row.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+            {
+                pattern.Select().context("SelectionItem.Select 失败")?;
+                return Ok(());
+            }
+            if let Ok(pattern) =
+                row.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+            {
+                pattern.Invoke().context("Invoke 失败")?;
+                return Ok(());
+            }
+        }
+        anyhow::bail!("这一行既不能选中也不能点击")
+    }
+
+    /// 侧边栏收起时点「展开侧边栏」。
+    unsafe fn expand_sidebar(automation: &IUIAutomation, hwnd: HWND) -> Result<()> {
+        unsafe {
+            let root = automation.ElementFromHandle(hwnd)?;
+            let condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ButtonControlTypeId.0),
+            )?;
+            let found = root.FindAll(TreeScope_Descendants, &condition)?;
+            let count = found.Length()?;
+            for index in 0..count {
+                let Ok(element) = found.GetElement(index) else {
+                    continue;
+                };
+                let name = element
+                    .CurrentName()
+                    .ok()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if name.contains("展开侧边栏") {
+                    let pattern: IUIAutomationInvokePattern =
+                        element.GetCurrentPatternAs(UIA_InvokePatternId)?;
+                    pattern.Invoke()?;
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::bail!("没找到「展开侧边栏」按钮")
+    }
+
+    /// 退路：把标题填进「搜索会话名称」筛一次，让目标行重新渲染出来。
+    unsafe fn search_session(automation: &IUIAutomation, hwnd: HWND, title: &str) -> Result<()> {
+        unsafe {
+            let root = automation.ElementFromHandle(hwnd)?;
+            let condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_EditControlTypeId.0),
+            )?;
+            let found = root.FindAll(TreeScope_Descendants, &condition)?;
+            let count = found.Length()?;
+            for index in 0..count {
+                let Ok(element) = found.GetElement(index) else {
+                    continue;
+                };
+                let name = element
+                    .CurrentName()
+                    .ok()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                if !name.contains("搜索会话") {
+                    continue;
+                }
+                let pattern: IUIAutomationValuePattern =
+                    element.GetCurrentPatternAs(UIA_ValuePatternId)?;
+                pattern.SetValue(&BSTR::from(title))?;
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                return Ok(());
+            }
+        }
+        anyhow::bail!("没找到会话搜索框")
     }
 
     pub fn list_windows() -> Vec<String> {
@@ -547,7 +812,7 @@ mod imp {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let automation: IUIAutomation =
                 CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 WorkBuddy 窗口"))?;
+            let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 DeepSeek Harness 窗口"))?;
             let condition = automation.CreatePropertyCondition(
                 UIA_ControlTypePropertyId,
                 &VARIANT::from(UIA_EditControlTypeId.0),
@@ -588,12 +853,12 @@ mod imp {
             }
             anyhow::bail!(
                 "等了 2 秒仍没拿到输入框（最后一次看到 {last_count} 个小 Edit）。\
-                 WorkBuddy 的无障碍树没建起来，先把窗口点到前台再试"
+                 DeepSeek Harness 的无障碍树没建起来，先把窗口点到前台再试"
             )
         }
     }
 
-    /// 所有「看起来像 WorkBuddy 主窗口」的候选（可见、类名 Chrome_WidgetWin_1）。
+    /// 所有「看起来像 DeepSeek Harness 主窗口」的候选（可见、类名 Chrome_WidgetWin_1）。
     fn candidates() -> Vec<HWND> {
         struct Search {
             found: Vec<HWND>,
@@ -614,7 +879,7 @@ mod imp {
         let mut class = [0u16; 256];
         let len = unsafe { GetClassNameW(hwnd, &mut class) };
         let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
-        class == "Chrome_WidgetWin_1" && window_title(hwnd).contains("WorkBuddy")
+        class == "Chrome_WidgetWin_1" && window_title(hwnd).ends_with("DeepSeek Harness")
     }
 
     fn window_title(hwnd: HWND) -> String {
@@ -623,10 +888,10 @@ mod imp {
         String::from_utf16_lossy(&title[..len.max(0) as usize])
     }
 
-    /// 主窗口：标题就是 `WorkBuddy` 的那个；没有就退回面积最大的候选。
+    /// 主窗口：标题就是 `DeepSeek Harness` 的那个；没有就退回面积最大的候选。
     fn find_window() -> Option<HWND> {
         let all = candidates();
-        if let Some(hwnd) = all.iter().find(|h| window_title(**h) == "WorkBuddy") {
+        if let Some(hwnd) = all.iter().find(|h| window_title(**h) == "DeepSeek Harness") {
             return Some(*hwnd);
         }
         all.into_iter().max_by_key(|hwnd| {
@@ -637,21 +902,21 @@ mod imp {
     }
 
     fn focus_window() -> Result<()> {
-        let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 WorkBuddy 窗口"))?;
+        let hwnd = find_window().ok_or_else(|| anyhow::anyhow!("没找到 DeepSeek Harness 窗口"))?;
         if unsafe { bring_to_front(hwnd) } {
             return Ok(());
         }
         // 抢不到前台就别往下按 Ctrl+V：键盘事件发给的是前台窗口，
         // 那样文字会粘进用户正在看的别的程序里，比失败严重得多。
         anyhow::bail!(
-            "没能把 WorkBuddy 切到前台，这次不粘贴（避免粘到别的窗口）；点一下窗口再按确认键"
+            "没能把 DeepSeek Harness 切到前台，这次不粘贴（避免粘到别的窗口）；点一下窗口再按确认键"
         )
     }
 
     /// 把窗口提到前台，**只在最小化时**还原大小。
     ///
     /// 之前无条件 `ShowWindow(SW_RESTORE)`：它对最大化的窗口同样生效，会把窗口
-    /// 拉回普通大小——用户看到的就是「一按确认，WorkBuddy 突然缩小」。
+    /// 拉回普通大小——用户看到的就是「一按确认，DeepSeek Harness 突然缩小」。
     /// 窗口大小是用户自己的事，我们只需要它在前台。
     ///
     /// 判「在前台」用的是**同进程**而不是同一个 HWND：Electron 会有一组顶层窗口，
@@ -722,7 +987,7 @@ mod imp {
         let _ = sent;
     }
 
-    /// 前台窗口是否就是 WorkBuddy（按进程判，容许 Electron 的多个顶层窗口）。
+    /// 前台窗口是否就是 DeepSeek Harness（按进程判，容许 Electron 的多个顶层窗口）。
     unsafe fn focused_on(hwnd: HWND) -> bool {
         unsafe {
             let fg = GetForegroundWindow();
@@ -821,7 +1086,7 @@ mod imp {
         anyhow::bail!("语音投递目前只支持 Windows")
     }
 
-    pub fn open_session(_session: &str) -> Result<()> {
+    pub fn open_session(_session: &str, _title: &str) -> Result<()> {
         anyhow::bail!("语音投递目前只支持 Windows")
     }
 }

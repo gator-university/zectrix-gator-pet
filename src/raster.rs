@@ -166,6 +166,52 @@ fn draw_rect(c: &mut Canvas, el: &Value) {
     }
 }
 
+/// 线段到点的距离（用于画带圆头、抗锯齿的粗线）。
+fn seg_dist(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+    let t = (((px - x1) * dx + (py - y1) * dy) / len2).clamp(0.0, 1.0);
+    let cx = x1 + t * dx;
+    let cy = y1 + t * dy;
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// `line`：带圆头的粗线段（用来画矢量图标，比如任务完成的勾）。字体里不一定有
+/// ✓（微软雅黑就没有），与其找符号字形，不如直接画出来，形状也更可控。
+fn draw_line(c: &mut Canvas, el: &Value) {
+    let x1 = int(el, "x1", 0) as f32;
+    let y1 = int(el, "y1", 0) as f32;
+    let x2 = int(el, "x2", 0) as f32;
+    let y2 = int(el, "y2", 0) as f32;
+    let width = int(el, "width", 2).max(1) as f32;
+    let ink = el["fill"].as_u64().map(|v| v.min(255) as u8).unwrap_or(0);
+    let half = width / 2.0;
+    let minx = (x1.min(x2) - half - 1.0).floor() as i32;
+    let maxx = (x1.max(x2) + half + 1.0).ceil() as i32;
+    let miny = (y1.min(y2) - half - 1.0).floor() as i32;
+    let maxy = (y1.max(y2) + half + 1.0).ceil() as i32;
+    for py in miny..=maxy {
+        for px in minx..=maxx {
+            let dist = seg_dist(
+                px as f32 + 0.5,
+                py as f32 + 0.5,
+                x1,
+                y1,
+                x2,
+                y2,
+            );
+            let cov = ((half + 0.5 - dist) * 255.0).clamp(0.0, 255.0) as u8;
+            if cov > 0 {
+                c.blend(px, py, cov, ink);
+            }
+        }
+    }
+}
+
 fn draw_text(c: &mut Canvas, el: &Value, fonts: &Fonts) {
     let content = el["content"].as_str().unwrap_or("");
     if content.is_empty() {
@@ -220,6 +266,7 @@ pub fn render(scene: &Value, fonts: &Fonts) -> Vec<u8> {
         for el in elements {
             match el["type"].as_str() {
                 Some("rect") => draw_rect(&mut canvas, el),
+                Some("line") => draw_line(&mut canvas, el),
                 Some("text") => draw_text(&mut canvas, el, fonts),
                 _ => {}
             }
@@ -278,6 +325,19 @@ mod tests {
             &f,
         );
         assert_eq!(dark(&vline), 10);
+    }
+
+    #[test]
+    fn line_draws_a_thick_segment() {
+        let f = Fonts::load().unwrap();
+        let px = render(
+            &json!({"elements":[{"type":"line","x1":20,"y1":20,"x2":60,"y2":60,"width":4,"fill":0}]}),
+            &f,
+        );
+        let d = dark(&px);
+        assert!(d > 120 && d < 600, "粗线应画出一条实线段，实际 {d}");
+        // 端点须有圆头：起点附近也应有墨迹
+        assert!(px[(20 * 400 + 20) as usize] < 128, "起点应有圆头墨迹");
     }
 
     #[test]

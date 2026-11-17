@@ -1,12 +1,12 @@
 [package]
-name = "workbuddy-pet"
-version = "0.4.6"
+name = "dsh-pet"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
-description = "ZECTRIX Note 4 像素宠物：跟随本机 WorkBuddy 会话状态，经 zectrix-sdk 局域网直连推送"
-repository = "https://github.com/MuskCheng/zectrix-workbuddy-pet"
+description = "鳄鱼大宠物：DSH 插件 + ZECTRIX Note 4 墨水屏，跟随本机 DeepSeek Harness 会话状态"
+repository = "https://github.com/gator-university/zectrix-croc-pet"
 readme = "README.md"
-keywords = ["zectrix", "eink", "workbuddy", "pet"]
+keywords = ["zectrix", "eink", "deepseek", "harness", "pet"]
 categories = ["command-line-utilities"]
 
 [dependencies]
@@ -18,10 +18,11 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
-# 只读 WorkBuddy 的 ~/.workbuddy/workbuddy.db（session_usage.used/size）取上下文占用
-rusqlite = { version = "0.32", features = ["bundled"] }
+# 只读 DSH 的会话日志：`session.v4.jsonl.zstd` 是逐帧追加的 zstd 流。
+# 纯解码，不写；不引入额外运行时依赖。
+zstd = "0.13"
 
-# 推送时刻从 WorkBuddy 窗口读「准备中」那行花絮（UI Automation）。
-# 该文案只在渲染进程内存里，磁盘上没有副本，只能走界面读。
+# 从 DeepSeek Harness 窗口读当前活动状态，并把语音文字贴进输入框（UI Automation）。
+# 活动描述只在渲染进程内存里，磁盘上没有副本，只能走界面读。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_JobObjects", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security"] }
+windows = { version = "0.58", features = ["Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Com", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_JobObjects", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_Security"] }
