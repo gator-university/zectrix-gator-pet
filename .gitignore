@@ -2,3 +2,6 @@
 *.exe
 /out
 .worktrees/
+
+__pycache__/
+zectrix-local-push-sdk/

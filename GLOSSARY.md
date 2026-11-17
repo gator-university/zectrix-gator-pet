@@ -24,6 +24,10 @@
 | 待命 | idle / standby | 宠物进程在线但无任务；设备显示自身默认界面（v1 不占用）。 |
 | grace | 交还宽限 | 任务结束后继续守着设备的时长（默认 300 秒）。 |
 | 动作 | action | 鳄鱼的六种姿态：idle/working/waiting/done/error/sleep。 |
+| 短吻鳄 / gator | gator | 角色物种（alligator）：圆头、短宽 U 吻、上颌盖下颌；不画长 V 吻或外露齿排。路径/包名仍沿用 `croc`。 |
+| 形象基线 | style baseline | FR-CROC-05 定义的画法：90×120、2px 描边、白高光眼、浅色肚皮、chibi 头身比；六动作是同一只。 |
+| 素材契约 | asset contract | 6 个 `assets/croc/<outfit>/{action}.png`，90×120 单色 PNG（0/255），1:1 画在 (300,152)；替换同尺寸同路径文件即换形象（ADR 0007）。 |
+| 插件图标 | `plugin/icon.png` | 128×128 单色 gator 头像，由 `make_croc_v2.py --icon` 生成，经 `exports["./icon"]` 供插件商店/详情页使用。 |
 | 装扮 | outfit | 未来扩展的一整套鳄鱼皮肤，路径 `assets/croc/<outfit>/`。 |
 | 花絮 | quip | 设备右下角一句短话，来自 `assets/quips.txt`。 |
 | 模式 | mode | 实时/平衡/安静/极简，控制动画与刷新节流。 |
