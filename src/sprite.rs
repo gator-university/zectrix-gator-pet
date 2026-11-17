@@ -1,15 +1,19 @@
-//! 鳄鱼大宠物的形象层：把 `assets/croc/<outfit>/<action>.png`（30×40 单色）
-//! 以 3× 最近邻放大画到 400×300 画布上。
+//! 鳄鱼大宠物的形象层：把 `assets/croc/<outfit>/<action>.png`（90×120 单色）
+//! 以 1:1 画到 400×300 画布上。
 //!
-//! 素材契约（见 SPEC FR-CROC-03）：30×40、黑/透明，3× 放大到 90×120，
+//! 素材契约（见 SPEC FR-CROC-03 / FR-CROC-05）：90×120、L 模式、阈值 <128 为墨，
 //! 画在右下角 (300,150)。v1 只有 `default` 一套；以后加装扮只需加目录。
 //!
 //! 画法：把位图压成「贪心矩形」再交给 raster——每个矩形是场景里的一个
-//! `rect` 元素。这样一帧只有几十个元素，比逐像素画上千个矩形轻得多。
+//! `rect` 元素。这样一帧只有两三百个元素，比逐像素画上万像素轻得多。
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+
+/// 素材尺寸。v2 起素材直接按 1:1 绘制，不再做 3× 最近邻放大。
+const SPRITE_W: usize = 90;
+const SPRITE_H: usize = 120;
 
 /// 六套旧造型的 id/显示名仍保留，用于 `skin` 诊断命令兼容；
 /// 版式已经不再按造型换装，而是按动作选图（动作由当前状态决定）。
@@ -100,19 +104,19 @@ fn embedded(action: &str) -> Option<&'static [u8]> {
     })
 }
 
-/// 位图缓存：动作名 → 30×40 的黑白掩码（true = 黑）。
+/// 位图缓存：动作名 → 90×120 的黑白掩码（true = 墨）。
 fn mask(action: &str) -> &'static Vec<Vec<bool>> {
     static CACHE: OnceLock<Mutex<HashMap<String, &'static Vec<Vec<bool>>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(m) = cache.lock().unwrap().get(action) {
         return m;
     }
-    let mut out = vec![vec![false; 40]; 30];
+    let mut out = vec![vec![false; SPRITE_H]; SPRITE_W];
     if let Some(bytes) = embedded(action) {
         if let Ok(img) = image::load_from_memory(bytes) {
             let gray = img.to_luma8();
-            for y in 0..40.min(gray.height() as usize) {
-                for x in 0..30.min(gray.width() as usize) {
+            for y in 0..SPRITE_H.min(gray.height() as usize) {
+                for x in 0..SPRITE_W.min(gray.width() as usize) {
                     if gray.get_pixel(x as u32, y as u32).0[0] < 128 {
                         out[x][y] = true;
                     }
@@ -129,24 +133,24 @@ fn mask(action: &str) -> &'static Vec<Vec<bool>> {
         .or_insert(leaked)
 }
 
-/// 把 30×40 掩码压成贪心矩形，写进场景。返回画了多少个矩形。
+/// 把 90×120 掩码压成贪心矩形，写进场景。返回画了多少个矩形。
 pub fn draw_action(e: &mut Vec<Value>, x: i32, y: i32, action: &str, scale: i32) -> usize {
     let m = mask(action);
-    let mut used = vec![[false; 40]; 30];
+    let mut used = vec![[false; SPRITE_H]; SPRITE_W];
     let mut count = 0;
-    for py in 0..40usize {
-        for px in 0..30usize {
+    for py in 0..SPRITE_H {
+        for px in 0..SPRITE_W {
             if !m[px][py] || used[px][py] {
                 continue;
             }
             // 先向右扩到最大宽度
             let mut w = 0usize;
-            while px + w < 30 && m[px + w][py] && !used[px + w][py] {
+            while px + w < SPRITE_W && m[px + w][py] && !used[px + w][py] {
                 w += 1;
             }
-            // 再向下扩：整行都黑且未被占用才继续
+            // 再向下扩：整行都墨且未被占用才继续
             let mut h = 1usize;
-            while py + h < 40 {
+            while py + h < SPRITE_H {
                 let full = (0..w).all(|i| m[px + i][py + h] && !used[px + i][py + h]);
                 if !full {
                     break;
@@ -180,17 +184,74 @@ mod tests {
     fn all_actions_have_art() {
         for a in ACTIONS {
             assert!(embedded(a).is_some(), "动作 {a} 缺少 PNG");
+            let m = mask(a);
+            assert_eq!(m.len(), SPRITE_W, "动作 {a} 宽度不是 90");
+            assert_eq!(m[0].len(), SPRITE_H, "动作 {a} 高度不是 120");
+
+            let ink = m.iter().flatten().filter(|px| **px).count();
+            let pixels = SPRITE_W * SPRITE_H;
+            assert!(
+                ink * 100 >= 6 * pixels,
+                "动作 {a} 墨量只有 {:.1}%，图可能空白",
+                ink as f32 / pixels as f32 * 100.0
+            );
+            assert!(
+                ink * 100 <= 50 * pixels,
+                "动作 {a} 墨量 {:.1}% 过高，墨水瓶会糊成一块",
+                ink as f32 / pixels as f32 * 100.0
+            );
+
+            let mut min_x = SPRITE_W;
+            let mut min_y = SPRITE_H;
+            let mut max_x = 0usize;
+            let mut max_y = 0usize;
+            for x in 0..SPRITE_W {
+                for y in 0..SPRITE_H {
+                    if m[x][y] {
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x + 1);
+                        max_y = max_y.max(y + 1);
+                    }
+                }
+            }
+            assert!(
+                max_x - min_x >= 40 && max_y - min_y >= 60,
+                "动作 {a} 包围盒只有 {}×{}，太小",
+                max_x - min_x,
+                max_y - min_y
+            );
+
             let mut e = vec![];
-            let n = draw_action(&mut e, 300, 150, a, 3);
+            let n = draw_action(&mut e, 300, 150, a, 1);
             assert!(n > 20, "动作 {a} 只有 {n} 个矩形，图可能空白");
-            assert!(n < 200, "动作 {a} 矩形过多（{n}），场景会太重");
+            // 90×120 线稿贪婪矩形化后约 210–280 个；上限留给未来微调。
+            assert!(n <= 400, "动作 {a} 矩形过多（{n}），场景会太重");
+            for v in &e {
+                let x = v["x"].as_i64().unwrap();
+                let y = v["y"].as_i64().unwrap();
+                let w = v["w"].as_i64().unwrap();
+                let h = v["h"].as_i64().unwrap();
+                assert!(x >= 300 && y >= 150, "动作 {a} 有元素画到了 (300,150) 之外");
+                assert!(x + w <= 390, "动作 {a} 有元素越过右边界");
+                assert!(y + h <= 270, "动作 {a} 有元素压到底部信息线");
+            }
+        }
+    }
+
+    #[test]
+    fn actions_are_pairwise_distinct() {
+        for (i, a) in ACTIONS.iter().enumerate() {
+            for b in &ACTIONS[i + 1..] {
+                assert_ne!(mask(a), mask(b), "动作 {a} 与 {b} 的位图完全相同");
+            }
         }
     }
 
     #[test]
     fn unknown_action_draws_nothing() {
         let mut e = vec![];
-        assert_eq!(draw_action(&mut e, 0, 0, "nope", 3), 0);
+        assert_eq!(draw_action(&mut e, 0, 0, "nope", 1), 0);
         assert!(e.is_empty());
     }
 

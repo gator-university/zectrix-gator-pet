@@ -423,7 +423,9 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
         } else {
             "idle"
         };
-        sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 3);
+        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-CROC-04）。
+        // 品牌行加高后版式整体下移 2px（ticket 02），素材跟着下移，仍不压底部分隔线。
+        sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 1);
     }
 
     rect(&mut e, 16, 271 + BODY_SHIFT, 368, 0, None);
@@ -918,7 +920,9 @@ mod tests {
             for frame in 0..6 {
                 let scene = draw(&m, 100, frame);
                 let e = scene["elements"].as_array().unwrap();
-                assert!(e.len() <= 200);
+                // 90×120 鳄鱼素材贪婪矩形化后单帧约 240–285 个元素（实测：素材 208–274，
+                // 版式约 10）；ticket 01 明确允许把上限从 200 提到 400，再高就该简化素材。
+                assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
                 // 品牌行分隔线与底部分隔线把版面切成三段：品牌两行 / 版心 / 底部信息。
                 assert_bands_clear(&scene);
                 for el in e {
