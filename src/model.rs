@@ -39,6 +39,35 @@ pub enum ProgressSource {
     Todo,
 }
 
+/// 任务标题的来源。
+///
+/// - `Session`（默认）：只读 DSH 的 `session/title` 事件；没有标题时用
+///   「项目目录名 + 第 N 轮」占位。**绝不读 user/message 正文。**
+/// - `Prompt`：显式 opt-in，会话没有标题时退回首条用户消息的首行，并把它
+///   写进 state.json 与设备。提示词可能包含敏感内容，默认关闭。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleSource {
+    #[default]
+    Session,
+    Prompt,
+}
+impl TitleSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "session" => Some(Self::Session),
+            "prompt" => Some(Self::Prompt),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Prompt => "prompt",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Event {
@@ -115,6 +144,9 @@ pub struct Settings {
     /// `default_pet_skin` 让它退回像素喵，升级不会把画面换成别的猫。
     #[serde(default = "default_pet_skin")]
     pub pet_skin: String,
+    /// 任务标题来源。默认 `session`，老 state.json 没这个字段时也按它处理。
+    #[serde(default)]
+    pub title_source: TitleSource,
 }
 
 fn default_pet_skin() -> String {
@@ -133,6 +165,7 @@ impl Default for Settings {
             // `dsh-pet set --calm on` 一键切成安静模式（关动画 + 30 秒节流）。
             refresh_secs: 0,
             pet_skin: default_pet_skin(),
+            title_source: TitleSource::Session,
         }
     }
 }
