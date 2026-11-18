@@ -82,85 +82,6 @@ fn dsh_running() -> bool {
     }
 }
 
-fn startup_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|a| {
-        PathBuf::from(a)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup")
-    })
-}
-
-fn autostart_entry() -> Option<PathBuf> {
-    startup_dir().map(|d| d.join("zectrix-dsh-pet.vbs"))
-}
-
-/// 控制面板快捷方式：开始菜单 + 桌面。装好后不用记路径、不用敲命令。
-fn panel_shortcut_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        out.push(
-            PathBuf::from(appdata)
-                .join("Microsoft")
-                .join("Windows")
-                .join("Start Menu")
-                .join("Programs")
-                .join("DSH 宠物.lnk"),
-        );
-    }
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let desktop = PathBuf::from(home).join("Desktop");
-        if desktop.is_dir() {
-            out.push(desktop.join("DSH 宠物.lnk"));
-        }
-    }
-    out
-}
-
-#[cfg(windows)]
-fn write_panel_shortcut(exe: &Path) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let esc = |s: &str| s.replace('\'', "''");
-    let work = exe
-        .parent()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    for lnk in panel_shortcut_paths() {
-        let script = format!(
-            "$W=New-Object -ComObject WScript.Shell; $s=$W.CreateShortcut('{}'); \
-             $s.TargetPath='{}'; $s.WorkingDirectory='{}'; $s.Description='DSH 宠物 控制面板'; $s.Save()",
-            esc(&lnk.display().to_string()),
-            esc(&exe.display().to_string()),
-            esc(&work)
-        );
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
-}
-
-#[cfg(not(windows))]
-fn write_panel_shortcut(_exe: &Path) {}
-
-fn watch_script() -> PathBuf {
-    data_dir().join("watch.cmd")
-}
-
-/// 计划任务用的看门狗启动脚本：wscript 以隐藏窗口运行，避免出现可见命令行窗口。
-fn supervise_script() -> PathBuf {
-    data_dir().join("supervise.vbs")
-}
-
-/// 自启、计划任务统一指向这份副本：`target\release` 会被 `cargo clean` 抹掉，
-/// 拿构建目录当安装目录，早晚会出现「自启项还在、exe 没了」的静默失效。
-fn guard_bin() -> PathBuf {
-    data_dir().join("bin").join("dsh-pet.exe")
-}
-
 fn heartbeat_path() -> PathBuf {
     data_dir().join("daemon.hb")
 }
@@ -169,20 +90,9 @@ fn lock_path() -> PathBuf {
     data_dir().join("daemon.lock")
 }
 
-fn supervise_heartbeat_path() -> PathBuf {
-    data_dir().join("watchdog.hb")
-}
-
-/// 停用标记：`autostart off` 时先落这个文件，`watch.cmd` 的循环看到它就退出。
-/// 否则 `off` 杀掉守护后，那个每 10 秒重启一次的批处理还会把它拉回来。
-fn stop_flag() -> PathBuf {
-    data_dir().join("stopped.flag")
-}
-
-/// 心跳多久算新鲜。守护每 5 秒写一次，留 4 倍余量，避免一次磁盘抖动误判为死。
-const HEARTBEAT_FRESH: i64 = 20;
-
-/// 心跳文件内容：第一行 PID，第二行时间戳。
+/// 心跳文件内容：第一行 PID，第二行时间戳。非 Windows 的抢锁兜底会读它；
+/// Windows 上用内核互斥体，只有测试还在校验这个旧格式。
+#[cfg(any(not(windows), test))]
 fn parse_heartbeat(text: &str) -> Option<(u32, i64)> {
     let mut it = text.lines();
     let pid = it.next()?.trim().parse().ok()?;
@@ -196,43 +106,14 @@ fn write_heartbeat() {
     let _ = std::fs::write(heartbeat_path(), body);
 }
 
-/// 心跳是否够新。这条路径被看门狗每 10 秒走一次，所以不查进程表——
-/// 只看时间戳，避免每 10 秒拉起一次 tasklist。真正的「进程还在不在」由
-/// `daemon.lock` 里的 PID 在启动时判定。
-fn heartbeat_fresh(path: &Path, fresh: i64) -> Option<(u32, i64)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let (pid, ts) = parse_heartbeat(&text)?;
-    (now() - ts <= fresh).then_some((pid, ts))
-}
-
-fn guard_alive() -> bool {
-    heartbeat_fresh(&heartbeat_path(), HEARTBEAT_FRESH).is_some()
-}
-
-/// 该 PID 是否确实是本程序。只在启动抢锁与 `autostart off` 时调用，频率很低，
-/// 所以用 tasklist 而不是引入更多 Win32 依赖。
-#[cfg(windows)]
-fn pid_is_ours(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Ok(out) = std::process::Command::new("tasklist")
-        .args(["/NH", "/FI", &format!("PID eq {pid}")])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    else {
-        return false;
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .to_ascii_lowercase()
-        .contains("dsh-pet.exe")
-}
-
+/// 非 Windows 平台的兜底实现：真正判断 PID 归属要查系统进程表，
+/// Windows 上用内核互斥体抢锁，不需要它，所以这里保持保守的 false。
 #[cfg(not(windows))]
 fn pid_is_ours(_pid: u32) -> bool {
     false
 }
 
-/// 把锁写盘：`autostart off` 和状态查询靠它找 PID。互斥体本身不依赖这个文件。
+/// 把锁写盘：状态查询靠它找 PID。互斥体本身不依赖这个文件。
 fn write_lock_file() {
     let _ = std::fs::write(
         lock_path(),
@@ -242,8 +123,8 @@ fn write_lock_file() {
 
 /// 抢占单实例锁：同一时刻只允许一份守护连设备。
 ///
-/// Windows 上必须用内核互斥体，不能「读 lock → 写 lock」：`ensure` 拉起守护的
-/// 同一秒，看门狗的第一拍也可能拉起一份，两个进程都读到空 lock、都写、都往下跑。
+/// Windows 上必须用内核互斥体，不能「读 lock → 写 lock」：新旧两个进程在同一秒
+/// 抢锁时会都读到空 lock、都写、都往下跑。
 /// 两份守护共用一台设备时只能互相抢连接——设备端看到的是「连上又断开」，
 /// 日志里是刷不完的「设备忙碌」。互斥体由内核保证唯一，进程退出自动释放，
 /// 也就不存在陈旧锁把重启挡在门外的问题。
@@ -288,205 +169,51 @@ fn claim_instance() -> bool {
     }
 }
 
-/// 结束某个 PID（`autostart off` 用）。仅当它确实是本程序才动手，
-/// 否则心跳里的旧 PID 被系统复用时会误杀别人的进程。
-fn stop_pid(pid: u32) -> bool {
-    // 心跳文件里可能残留刚退出进程的 PID，而 Windows 会复用 PID——
-    // 万一副本恰好拿到同一个号，这里就会把自己杀掉。先挡住。
-    if pid == std::process::id() {
-        return false;
-    }
-    if !pid_is_ours(pid) {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-        unsafe {
-            let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) else {
-                return false;
-            };
-            let ok = TerminateProcess(handle, 0).is_ok();
-            let _ = CloseHandle(handle);
-            ok
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+/// 只清理旧版本（控制面板/托盘/开机自启）留下的启动产物，不写任何新启动项。
+/// 插件形态下 DSH 自己 spawn 宠物，登录自启与快捷方式都不再需要；升级后第一次
+/// 启动清一次即可。文件不存在就跳过，删不掉只告警——清理失败不该拖住启动。
+/// 返回实际删掉的个数。
+fn retire_legacy_autostart() -> usize {
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    retire_legacy_autostart_in(appdata.as_deref(), profile.as_deref())
 }
 
-/// 停掉守护与看门狗。**先停看门狗**，否则它会在 10 秒内把守护再拉起来。
-fn stop_running() {
-    for path in [supervise_heartbeat_path(), heartbeat_path()] {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some((pid, _)) = parse_heartbeat(&text) {
-                if stop_pid(pid) {
-                    println!("已结束进程 pid {pid}");
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-    let _ = std::fs::remove_file(lock_path());
-}
-
-/// 承载看门狗的计划任务名。
-#[cfg(windows)]
-const TASK_NAME: &str = "zectrix-dsh-pet";
-
-/// 任务注册成功后落的标记。判断「有没有装过任务」只读这个文件，不再去调
-/// `schtasks /query`：那个调用在受限环境里会被安全策略拦掉，连调用者一起终止，
-/// 一个读状态的动作不该有这种副作用。
-fn task_marker() -> PathBuf {
-    data_dir().join("task.installed")
-}
-
-fn task_installed() -> bool {
-    task_marker().is_file()
-}
-
-/// 调 `schtasks`，不弹窗。返回原始输出，由调用方判断成败。
-#[cfg(windows)]
-fn schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("schtasks")
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .output()
-}
-
-/// 停任务并删除。先 `end` 再 `delete`：只删不体会留下一个正在跑的实例。
-#[cfg(windows)]
-fn task_remove() {
-    let _ = schtasks(&["/end", "/tn", TASK_NAME]);
-    let _ = schtasks(&["/delete", "/tn", TASK_NAME, "/f"]);
-    let _ = std::fs::remove_file(task_marker());
-    let _ = std::fs::remove_file(supervise_script());
-}
-
-/// 复制 exe，遇到「文件被占用」（ERROR_SHARING_VIOLATION / ACCESS_DENIED）时重试：
-/// 刚被结束的守护进程还要几百毫秒才释放映像，一次性 copy 会误判成「覆盖不了」。
-fn copy_with_retry(from: &Path, to: &Path, budget: std::time::Duration) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        match std::fs::copy(from, to) {
-            Ok(_) => return Ok(()),
-            Err(e) if matches!(e.raw_os_error(), Some(32) | Some(5)) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(e);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-fn write_autostart(target: Option<&str>) -> Result<()> {
-    let current = std::env::current_exe().context("无法定位 dsh-pet.exe")?;
-    let log = data_dir().join("watch.log");
-    std::fs::create_dir_all(data_dir())?;
-    // 旧版本用 watch.cmd + stopped.flag 做自愈，现在由面板自己托管守护，删掉以免残留生效。
-    let _ = std::fs::remove_file(watch_script());
-    let _ = std::fs::remove_file(stop_flag());
-
-    // 自启项指向这份副本，不指向构建目录：`cargo clean`、换仓库位置
-    // 都会让指向 target\release 的自启项变成「还在，但一启动就找不到 exe」。
-    let installed = guard_bin();
-    let mut exe = current.clone();
-    if current != installed {
-        if let Some(dir) = installed.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        if installed.is_file() && guard_alive() {
-            println!("检测到旧版本的守护仍在运行，先停掉再替换副本…");
-            stop_running();
-        }
-        match copy_with_retry(&current, &installed, std::time::Duration::from_secs(5)) {
-            Ok(_) => exe = installed.clone(),
-            Err(e) if installed.is_file() => {
-                eprintln!("无法覆盖已安装副本（{e}），继续使用 {}", installed.display());
-                eprintln!("要换版本：先在面板里退出，再执行一次 autostart on。");
-                exe = installed.clone();
-            }
-            Err(e) => {
-                eprintln!("复制 exe 到 {} 失败（{e}），自启将指向 {}", installed.display(), current.display());
-            }
-        }
-    }
-
-    // 登录自启现在只拉起**控制面板**（隐藏到托盘），由面板自己启动/管理守护；
-    // 不再注册计划任务、不再有独立看门狗进程。
-    let entry = autostart_entry().context("找不到启动文件夹（%APPDATA%）")?;
-    let vbs = format!(
-        "' Generated by \"dsh-pet autostart on\": start the control panel in the tray at login.\r\n\
-         CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" panel --tray\", 0, False\r\n",
-        exe.display()
-    );
-    std::fs::write(&entry, vbs)?;
-
-    // 清掉旧版本的计划任务/看门狗脚本，避免升级后两套控制逻辑打架。
-    #[cfg(windows)]
-    if task_installed() {
-        task_remove();
-        println!("已移除旧版计划任务：{TASK_NAME}");
-    }
-    let _ = std::fs::remove_file(supervise_script());
-
-    if let Some(t) = target.filter(|t| !t.trim().is_empty()) {
-        // 记住目标，之后 info/status 与自动发现都不会因为没带参数而失效。
-        let mut store = load_store();
-        store.target = Some(t.to_string());
-        save_store(&store)?;
-    }
-    // 开始菜单/桌面放一个「DSH 宠物」快捷方式，双击就是控制面板（不带参数 = 面板）。
-    write_panel_shortcut(&exe);
-    println!("已设置开机启动：{}（登录后隐藏到托盘）", entry.display());
-    println!("控制面板：开始菜单或桌面「DSH 宠物」（也可以直接双击 dsh-pet.exe）");
-    println!("程序：{}", exe.display());
-    println!("日志：{}", log.display());
-    Ok(())
-}
-
-/// 只清理「开机自启」相关产物，不碰正在运行的面板/守护。
-/// 面板里的开关用这个；命令行 `autostart off` 会额外停掉后台进程。
-/// 旧版本（控制面板/托盘/开机自启）留下的东西：登录自启脚本、桌面与开始菜单快捷方式。
-/// 插件形态不再需要它们；升级后第一次启动自动清掉，避免两套逻辑抢设备。
-fn retire_legacy_autostart() {
+/// 清理逻辑本体：基目录由调用方给（`None` = 环境变量缺失），方便测试直接喂
+/// 临时目录，不用改进程级环境变量。
+fn retire_legacy_autostart_in(appdata: Option<&Path>, profile: Option<&Path>) -> usize {
     let mut targets: Vec<PathBuf> = Vec::new();
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let base = PathBuf::from(appdata);
-        targets.push(
-            base.join(r"Microsoft\Windows\Start Menu\Programs\Startup\zectrix-dsh-pet.vbs"),
-        );
-        targets.push(
-            base.join(r"Microsoft\Windows\Start Menu\Programs\Startup\croc-pet.vbs"),
-        );
-        let programs = base.join(r"Microsoft\Windows\Start Menu\Programs");
-        for name in ["DSH 宠物.lnk", "鳄鱼大宠物.lnk"] {
-            targets.push(programs.join(name));
-        }
+    if let Some(base) = appdata {
+        let programs = base
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs");
+        targets.push(programs.join("Startup").join("zectrix-dsh-pet.vbs"));
+        targets.push(programs.join("Startup").join("croc-pet.vbs"));
+        targets.push(programs.join("DSH 宠物.lnk"));
     }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        for name in ["DSH 宠物.lnk", "鳄鱼大宠物.lnk"] {
-            targets.push(PathBuf::from(&profile).join("Desktop").join(name));
-        }
+    if let Some(profile) = profile {
+        let desktop = profile.join("Desktop");
+        targets.push(desktop.join("DSH 宠物.lnk"));
+        targets.push(desktop.join("鳄鱼大宠物.lnk"));
     }
+    let mut removed = 0usize;
     for path in targets {
-        if path.exists() {
-            if std::fs::remove_file(&path).is_ok() {
-                println!("已清理旧版启动项：{}", path.display());
-            }
+        // 旧版本没装过就没有这些文件：静默跳过，别每次启动都刷日志。
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            // 被杀毒/权限挡住时只警告：宠物该起来还得起来。
+            Err(e) => eprintln!("清理旧版启动项失败（忽略）：{}：{e}", path.display()),
         }
     }
+    removed
 }
 
-/// 指定的进程是否还活着（父进程用来看面板是否被结束）。
+/// 指定的进程是否还活着（宠物用来看拉起它的 DSH 是否被强杀）。
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
@@ -1229,7 +956,7 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     // 守护与交互命令共用一份 state.json。守护内存里的 store 是启动时的快照，
-    // 若整份回写，会把别处（init / autostart / run）刚保存的设备地址覆盖成 None。
+    // 若整份回写，会把别处（init / set / run）刚保存的设备地址覆盖成 None。
     // 写入前合并一次：设备地址与格式以「磁盘上的非空值」为准，除非本次显式改了。
     let disk_bytes = std::fs::read(path).ok();
     let disk = disk_bytes
@@ -2202,7 +1929,7 @@ fn onoff_label(value: bool) -> &'static str {
 ///
 /// 只改 `state.json` 里的 `model.settings`；守护每一拍重新读磁盘，所以改完 2 秒内
 /// 生效，不需要重启守护。`--follow off` 会让守护释放设备（回到待命、不再占用），
-/// 这是「暂时让它别上屏」的开关；要连自启一起停掉用 `autostart off`。
+/// 这是「暂时让它别上屏」的开关；插件被禁用或 DSH 退出时宠物随之收尾。
 fn cmd_set(args: &Args) -> Result<()> {
     let mut store = load_store();
     let mut touched = false;
@@ -2424,8 +2151,8 @@ fn confirm(prompt: &str) -> bool {
     )
 }
 
-/// 首次使用引导：先讲清现状，再连设备、生成预览、按用户确认推送、按需开自启。
-/// 每一步都允许失败而不中断——连不上设备仍能看预览、设自启，修正后重跑即可。
+/// 首次使用引导：先讲清现状，再连设备、生成预览、按用户确认推送。
+/// 每一步都允许失败而不中断——连不上设备仍能看预览，修正后重跑即可。
 async fn cmd_init(args: &Args) -> Result<()> {
     let mut store = load_store();
     println!("DeepSeek Harness 宠物 · 初始化\n");
@@ -2477,7 +2204,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
     );
 
     // 2. 设备
-    println!("\n[1/3] 连接设备");
+    println!("\n[1/2] 连接设备");
     let mut target = args
         .get("target")
         .map(str::to_string)
@@ -2538,7 +2265,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
     }
 
     // 3. 预览：先让用户看到要推到设备上的到底是什么。
-    println!("\n[2/3] 生成预览");
+    println!("\n[2/2] 生成预览");
     let mut watcher = Watcher::new(dsh_root());
     scan_into(&mut store.model, &mut watcher);
     let scene = layout::draw(&store.model, now(), 0);
@@ -2569,13 +2296,8 @@ async fn cmd_init(args: &Args) -> Result<()> {
         println!("  已断开连接（不占用设备）");
     }
 
-    // 4. 自启
-    println!("\n[3/3] 开机自启");
-    if confirm("  登录 Windows 时自动在后台运行？") {
-        write_autostart(target.as_deref())?;
-    } else {
-        println!("  已跳过；之后可运行 `dsh-pet autostart on --target <IP>`");
-    }
+    // 不再写任何开机自启/快捷方式：插件形态下 DSH 启动时自己拉起宠物，
+    // 旧版本的残留由 `watch` 加载阶段清一次（见 retire_legacy_autostart）。
 
     println!(
         "\n初始化结束。日常使用：`dsh-pet watch{}`",
@@ -3255,7 +2977,7 @@ async fn cmd_watch(args: &Args) -> Result<()> {
         chrono::Local::now().format("%H:%M:%S"),
         std::process::id()
     );
-    // 先落一次心跳，让看门狗/状态查询立刻看到「守护在跑」，不用等第一个 tick。
+    // 先落一次心跳，状态查询立刻能看到「守护在跑」，不用等第一个 tick。
     write_heartbeat();
 
     // 显式给了地址就记住：下次 `watch` / `run` / `push` 不带参数也能连上。
@@ -3283,9 +3005,8 @@ async fn cmd_watch(args: &Args) -> Result<()> {
         "守护模式已启动：目标 {}；有任务才占用设备，{grace} 秒无活跃任务即交还。",
         target.as_deref().unwrap_or("自动发现")
     );
-    // 心跳：看门狗、`ensure`、`autostart status` 靠它判断守护在不在。5 秒一次——
-    // 心跳过期即视为死亡，间隔越短，被结束后恢复得越快。写失败（磁盘满、权限）
-    // 只影响这几个判断，不影响推送。
+    // 心跳：5 秒一次，供状态判断「宠物是否在跑」。写失败（磁盘满、权限）
+    // 只影响这个判断，不影响推送。
     tokio::spawn(async {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3294,7 +3015,11 @@ async fn cmd_watch(args: &Args) -> Result<()> {
             write_heartbeat();
         }
     });
-    retire_legacy_autostart();
+    // 旧版本（面板/托盘/登录自启）的残留只在加载阶段清一次，幂等；0 个时保持安静。
+    let retired = retire_legacy_autostart();
+    if retired > 0 {
+        println!("已清理旧版启动项 {retired} 个");
+    }
     let mut watcher = Watcher::new(dsh_root());
     // DSH 插件 spawn 时传 `--watch-pid <DSH Host pid>`；旧面板形态传 `--parent`。
     // 父进程消失就自退（DSH 崩溃/被强杀时 dispose 不会执行，只能靠这条兜底）。
@@ -3775,6 +3500,55 @@ mod tests {
         assert_eq!(parse_heartbeat("4242\n"), None);
         assert_eq!(parse_heartbeat(""), None);
         assert_eq!(parse_heartbeat("abc\ndef\n"), None);
+    }
+
+    /// T4：旧版启动项只清已知的 5 个文件；别的桌面文件不碰；缺文件时不报错，
+    /// 第二次调用返回 0（幂等）。基目录直接传临时目录，不改进程环境变量。
+    #[test]
+    fn retire_legacy_autostart_removes_only_known_artifacts() {
+        let dir = TempDir::new("retire");
+        let appdata = dir.path().join("appdata");
+        let profile = dir.path().join("profile");
+        let programs = appdata
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs");
+        let startup = programs.join("Startup");
+        let desktop = profile.join("Desktop");
+        for d in [&startup, &desktop] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let known = [
+            startup.join("zectrix-dsh-pet.vbs"),
+            startup.join("croc-pet.vbs"),
+            programs.join("DSH 宠物.lnk"),
+            desktop.join("DSH 宠物.lnk"),
+            desktop.join("鳄鱼大宠物.lnk"),
+        ];
+        for f in &known {
+            std::fs::write(f, b"legacy").unwrap();
+        }
+        let unrelated = desktop.join("unrelated.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let removed = retire_legacy_autostart_in(Some(&appdata), Some(&profile));
+
+        assert_eq!(removed, 5, "五个已知旧文件都要清掉");
+        for f in &known {
+            assert!(!f.exists(), "{} 应已删除", f.display());
+        }
+        assert!(unrelated.exists(), "不相干的桌面文件不能动");
+        assert_eq!(
+            retire_legacy_autostart_in(Some(&appdata), Some(&profile)),
+            0,
+            "第二次调用必须幂等"
+        );
+        assert_eq!(
+            retire_legacy_autostart_in(None, None),
+            0,
+            "环境变量缺失时静默跳过"
+        );
     }
 
     #[test]
