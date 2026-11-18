@@ -1,5 +1,6 @@
 /target
 *.exe
+!plugin/bin/dsh-pet.exe
 /out
 .worktrees/
 
