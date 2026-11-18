@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-gator-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.8.2 · 2026-11-18
+> 版本：0.8.3 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -263,7 +263,7 @@
 **FR-PRIV-03 日志与历史清理**
 - 期望：`pet.log` 默认只记 `session-<短号> · 状态词`，`--verbose` 才带标题；`dsh-pet forget --titles` 可把旧标题清成 session 短号并清空指纹，保留设置。
 - 状态：已验收。
-- 证据：`src/daemon.rs` 状态日志 + `cli.rs` forget 子命令；单测覆盖；0.8.0 部署时已对真机状态执行一次清理（`forget --titles`：替换 76 条标题、清空提醒指纹；旧 `pet.log` 归档后重建）。
+- 证据：`src/daemon.rs` 状态日志 + `cli.rs` forget 子命令；单测覆盖；0.8.0 部署时已对真机状态执行一次清理（`forget --titles`：替换 76 条标题、清空提醒指纹；旧 `pet.log` 归档后重建）。0.8.3 起待命阶段的导入日志同样走隐私口径（`wait_for_task` 不再打印标题，提交 `fa9f883`）。
 
 **FR-PRIV-04 历史彻底清理**
 - 期望：`forget --titles` 直接原子写净化 state（不滚 `.bak`），随后删除 `state.bak.json`/`state.corrupt-*.json`/`state.recovered.json`/`watch.log` 并逐项打印；degraded 时保留损坏现场与 recovered 证据。
@@ -291,10 +291,10 @@
 - 状态：已验收。
 
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-gator-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
-- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-gator-pet （`main` 已推送；tag `v0.8.2`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
+- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-gator-pet （`main` 已推送；tag `v0.8.3`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
 - 证据：`pnpm add "github:gator-university/zectrix-gator-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载；0.8.0 安全整改后以同一 spec 升级）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-gator-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.8.2）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.8.3）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 11. 可验证性（FR-VER）
