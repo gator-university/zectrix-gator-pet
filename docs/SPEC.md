@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.7.0 · 2026-11-18
+> 版本：0.7.1 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -160,7 +160,7 @@
 - 物种：gator / 短吻鳄（alligator）——圆头、短而宽的 U 形吻部、上颌盖住下颌；不画长 V 形吻与外露齿排。
 - 风格：粗黑描边卡通风、白高光眼、浅色肚皮分节线、短肢体；头身比 chibi（头部约占身高 45%）。
 - 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），按 1:1 绘制在 (300,152)，`scale` 保留、v1 传 1。
-- 六动作：`idle` 端咖啡、`working` 桌前敲笔记本、`waiting` 举手 + 问号、`done` 点赞 + 星星、`error` 创可贴 + × 眼 + 汗、`sleep` 蜷卧闭眼 + Z。
+- 六动作：`idle` 端咖啡、`working` 桌前敲笔记本、`waiting` 举手 + 问号、`done` 点赞 + 星星、`error` 尴尬苦笑 + 冷汗、`sleep` 蜷卧闭眼 + Z。
 - 素材契约：`assets/croc/default/{action}.png`，用户可用 6 个同尺寸同路径文件直接替换，不改代码（ADR 0007）。
 - 生成：母版 `art/gen-v3/*.png` 由 gpt-image-2（image edit 模式；idle 以用户参考图为基准、其余以 idle 为角色基准）生成并入库存 512px；`scripts/prep_croc_art.py` 统一裁剪并转换 90×120 二值图，顺带生成 `plugin/icon.png`（ADR 0008）。
 - 状态：已验收。
@@ -211,7 +211,7 @@
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `https://github.com/gator-university/zectrix-croc-pet`；本地开发用 link 目录。
 - 状态：待验证（本地 link 安装已验证；Git 地址未建仓/未发布）。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.0）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.1）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 10. 可验证性（FR-VER）
