@@ -952,3 +952,273 @@ fn tick_trace_samples_only_when_enabled() {
     assert!(summary.contains("共 12 拍"), "{summary}");
     assert!(summary.contains("最大"), "{summary}");
 }
+
+// ---- T9 补齐：配置校验/整体生效、state 合并、team busy、释放边界 ----
+
+/// 用 JSON 构造一份插件配置：与写盘前校验走同一条 `pet_config_from_obj`。
+fn pet_cfg(value: serde_json::Value) -> (PetConfig, Vec<String>) {
+    let obj = value
+        .as_object()
+        .cloned()
+        .expect("测试配置必须是 JSON 对象");
+    let mut warnings = Vec::new();
+    let cfg = pet_config_from_obj(&obj, &mut warnings);
+    (cfg, warnings)
+}
+
+fn read_store(path: &Path) -> Store {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn pet_config_rejects_unknown_mode_but_keeps_other_fields() {
+    let (cfg, warnings) = pet_cfg(serde_json::json!({"mode":"turbo","volume":10}));
+    assert_eq!(cfg.mode, None, "未知 mode 必须丢弃，不能自己猜一个近似值");
+    assert_eq!(cfg.volume, Some(10), "坏字段只影响自己，别拖累同一条配置");
+    assert!(
+        warnings.iter().any(|w| w.contains("mode")),
+        "必须提示少了哪个字段：{warnings:?}"
+    );
+
+    let mut store = Store::default();
+    assert!(apply_pet_config_value(&mut store, &cfg));
+    assert_eq!(
+        store.model.settings.refresh_secs, 0,
+        "丢弃 mode 后回落到默认节流，而不是停在上一档"
+    );
+    assert_eq!(store.model.settings.volume, 10);
+}
+
+#[test]
+fn pet_config_rejects_unsupported_format_without_touching_current_one() {
+    let (cfg, warnings) = pet_cfg(serde_json::json!({"format":"gray8"}));
+    assert_eq!(cfg.format, None);
+    assert!(warnings.iter().any(|w| w.contains("format")), "{warnings:?}");
+
+    let mut store = Store::default();
+    assert!(!apply_pet_config_value(&mut store, &cfg));
+    assert_eq!(store.format, "mono", "非法格式不能把当前屏幕模式改坏");
+    assert_eq!(store.format_set_at, 0, "没生效就不该更新格式时间戳");
+}
+
+#[test]
+fn pet_config_missing_fields_fall_back_to_rust_defaults() {
+    let (cfg, warnings) = pet_cfg(serde_json::json!({"volume":30}));
+    assert!(warnings.is_empty(), "缺字段是正常情况，不该报警：{warnings:?}");
+    let mut store = Store::default();
+    store.model.settings.volume = 99;
+    store.model.settings.stale_minutes = 99;
+    store.model.settings.sound_enabled = false;
+
+    assert!(apply_pet_config_value(&mut store, &cfg));
+    let expected = Settings {
+        volume: 30,
+        ..Settings::default()
+    };
+    assert!(
+        settings_equal(&store.model.settings, &expected),
+        "配置里没写的字段必须回落到 Rust 默认值：{:?}",
+        store.model.settings
+    );
+}
+
+#[test]
+fn pet_config_mode_preset_wins_over_plain_refresh() {
+    let (cfg, _) = pet_cfg(serde_json::json!({"mode":"calm","refresh_secs":0}));
+    assert_eq!(
+        settings_from_pet_config(&cfg).refresh_secs,
+        30,
+        "mode 是预设，显式 refresh_secs 只是兜底"
+    );
+
+    let (cfg, _) = pet_cfg(serde_json::json!({"mode":"实时"}));
+    assert_eq!(settings_from_pet_config(&cfg).refresh_secs, 0, "中文别名同样识别");
+
+    let (cfg, _) = pet_cfg(serde_json::json!({"refresh_secs":7}));
+    assert_eq!(settings_from_pet_config(&cfg).refresh_secs, 7);
+}
+
+#[test]
+fn config_write_rejects_invalid_field_before_touching_disk() {
+    let dir = TempDir::new("set-bad-format");
+    let path = dir.path().join("pet-config.json");
+    let patch = PetConfigPatch {
+        format: Some("gray8".into()),
+        ..Default::default()
+    };
+    let err = write_pet_config_at(&path, &patch).unwrap_err();
+    assert!(
+        err.to_string().contains("拒绝写入"),
+        "写盘前必须用读端同一套校验：{err}"
+    );
+    assert!(!path.exists(), "校验失败不得落盘，否则守护会读到坏配置");
+}
+
+#[test]
+fn save_merge_prefers_the_newer_format_stamp() {
+    let dir = TempDir::new("merge-format");
+    let path = dir.path().join("state.json");
+    std::fs::write(&path, br#"{"format":"gray16","format_set_at":100}"#).unwrap();
+
+    // 守护手里的快照比磁盘旧：保留磁盘上的格式，否则 `set --format` 会被盖回去。
+    let mut older = Store::default();
+    older.format = "mono".into();
+    older.format_set_at = 50;
+    save_store_at(&path, &older).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(disk.format, "gray16", "旧快照不能盖掉磁盘上的新格式");
+    assert_eq!(disk.format_set_at, 100);
+
+    // 反过来：内存里的更新，磁盘旧值不能把它改回去。
+    let mut newer = Store::default();
+    newer.format = "mono".into();
+    newer.format_set_at = 200;
+    save_store_at(&path, &newer).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(disk.format, "mono");
+    assert_eq!(disk.format_set_at, 200);
+}
+
+#[test]
+fn save_merge_prefers_the_newer_announced_stamp() {
+    let dir = TempDir::new("merge-announced");
+    let path = dir.path().join("state.json");
+    std::fs::write(
+        &path,
+        br#"{"announced":["0123456789abcdef"],"announced_at":200}"#,
+    )
+    .unwrap();
+
+    let mut older = Store::default();
+    older.announced = vec!["fedcba9876543210".into()];
+    older.announced_at = 100;
+    save_store_at(&path, &older).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(
+        disk.announced,
+        vec!["0123456789abcdef".to_string()],
+        "磁盘上刚响过的提醒不能被慢半拍的快照盖回去（盖回去 = 下轮重连再响）"
+    );
+    assert_eq!(disk.announced_at, 200);
+
+    let mut newer = Store::default();
+    newer.announced = vec!["fedcba9876543210".into()];
+    newer.announced_at = 300;
+    save_store_at(&path, &newer).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(disk.announced, vec!["fedcba9876543210".to_string()]);
+    assert_eq!(disk.announced_at, 300);
+}
+
+#[test]
+fn save_merge_fills_runtime_fields_from_disk_but_keeps_explicit_ones() {
+    let dir = TempDir::new("merge-fill");
+    let path = dir.path().join("state.json");
+    std::fs::write(
+        &path,
+        br#"{"target":"10.1.2.3","released_at":9,"idle_grace":120}"#,
+    )
+    .unwrap();
+
+    // 守护那份快照没带这些字段：从磁盘补回来，别把设备地址/释放时间写没。
+    save_store_at(&path, &Store::default()).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(disk.target.as_deref(), Some("10.1.2.3"));
+    assert_eq!(disk.released_at, Some(9));
+    assert_eq!(disk.idle_grace, Some(120));
+
+    // 内存里显式改过的值优先。
+    let mut explicit = Store::default();
+    explicit.target = Some("192.168.1.9".into());
+    explicit.released_at = Some(77);
+    explicit.idle_grace = Some(30);
+    save_store_at(&path, &explicit).unwrap();
+    let disk = read_store(&path);
+    assert_eq!(disk.target.as_deref(), Some("192.168.1.9"));
+    assert_eq!(disk.released_at, Some(77));
+    assert_eq!(disk.idle_grace, Some(30));
+}
+
+#[test]
+fn save_never_overwrites_a_state_file_it_cannot_parse() {
+    let dir = TempDir::new("save-corrupt");
+    let path = dir.path().join("state.json");
+    std::fs::write(&path, b"{bad").unwrap();
+
+    // 别的进程写了一半 JSON：即使调用方没带 degraded 标记也不能覆盖。
+    save_store_at(&path, &Store::default()).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{bad",
+        "解析不了的文件是用户唯一的现场，不能拿默认值盖掉"
+    );
+    assert!(
+        dir.path().join("state.recovered.json").is_file(),
+        "只允许写 state.recovered.json 留给用户手工恢复"
+    );
+}
+
+#[test]
+fn team_scan_busy_propagates_to_known_task_and_clears() {
+    let mut model = model_with(1, Status::Working, 100);
+    model.tasks[0].event.thread_id = Some("main".into());
+
+    let mut team = TeamScan::default();
+    let log = PathBuf::from("proj").join("child1").join("session.v4.jsonl.zstd");
+    team.files
+        .insert(log.clone(), (0, 100, Some("main".into()), true));
+
+    assert!(team.refresh_busy(&mut model, 100));
+    assert!(
+        model.team_busy.contains_key("main"),
+        "子会话还有未结束回合，主任务必须标成忙碌：{:?}",
+        model.team_busy
+    );
+    assert_eq!(team.busy.get("main"), Some(&100));
+
+    // 子会话回合结束：busy 消失，任务完成时不能一直显示「子智能体运行中」。
+    team.files
+        .insert(log, (0, 100, Some("main".into()), false));
+    assert!(team.refresh_busy(&mut model, 101));
+    assert!(model.team_busy.is_empty(), "{:?}", model.team_busy);
+}
+
+#[test]
+fn team_scan_busy_climbs_to_the_top_level_task() {
+    let mut model = model_with(1, Status::Working, 100);
+    model.tasks[0].event.thread_id = Some("boss".into());
+
+    let mut team = TeamScan::default();
+    team.files.insert(
+        PathBuf::from("proj/child1/session.v4.jsonl.zstd"),
+        (0, 100, Some("mid".into()), true),
+    );
+    team.files.insert(
+        PathBuf::from("proj/mid/session.v4.jsonl.zstd"),
+        (0, 100, Some("boss".into()), false),
+    );
+
+    assert!(team.refresh_busy(&mut model, 100));
+    assert_eq!(
+        model.team_busy.get("boss"),
+        Some(&100),
+        "多层子会话必须一路溯到最上层任务：{:?}",
+        model.team_busy
+    );
+    assert!(
+        !model.team_busy.contains_key("mid"),
+        "中间层会话不是任务，别把侧边栏标错"
+    );
+}
+
+#[test]
+fn should_hold_is_exclusive_at_the_grace_boundary() {
+    let model = model_with(1, Status::Done, 200);
+    assert!(should_hold(&model, 259, 60), "最后一笔活动后不足 grace 秒");
+    assert!(!should_hold(&model, 260, 60), "刚好满 grace 秒就该释放");
+    assert!(!should_hold(&model, 200, 0), "grace=0 立刻释放");
+
+    // 还在跑的任务无视 grace：设备不能被交还。
+    let running = model_with(1, Status::Working, 200);
+    assert!(should_hold(&running, 261, 60));
+}
