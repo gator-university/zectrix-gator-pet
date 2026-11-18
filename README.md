@@ -5,7 +5,7 @@
 一只像素小鳄鱼，跟着 DSH 的会话状态换动作。它是 **DeepSeek Harness 插件**：
 DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugins 里，没有别的常驻程序。
 
-`Windows 10 / 11 x64` · `v0.7.1` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
+`Windows 10 / 11 x64` · `v0.7.2` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
 
 <p align="center">
   <img src="docs/screens/working.png" width="420" alt="设备上的一帧：单任务详情，右下角是鳄鱼大宠物">
