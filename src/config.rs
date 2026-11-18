@@ -181,6 +181,19 @@ pub(crate) fn quarantine_pet_config(path: &Path, why: &str) {
     }
 }
 
+/// target 只接受私网/回环 IPv4 **字面量**：不带端口、不是主机名、不是 IPv6。
+///
+/// 设备地址最终会进 socket 连接，允许任意字符串等于把「写配置文件」变成
+/// 「把宠物指到任意地址」。协议层只需要一个地址，看到 `1.2.3.4:32342`、
+/// `evil`、`[::1]` 这类值就说明不是本插件写的，丢弃并提示。
+pub(crate) fn valid_target(s: &str) -> bool {
+    let Ok(addr) = s.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let [a, b, ..] = addr.octets();
+    addr.is_loopback() || a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
 /// 逐字段校验：类型/范围不对就记一条警告并丢弃该字段，
 /// 其余字段照常生效——不再因为一个坏 volume 把整份配置丢掉。
 pub(crate) fn pet_config_from_obj(
@@ -204,11 +217,15 @@ pub(crate) fn pet_config_from_obj(
         })
         .and_then(|s| TitleSource::parse(&s)),
     };
-    // 空字符串 = 没设过，静默忽略；非字符串才算非法。
+    // 空字符串 = 没设过，静默忽略；非字符串/非法地址丢弃并提示。
+    // 丢弃后 `store.target` 保持 None，设备打开走默认发现流程。
     if let Some(value) = obj.get("target") {
         match value.as_str() {
-            Some(s) if !s.trim().is_empty() => cfg.target = Some(s.trim().to_string()),
-            Some(_) => {}
+            Some(s) if s.trim().is_empty() => {}
+            Some(s) if valid_target(s.trim()) => cfg.target = Some(s.trim().to_string()),
+            Some(s) => warnings.push(format!(
+                "[配置] 忽略非法 target（只接受私网/回环 IPv4 地址）：{s}"
+            )),
             None => warnings.push(format!("[配置] 忽略非法字段 target={value}")),
         }
     }

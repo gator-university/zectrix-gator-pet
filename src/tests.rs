@@ -397,6 +397,73 @@ fn test_save_keeps_previous_as_bak() {
 }
 
 #[test]
+fn parent_guard_keeps_a_live_process_and_drops_a_dead_pid() {
+    // 快照必须在启动时只记一次；同一进程的创建时间不变，应一直判存活。
+    let guard = parent_guard(Some(std::process::id())).expect("当前进程必然存在");
+    assert!(guard.alive(), "同一进程的创建时间/镜像没变，应判存活");
+    assert!(
+        guard.created.is_some(),
+        "活进程应能通过 GetProcessTimes 取到创建时间（PID 复用防护的前提）"
+    );
+    assert!(
+        guard.image.is_some(),
+        "活进程应能通过 QueryFullProcessImageNameW 取到镜像名"
+    );
+
+    // 不存在的 pid 打不开进程句柄 → 视为已退出（单独构造，不污染全局快照）。
+    let dead = ParentGuard::resolve(u32::MAX);
+    assert!(!dead.alive(), "打不开的 pid 不能判存活");
+}
+
+#[test]
+fn target_must_be_a_private_or_loopback_ipv4_literal() {
+    for ok in [
+        "192.168.1.9",
+        "10.0.0.7",
+        "172.16.5.4",
+        "172.31.255.254",
+        "127.0.0.1",
+    ] {
+        assert!(valid_target(ok), "应接受私网/回环 IPv4：{ok}");
+    }
+    for bad in [
+        "8.8.8.8",         // 公网地址
+        "1.2.3.4:32342",   // 带端口
+        "evil",            // 主机名
+        "[::1]",           // IPv6 字面量
+        "192.168.1.0/24",  // 网段
+        "192.168.1",       // 不完整
+    ] {
+        assert!(!valid_target(bad), "必须拒绝非私网 IPv4 字面量：{bad:?}");
+    }
+}
+
+#[test]
+fn invalid_target_in_pet_config_is_dropped_with_warning() {
+    let dir = TempDir::new("petcfg-target");
+    let path = dir.path().join("pet-config.json");
+    std::fs::write(&path, br#"{"target":"8.8.8.8","volume":42}"#).unwrap();
+    let cfg = load_pet_config_at(&path).expect("语法没错，只该丢坏 target");
+    assert_eq!(cfg.target, None, "公网地址要丢弃，回落默认发现流程");
+    assert_eq!(cfg.volume, Some(42), "坏 target 不该影响其它字段");
+
+    let value = serde_json::json!({"target": "1.2.3.4:32342"});
+    let mut warnings = Vec::new();
+    let cfg = pet_config_from_obj(value.as_object().unwrap(), &mut warnings);
+    assert!(cfg.target.is_none());
+    assert!(
+        warnings.iter().any(|w| w.contains("target")),
+        "丢弃非法 target 要留一条警告：{warnings:?}"
+    );
+
+    let value = serde_json::json!({"target": "192.168.1.9"});
+    let mut warnings = Vec::new();
+    let cfg = pet_config_from_obj(value.as_object().unwrap(), &mut warnings);
+    assert_eq!(cfg.target.as_deref(), Some("192.168.1.9"));
+    assert!(warnings.is_empty(), "合法地址不该产生警告：{warnings:?}");
+}
+
+#[test]
 fn test_pet_config_field_level_fallback() {
     let dir = TempDir::new("petcfg");
     let path = dir.path().join("pet-config.json");

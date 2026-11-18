@@ -66,7 +66,12 @@ fn dsh_running() -> bool {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = std::process::Command::new("tasklist")
+        // 绝对路径：相对名会走当前目录/PATH 查找，工作目录里放个同名 exe
+        // 就能劫持这次探测。SystemRoot 取不到时退回默认安装位置。
+        let tasklist = std::env::var("SystemRoot")
+            .map(|root| PathBuf::from(root).join("System32").join("tasklist.exe"))
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\tasklist.exe"));
+        let out = std::process::Command::new(tasklist)
             .args(["/NH", "/FI", "IMAGENAME eq DeepSeek Harness.exe"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
@@ -248,25 +253,125 @@ fn retire_legacy_autostart_in(appdata: Option<&Path>, profile: Option<&Path>) ->
     removed
 }
 
-/// 指定的进程是否还活着（宠物用来看拉起它的 DSH 是否被强杀）。
+/// 被监视进程的镜像名。插件把 DSH Host 的 pid 传进来（正常是
+/// `DeepSeek Harness.exe`）；`dsh-pet.exe` 用于旧版自守护/手工传入宠物自身 pid
+/// 的场景。名单只用于启动时提示，不据此拒绝运行。
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
+const EXPECTED_PARENT_IMAGES: [&str; 2] = ["deepseek harness.exe", "dsh-pet.exe"];
+
+/// 快照一次被监视进程：是否存活 + 创建时间（FILETIME）+ 镜像完整路径。
+/// `None` = 进程已退出/打不开。
+#[cfg(windows)]
+fn probe_process(pid: u32) -> Option<(Option<u64>, Option<String>)> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     const STILL_ACTIVE: u32 = 259;
     unsafe {
-        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(handle) => {
-                let mut code = 0u32;
-                let ok = GetExitCodeProcess(handle, &mut code).is_ok();
-                let _ = CloseHandle(handle);
-                ok && code == STILL_ACTIVE
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut code = 0u32;
+        if GetExitCodeProcess(handle, &mut code).is_err() || code != STILL_ACTIVE {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // 拿不到创建时间时返回 None（调用方退回只看存活），不因此判死。
+        let created = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user)
+            .ok()
+            .map(|_| (created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64);
+        let mut buf = [0u16; 2048];
+        let mut size = buf.len() as u32;
+        let image = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .ok()
+        .map(|_| String::from_utf16_lossy(&buf[..size as usize]));
+        let _ = CloseHandle(handle);
+        Some((created, image))
+    }
+}
+
+/// 父进程身份快照。只看存活时，DSH 退出后 Windows 复用同一 PID 会让宠物
+/// 一直等一个陌生进程；启动时把创建时间（和镜像名）记一次，之后每拍对比。
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct ParentGuard {
+    pid: u32,
+    created: Option<u64>,
+    image: Option<String>,
+}
+
+#[cfg(windows)]
+impl ParentGuard {
+    fn resolve(pid: u32) -> Self {
+        let probe = probe_process(pid);
+        let created = probe.as_ref().and_then(|(c, _)| *c);
+        let image = probe.as_ref().and_then(|(_, i)| i.clone());
+        if created.is_none() {
+            // 票面要求：拿不到创建时间时退回「只看存活」，只警告一次，不拒绝启动。
+            eprintln!(
+                "[watch] 拿不到父进程（pid {pid}）的创建时间，退回只看存活；PID 复用防护不可用"
+            );
+        }
+        if let Some(img) = image.as_deref().and_then(image_file_name) {
+            if !EXPECTED_PARENT_IMAGES
+                .iter()
+                .any(|e| img.eq_ignore_ascii_case(e))
+            {
+                eprintln!(
+                    "[watch] 父进程镜像为 {img}（预期 DeepSeek Harness.exe 或 dsh-pet.exe），仍按创建时间校验"
+                );
             }
-            Err(_) => false,
+        }
+        Self {
+            pid,
+            created,
+            image: image.as_deref().and_then(image_file_name),
         }
     }
+
+    /// 存活且身份未变。创建时间拿不到时退化为只看存活。
+    pub(crate) fn alive(&self) -> bool {
+        let Some((created, image)) = probe_process(self.pid) else {
+            return false;
+        };
+        let Some(expected) = self.created else {
+            return true;
+        };
+        if created != Some(expected) {
+            return false;
+        }
+        match (&self.image, image.as_deref().and_then(image_file_name)) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+            _ => true,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn image_file_name(full: &str) -> Option<String> {
+    Path::new(full)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+}
+
+/// 进程内唯一的父进程快照：启动时解析一次，三处检测（watch 主循环、
+/// 待命 tick、会话 tick）共用，避免每个 tick 重新记录「当前创建时间」。
+#[cfg(windows)]
+static PARENT_GUARD: OnceLock<Option<ParentGuard>> = OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn parent_guard(pid: Option<u32>) -> Option<&'static ParentGuard> {
+    PARENT_GUARD.get_or_init(|| pid.map(ParentGuard::resolve)).as_ref()
 }
 
 fn render(model: &Model) -> Result<Vec<u8>> {

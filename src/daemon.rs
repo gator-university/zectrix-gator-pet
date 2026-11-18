@@ -246,12 +246,13 @@ pub(crate) async fn cmd_run(args: &Args) -> Result<()> {
                 // 上一拍在节流窗口里攒下的状态，到点就落盘（1 秒内最多写一次）。
                 let _ = flush_pending_store();
                 // DSH 插件/面板退出或被结束：子进程自己收尾，别留下孤儿占着设备。
-                if args
-                    .get("watch-pid")
-                    .or_else(|| args.get("parent"))
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .is_some_and(|p| !pid_alive(p))
-                {
+                // 只判存活不够（PID 会被系统复用），还比对启动时记录的创建时间/镜像。
+                let watched = parent_guard(
+                    args.get("watch-pid")
+                        .or_else(|| args.get("parent"))
+                        .and_then(|v| v.parse::<u32>().ok()),
+                );
+                if watched.is_some_and(|g| !g.alive()) {
                     println!("DSH 已退出：释放设备，宠物退出。");
                     break Ok(());
                 }
@@ -593,7 +594,7 @@ pub(crate) async fn cmd_run(args: &Args) -> Result<()> {
 pub(crate) async fn wait_for_task(
     store: &mut Store,
     watcher: &mut Watcher,
-    parent: Option<u32>,
+    parent: Option<&'static ParentGuard>,
     trace: &mut TickTrace,
 ) -> Result<bool> {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -605,7 +606,7 @@ pub(crate) async fn wait_for_task(
         tick.tick().await;
         let tick_started = Instant::now();
         let _ = flush_pending_store();
-        if parent.is_some_and(|p| !pid_alive(p)) {
+        if parent.is_some_and(|g| !g.alive()) {
             println!("控制面板已退出：结束待命。");
             return Ok(false);
         }
@@ -784,16 +785,18 @@ pub(crate) async fn cmd_watch(args: &Args) -> Result<()> {
     let mut watcher = Watcher::new(dsh_root());
     // DSH 插件 spawn 时传 `--watch-pid <DSH Host pid>`；旧面板形态传 `--parent`。
     // 父进程消失就自退（DSH 崩溃/被强杀时 dispose 不会执行，只能靠这条兜底）。
-    let parent = args
-        .get("watch-pid")
-        .or_else(|| args.get("parent"))
-        .and_then(|v| v.parse::<u32>().ok());
+    // 快照在启动时记一次：之后每拍比对创建时间/镜像，PID 被复用也不会当成父进程。
+    let parent = parent_guard(
+        args.get("watch-pid")
+            .or_else(|| args.get("parent"))
+            .and_then(|v| v.parse::<u32>().ok()),
+    );
     // `--trace-tick` 在 watch 里也生效：待命 tick 与之后每次会话（session 继承
     // 同一批 flags）都会采样；关闭时 record 是空操作。
     let mut trace = TickTrace::from_args(args);
     loop {
-        if let Some(p) = parent {
-            if !pid_alive(p) {
+        if let Some(guard) = parent {
+            if !guard.alive() {
                 println!("DSH 已退出：宠物收尾，释放设备。");
                 return Ok(());
             }
