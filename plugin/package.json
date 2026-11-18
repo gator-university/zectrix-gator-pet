@@ -1,6 +1,6 @@
 {
   "name": "zectrix-gator-pet",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "private": true,
   "description": "鳄鱼大宠物：把 DeepSeek Harness 的会话状态推到 Zectrix Note 4 墨水屏。",
   "type": "module",

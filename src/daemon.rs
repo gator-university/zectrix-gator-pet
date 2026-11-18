@@ -596,6 +596,7 @@ pub(crate) async fn wait_for_task(
     watcher: &mut Watcher,
     parent: Option<&'static ParentGuard>,
     trace: &mut TickTrace,
+    verbose: bool,
 ) -> Result<bool> {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -650,15 +651,22 @@ pub(crate) async fn wait_for_task(
             println!("检测到子智能体仍在运行：准备占用设备。");
         }
         for ev in events {
-            println!(
-                "[状态] {} · {} → {}{}",
-                ev.title,
-                ev.task_id,
-                ev.status.label(),
-                ev.progress
-                    .map(|p| format!("（清单 {p}%）"))
-                    .unwrap_or_default()
-            );
+            let progress = ev
+                .progress
+                .map(|p| format!("（清单 {p}%）"))
+                .unwrap_or_default();
+            if verbose {
+                println!(
+                    "[状态] {} · {}{} · 标题：{}",
+                    short_task_ref(&ev),
+                    ev.status.label(),
+                    progress,
+                    ev.title
+                );
+            } else {
+                // 与 cmd_run 同一隐私口径：待命阶段的导入日志也不能出现标题。
+                println!("[状态] {} · {}", short_task_ref(&ev), ev.status.label());
+            }
         }
         // 与释放判定同源：任务在跑、或上一轮刚结束还在宽限期内才占用设备。
         // 只看 running 会把「等你处理」也算进来，释放后立刻又被重占，
@@ -806,7 +814,8 @@ pub(crate) async fn cmd_watch(args: &Args) -> Result<()> {
             continue;
         }
         println!("检测到 DeepSeek Harness，进入待命（只读会话，不占用设备）。");
-        if !wait_for_task(&mut store, &mut watcher, parent, &mut trace).await? {
+        if !wait_for_task(&mut store, &mut watcher, parent, &mut trace, args.has("verbose")).await?
+        {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -909,7 +918,7 @@ pub(crate) async fn scan_and_report(
         } else {
             // 默认只留会话短号 + 状态词：pet.log 可能被转发/上传，标题可能来自
             // 提示词首行（prompt 模式）或项目名，不应出现在日志里。
-            println!("[状态] {} · {}", short_task_ref(ev), ev.status.label());
+            println!("[状态] {} · {}", short_task_ref(&ev), ev.status.label());
         }
         // 同一批记录里可能先出现「完成」又立刻回到「工作」（上一轮完成记录
         // 延迟补写的场景），提示音只认每个任务的最终状态，中间态不响铃。
