@@ -21,7 +21,7 @@ let bridge
 let token
 
 function authHeaders(extra = {}) {
-  return { 'x-croc-pet-token': token, ...extra }
+  return { 'x-gator-pet-token': token, ...extra }
 }
 
 function request(pathname, { method = 'GET', body, headers = {}, port = bridge.port } = {}) {
@@ -62,7 +62,7 @@ function readConfigFile() {
 
 before(async () => {
   previousLocalAppData = process.env.LOCALAPPDATA
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'croc-bridge-'))
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gator-bridge-'))
   process.env.LOCALAPPDATA = tmpDir
   configPath = path.join(tmpDir, 'pet-config.json')
   resetConfig()
@@ -146,9 +146,9 @@ test('/token 只认 dsh-app://app：无需 Sec-Fetch-Site，且每次调用轮�
   assert.notEqual(second.json.token, first.json.token, '旧令牌应在下次 /token 时作废')
 
   // 旧令牌立即失效，新令牌可用。
-  const old = await request('/config', { headers: { 'x-croc-pet-token': first.json.token } })
+  const old = await request('/config', { headers: { 'x-gator-pet-token': first.json.token } })
   assert.equal(old.status, 401)
-  const fresh = await request('/config', { headers: { 'x-croc-pet-token': second.json.token } })
+  const fresh = await request('/config', { headers: { 'x-gator-pet-token': second.json.token } })
   assert.equal(fresh.status, 200)
   token = second.json.token
 })
@@ -274,7 +274,7 @@ test('配置写日志只记 key 名，不记值', async () => {
     const res = await request('/config', {
       method: 'POST',
       body: { target: '192.168.1.77', volume: 40 },
-      headers: { origin: APP_ORIGIN, 'x-croc-pet-token': logBridge.token },
+      headers: { origin: APP_ORIGIN, 'x-gator-pet-token': logBridge.token },
       port: logBridge.port,
     })
     assert.equal(res.status, 200)
@@ -305,7 +305,7 @@ test('POST /test 忽略 body 里的 target，只用已保存的 target', async (
     const res = await request('/test', {
       method: 'POST',
       body: { target: '10.9.9.9' },
-      headers: { origin: APP_ORIGIN, 'x-croc-pet-token': testBridge.token },
+      headers: { origin: APP_ORIGIN, 'x-gator-pet-token': testBridge.token },
       port: testBridge.port,
     })
     assert.equal(res.status, 200)
@@ -337,7 +337,7 @@ test('POST /test 同设备 3 秒冷却：第二次返回 429', async () => {
 
 test('token 超过有效期后 401，重新 GET /token 可恢复', async () => {
   const saved = process.env.LOCALAPPDATA
-  const ttlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'croc-bridge-ttl-'))
+  const ttlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gator-bridge-ttl-'))
   process.env.LOCALAPPDATA = ttlDir
   let short = null
   try {
@@ -353,7 +353,7 @@ test('token 超过有效期后 401，重新 GET /token 可恢复', async () => {
     await new Promise(resolve => setTimeout(resolve, 80))
 
     const expired = await request('/config', {
-      headers: { 'x-croc-pet-token': issued },
+      headers: { 'x-gator-pet-token': issued },
       port: short.port,
     })
     assert.equal(expired.status, 401, '过期令牌必须 401')
@@ -365,7 +365,7 @@ test('token 超过有效期后 401，重新 GET /token 可恢复', async () => {
     assert.equal(renewed.status, 200)
     assert.notEqual(renewed.json.token, issued)
     const ok = await request('/config', {
-      headers: { 'x-croc-pet-token': renewed.json.token },
+      headers: { 'x-gator-pet-token': renewed.json.token },
       port: short.port,
     })
     assert.equal(ok.status, 200)
@@ -394,12 +394,12 @@ test('OPTIONS 仅对 dsh-app://app 回 204；http 回环与非白名单 403', as
     headers: {
       origin: APP_ORIGIN,
       'access-control-request-method': 'POST',
-      'access-control-request-headers': 'content-type, x-croc-pet-token',
+      'access-control-request-headers': 'content-type, x-gator-pet-token',
     },
   })
   assert.equal(ok.status, 204)
   assert.equal(ok.headers['access-control-allow-origin'], APP_ORIGIN)
-  assert.match(String(ok.headers['access-control-allow-headers']), /x-croc-pet-token/)
+  assert.match(String(ok.headers['access-control-allow-headers']), /x-gator-pet-token/)
   assert.match(String(ok.headers['access-control-allow-methods']), /GET/)
   assert.match(String(ok.headers['access-control-allow-methods']), /POST/)
   assert.match(String(ok.headers['access-control-allow-methods']), /OPTIONS/)

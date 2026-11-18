@@ -1,7 +1,7 @@
 // 鳄鱼大宠物 · DSH 插件设置页（浏览器半侧）。
 // 注册在 Plugins 页的组合包配置 slot：`plugins.bundle.config`，key 为包名。
 window.__ModuleLoader__.load({
-  id: 'zectrix-croc-pet',
+  id: 'zectrix-gator-pet',
   factory: require => {
     const React = require('react')
     const h = React.createElement
@@ -9,10 +9,10 @@ window.__ModuleLoader__.load({
 
     // 原生 <select> 的下拉选项由系统绘制，默认白底；在深色主题里会变成白底白字。
     // 这里按 DSH 的 body[data-ds-dark-theme] 显式给 option 上色，并在停用时移除。
-    const STYLE_ID = 'zectrix-croc-pet-style'
+    const STYLE_ID = 'zectrix-gator-pet-style'
     const STYLE_TEXT = [
-      '.croc-pet-settings select option { background-color: #1d1e21; color: #e9e9ea; }',
-      'body:not([data-ds-dark-theme]) .croc-pet-settings select option { background-color: #ffffff; color: #1d1e21; }',
+      '.gator-pet-settings select option { background-color: #1d1e21; color: #e9e9ea; }',
+      'body:not([data-ds-dark-theme]) .gator-pet-settings select option { background-color: #ffffff; color: #1d1e21; }',
     ].join('\n')
     if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
       const styleEl = document.createElement('style')
@@ -67,7 +67,7 @@ window.__ModuleLoader__.load({
 
     // 配置桥的令牌只对 DSH 桌面 App（dsh-app://app）的渲染进程返回，
     // 且 10 分钟过期、每次 GET /token 都轮换。首次请求先取令牌，
-    // 之后所有请求都带 X-Croc-Pet-Token；遇到 401 说明过期/被轮换，自动重取一次。
+    // 之后所有请求都带 X-Gator-Pet-Token；遇到 401 说明过期/被轮换，自动重取一次。
     let tokenPromise = null
     function getToken() {
       if (!tokenPromise) {
@@ -88,7 +88,7 @@ window.__ModuleLoader__.load({
 
     async function api(path, init) {
       const send = async token => {
-        const headers = { ...((init && init.headers) || {}), 'x-croc-pet-token': token }
+        const headers = { ...((init && init.headers) || {}), 'x-gator-pet-token': token }
         return fetch(BASE + path, { ...init, headers })
       }
       let token = await getToken()
@@ -187,7 +187,7 @@ window.__ModuleLoader__.load({
 
       return h(
         'div',
-        { className: 'croc-pet-settings', style: { padding: '8px 4px 24px', fontSize: 13, lineHeight: 1.6 } },
+        { className: 'gator-pet-settings', style: { padding: '8px 4px 24px', fontSize: 13, lineHeight: 1.6 } },
         h('h3', { style: { margin: '4px 0 2px', fontSize: 15 } }, '鳄鱼大宠物'),
         h(
           'p',
@@ -315,7 +315,7 @@ window.__ModuleLoader__.load({
           () => {
             const dispose = ctx.slots.inject('plugins.bundle.config', () =>
               ctx.slots.register(
-                { name: 'plugins.bundle.config', key: 'zectrix-croc-pet' },
+                { name: 'plugins.bundle.config', key: 'zectrix-gator-pet' },
                 PetSettings,
               ),
             )
@@ -327,7 +327,7 @@ window.__ModuleLoader__.load({
               }
             }
           },
-          'zectrix-croc-pet: settings page',
+          'zectrix-gator-pet: settings page',
         )
       },
     }

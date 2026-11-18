@@ -1,8 +1,8 @@
 # 鳄鱼大宠物 · 功能规格与验收（SPEC）
 
-> 项目：`zectrix-croc-pet`（历史名 dsh-pet）
+> 项目：`zectrix-gator-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.8.1 · 2026-11-18
+> 版本：0.8.2 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -22,7 +22,7 @@
 - 步骤：退出宠物 → 在 DSH 中启用本插件 → 关闭并重新打开 DSH。
 - 期望：DSH 启动后 ≤5 秒内 `dsh-pet.exe watch` 出现，`pet.log` 有启动行。
 - 状态：已验收。
-- 证据：`plugin/index.js` `apply()` spawn `bin/dsh-pet.exe watch --watch-pid <host pid>`；2026-11-18 02:10 禁用/启用插件触发重载，宿主自动拉起 pid 41048（父进程为 DSH Host），`pet.log` 记录「已启动宠物」与推送；**2026-11-18 18:03 重启 DSH 后从 Git 安装副本拉起** `C:\Users\liujj\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe watch --watch-pid 52488`（pid 49176，父进程为 DSH Host），配置桥 4517 的 `/health` 返回该安装路径，18:03:31 推送成功（1.70s）。
+- 证据：`plugin/index.js` `apply()` spawn `bin/dsh-pet.exe watch --watch-pid <host pid>`；2026-11-18 02:10 禁用/启用插件触发重载，宿主自动拉起 pid 41048（父进程为 DSH Host），`pet.log` 记录「已启动宠物」与推送；**2026-11-18 18:03 重启 DSH 后从 Git 安装副本拉起** `C:\Users\liujj\.dsh\profiles\desktop\node_modules\zectrix-gator-pet\bin\dsh-pet.exe watch --watch-pid 52488`（pid 49176，父进程为 DSH Host），配置桥 4517 的 `/health` 返回该安装路径，18:03:31 推送成功（1.70s）。
 
 **FR-LIFE-02 DSH 退出即退出宠物进程**
 - 步骤：DSH 托盘 Quit（正常退出）。
@@ -141,38 +141,38 @@
 - 状态：已验收。
 - 证据：测试 `done_screen_hands_over_to_idle_after_five_seconds`（第 4 秒仍完成，第 6 秒待命中）。
 
-## 5. 鳄鱼形象（FR-CROC）
+## 5. 鳄鱼形象（FR-GATOR）
 
-**FR-CROC-01 一只鳄鱼，六个动作**
+**FR-GATOR-01 一只鳄鱼，六个动作**
 - 动作：`idle` 待命、`working` 干活、`waiting` 等你、`done` 完成、`error` 出错、`sleep` 睡觉；单帧静态，状态切换才重绘。
 - 状态：已验收。
-- 证据：`assets/croc/default/{6 动作}.png`（90×120，1:1 绘制在 (300,152)）；`sprite::draw_action` 贪心矩形化；测试 `all_actions_have_art`、`actions_are_pairwise_distinct`。
+- 证据：`assets/gator/default/{6 动作}.png`（90×120，1:1 绘制在 (300,152)）；`sprite::draw_action` 贪心矩形化；测试 `all_actions_have_art`、`actions_are_pairwise_distinct`。
 
-**FR-CROC-02 触发规则**
+**FR-GATOR-02 触发规则**
 - idle：无任务（含完成 5 秒后）；working：有 Working；waiting：有 Waiting；done：完成后 5 秒内；error：Error/Stopped（决定：Stopped 也走 error 动作）；sleep：连续 30 分钟无活跃任务（`model.last_active_at`）。
 - 素材从 30×40@3× 换到 90×120@1× 后，触发规则与动作选择不变。
 - 状态：已验收。
 - 证据：`layout.rs` 动作选择分支；`last_active_at` 在扫描时刷新。
 
-**FR-CROC-03 素材契约**
-- 路径 `assets/croc/default/{action}.png`；90×120 单色 PNG（L 模式，只含 0/255），按 1:1 直接绘制在 (300,152)，不再缩放；`sprite::draw_action(elements, x, y, action, scale)` 的 `scale` 参数保留（v1 传 1，供未来更换素材尺寸）；装扮目录 `assets/croc/<outfit>/`；可选第二帧（v1 不用）。
+**FR-GATOR-03 素材契约**
+- 路径 `assets/gator/default/{action}.png`；90×120 单色 PNG（L 模式，只含 0/255），按 1:1 直接绘制在 (300,152)，不再缩放；`sprite::draw_action(elements, x, y, action, scale)` 的 `scale` 参数保留（v1 传 1，供未来更换素材尺寸）；装扮目录 `assets/gator/<outfit>/`；可选第二帧（v1 不用）。
 - 状态：已验收。
-- 证据：6 张 90×120 PNG 由 `scripts/make_croc_v2.py` 可复现；`sprite` 测试直接解码 PNG 断言尺寸 90×120、墨量 6%–50%、包围盒 ≥40×60、单帧矩形数 ≤400、不越出 (300,152)–(390,272)；未知动作不画。
+- 证据：6 张 90×120 PNG 由 `scripts/make_gator_v2.py` 可复现；`sprite` 测试直接解码 PNG 断言尺寸 90×120、墨量 6%–50%、包围盒 ≥40×60、单帧矩形数 ≤400、不越出 (300,152)–(390,272)；未知动作不画。
 
-**FR-CROC-04 手势**
+**FR-GATOR-04 手势**
 - 单击回主页、双击静音切换、三击退出（follow=false 并释放设备）、长按无操作。
 - 状态：已验收。
 - 证据：连击 700ms 窗 + 650ms 双击落定；长按确认键日志「按规格无操作（不录音、不投递）」；原长按换造型（六套装扮）随新规格移除。
 
-**FR-CROC-05 形象风格基线（v3：AI 生成线稿）**
+**FR-GATOR-05 形象风格基线（v3：AI 生成线稿）**
 - 物种：gator / 短吻鳄（alligator）——圆头、短而宽的 U 形吻部、上颌盖住下颌；不画长 V 形吻与外露齿排。
 - 风格：粗黑描边卡通风、白高光眼、浅色肚皮分节线、短肢体；头身比 chibi（头部约占身高 45%）。
 - 规格：90×120 单色 PNG（L 模式，0 墨 / 255 纸），按 1:1 绘制在 (300,152)，`scale` 保留、v1 传 1。
 - 六动作：`idle` 端咖啡、`working` 桌前敲笔记本、`waiting` 举手 + 问号、`done` 点赞 + 星星、`error` 轻微惊吓（睁大眼、小圆嘴、冷汗）、`sleep` 蜷卧闭眼 + Z。
-- 素材契约：`assets/croc/default/{action}.png`，用户可用 6 个同尺寸同路径文件直接替换，不改代码（ADR 0007）。
-- 生成：母版 `art/gen-v3/*.png` 由 gpt-image-2（image edit 模式；idle 以用户参考图为基准、其余以 idle 为角色基准）生成并入库存 512px；`scripts/prep_croc_art.py` 统一裁剪并转换 90×120 二值图，顺带生成 `plugin/icon.png`（ADR 0008）。
+- 素材契约：`assets/gator/default/{action}.png`，用户可用 6 个同尺寸同路径文件直接替换，不改代码（ADR 0007）。
+- 生成：母版 `art/gen-v3/*.png` 由 gpt-image-2（image edit 模式；idle 以用户参考图为基准、其余以 idle 为角色基准）生成并入库存 512px；`scripts/prep_gator_art.py` 统一裁剪并转换 90×120 二值图，顺带生成 `plugin/icon.png`（ADR 0008）。
 - 状态：已验收。
-- 证据：`assets/croc/default/*.png`；`docs/screens/{working,waiting,done,error,stopped}.png`；`plugin/icon.png`；`src/sprite.rs` 测试 `all_actions_have_art`/`actions_are_pairwise_distinct`；`art/gen-v3/` 母版；设计记录 `docs/specs/croc-redesign-v2.md`、ADR 0007/0008。
+- 证据：`assets/gator/default/*.png`；`docs/screens/{working,waiting,done,error,stopped}.png`；`plugin/icon.png`；`src/sprite.rs` 测试 `all_actions_have_art`/`actions_are_pairwise_distinct`；`art/gen-v3/` 母版；设计记录 `docs/specs/gator-redesign-v2.md`、ADR 0007/0008。
 
 ## 6. 提示音与手势（FR-AUD）
 
@@ -223,17 +223,32 @@
 **FR-SEC-01 配置桥鉴权**
 - 期望：桥只监听 `127.0.0.1`；`/config`、`/test` 必须带逐安装 token（`%LOCALAPPDATA%\zectrix-dsh-pet\bridge-token`，0600）；`/token` 只接受白名单 Origin + 同源/同站请求；`/health` 免 token 但只回 `{ok, version}`。
 - 状态：已验收。
-- 证据：`plugin/bridge.js` + `plugin/test/bridge.test.js`（13 例，`npm test` 全绿）；提交 `9fc45fc`（T1）。
+- 证据：`plugin/bridge.js` + `plugin/test/bridge.test.js`（25 例，`npm test` 全绿）；提交 `9fc45fc`（T1）；0.8.2 起 `/token` 只信任 `dsh-app://app`、令牌 10 分钟轮换、`/test` 3 秒冷却、`requestTimeout`/`headersTimeout`/`maxConnections` 上限（提交 `b0ebbcd`，S1）。
 
 **FR-SEC-02 跨站与最小暴露**
 - 期望：任何非白名单 Origin 或 `Sec-Fetch-Site: cross-site` 一律 403；例外只有 DSH 桌面渲染进程自己的 `dsh-app://app`（Electron 自定义 scheme，跨源到本机 HTTP 时浏览器固定标 `cross-site`，无法被远程网页伪造）。CORS 只回精确 Origin + `Vary: Origin`，无 `*`；`/test` 只用已存设备 IP，忽略请求体 target。
 - 状态：已验收。
-- 证据：`bridge.test.js` 覆盖 401/403/415/413/400 与 OPTIONS 路径，含 `dsh-app://app` 放行与远程 Origin 拒绝各 1 例（16 例全过）；提交 `9fc45fc`、0.8.1 修复 `dsh-app://app` 放行。
+- 证据：`bridge.test.js` 覆盖 401/403/415/413/400/429 与 OPTIONS 路径；0.8.2 起「http 回环 Origin 一律拿不到 token（含带 Sec-Fetch-Site）」与「`dsh-app://app` 可取且轮换」各有用例，25 例全过；提交 `9fc45fc`、`b0ebbcd`。
 
 **FR-SEC-03 输入校验与原子写**
 - 期望：设备 IP 限私网/回环 IPv4；音量 0–100；格式/模式限枚举；非法值 400 且不写盘；`pet-config.json` 与 `state.json` 均为 tmp+rename 原子写。
 - 状态：已验收。
 - 证据：`bridge.js` 校验 + `src/config.rs` 读端同校验；`write_json_atomic`（提交 `9fc45fc`、`482ab6a`）。
+
+**FR-SEC-04 数据目录权限**
+- 期望：数据目录与 token 文件 ACL 去掉继承，只留当前用户 + SYSTEM；收紧失败只警告、不阻塞。
+- 状态：已验收。
+- 证据：`plugin/winacl.js`（`createBridge` 启动时对数据目录与已有 token 执行 `icacls /inheritance:r /grant:r`）+ `plugin/test/winacl.test.js`（假 `execFile`）；提交 `729acb8`（S2）。
+
+**FR-SEC-05 读取上限**
+- 期望：会话日志读前 `metadata().len()>32MB` 跳过；zstd 解码 `Read::take(64MB)` 且最多 4096 帧；超限只警告一次。
+- 状态：已验收。
+- 证据：`src/dsh.rs`、`src/scan.rs` 上限 + 单测；提交 `f7715be`（S4）。
+
+**FR-SEC-06 子进程与父进程校验**
+- 期望：Rust 侧 target 只收私网/回环 IPv4 字面量；`--watch-pid` 用启动快照的进程创建时间 + 镜像名逐拍比对（镜像名不在 `DeepSeek Harness.exe`/`dsh-pet.exe` 时仅警告）；`tasklist` 走 `%SystemRoot%\System32\tasklist.exe`。
+- 状态：已验收。
+- 证据：`src/config.rs` target 校验、`src/main.rs` `probe_process`/`ParentGuard`；提交 `443c26a`（S5）。
 
 **FR-PRIV-01 标题来源**
 - 期望：默认 `title_source=session`，只读 `session/title`；缺失时用「项目目录名 第 N 轮」；完全不读 `user/message`；`prompt` 模式必须显式开启。
@@ -248,7 +263,12 @@
 **FR-PRIV-03 日志与历史清理**
 - 期望：`pet.log` 默认只记 `session-<短号> · 状态词`，`--verbose` 才带标题；`dsh-pet forget --titles` 可把旧标题清成 session 短号并清空指纹，保留设置。
 - 状态：已验收。
-- 证据：`src/daemon.rs` 状态日志 + `cli.rs` forget 子命令；单测覆盖；0.8.0 部署时已对真机状态执行一次清理（`forget --titles`：替换 76 条标题、清空提醒指纹；旧 `pet.log` 归档为 `pet.log.bak` 后重建）。
+- 证据：`src/daemon.rs` 状态日志 + `cli.rs` forget 子命令；单测覆盖；0.8.0 部署时已对真机状态执行一次清理（`forget --titles`：替换 76 条标题、清空提醒指纹；旧 `pet.log` 归档后重建）。
+
+**FR-PRIV-04 历史彻底清理**
+- 期望：`forget --titles` 直接原子写净化 state（不滚 `.bak`），随后删除 `state.bak.json`/`state.corrupt-*.json`/`state.recovered.json`/`watch.log` 并逐项打印；degraded 时保留损坏现场与 recovered 证据。
+- 状态：已验收。
+- 证据：`src/store.rs` `save_store_at_no_backup` + 3 个新单测；提交 `5a57d09`（S3）。
 
 **FR-DATA-01 损坏保护**
 - 期望：`state.json` 解析失败时改名为 `state.corrupt-<ts>.json` 且**绝不覆盖**（降级只写 `state.recovered.json`）；正常写前滚 `state.bak.json`；`pet-config.json` 字段级容错。
@@ -263,24 +283,24 @@
 **FR-ARCH-01 模块拆分**
 - 期望：`main.rs` <800 行，职责拆到 `store/config/scan/daemon/cli`；测试集中 `src/tests.rs`；`cargo test --offline` ≥80。
 - 状态：已验收。
-- 证据：`main.rs` 449 行；101 项测试（55 lib + 46 bin）全绿、0 warning；提交 `79d4625`…`e7cf357`（T9）。
+- 证据：`main.rs` 449 行；111 项测试（58 lib + 53 bin）全绿、0 warning；提交 `79d4625`…`e7cf357`（T9）。
 
 ## 10. 发布与归属（FR-REL）
 
 **FR-REL-01 归属**：README/USAGE/SPEC 注明 fork 自 MuskCheng/zectrix-workbuddy-pet；LICENSE 保留原版权。
 - 状态：已验收。
 
-**FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-croc-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
-- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-croc-pet （`main` 已推送；tag `v0.8.0`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
-- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载；0.8.0 安全整改后以同一 spec 升级）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
+**FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-gator-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
+- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-gator-pet （`main` 已推送；tag `v0.8.2`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
+- 证据：`pnpm add "github:gator-university/zectrix-gator-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载；0.8.0 安全整改后以同一 spec 升级）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-gator-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.8.0）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.8.2）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 11. 可验证性（FR-VER）
 
 **FR-VER-01 自动化**：`cargo test` 全过（≥80 项），插件侧 `npm test` 全过。
-- 状态：已验收。55 lib + 46 bin = **101** 项；`plugin` 侧 14 例。
+- 状态：已验收。58 lib + 53 bin = **111** 项；`plugin` 侧 25 例。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。

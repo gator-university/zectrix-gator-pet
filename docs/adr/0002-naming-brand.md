@@ -6,7 +6,7 @@
 ## 决策
 
 - 正式名称：**鳄鱼大宠物**（五个汉字，中文语序，略带玩笑感）。
-- 英文/仓库名：`zectrix-croc-pet`；内部 crate 名暂时仍为 `dsh-pet`（避免大范围重命名），可执行文件仍为 `dsh-pet.exe`。
+- 英文/仓库名：`zectrix-gator-pet`；内部 crate 名暂时仍为 `dsh-pet`（避免大范围重命名），可执行文件仍为 `dsh-pet.exe`。
 - 项目名：`zectrix-deepseek-harness-pet`（文档/仓库描述使用）。
 - 宠物无自称、无名字；界面不出现「AI 工作搭子」。
 - 设备左上只显示「鳄鱼大宠物」12px；窗口标题、DSH 插件标题、插件图标名都用该名称。

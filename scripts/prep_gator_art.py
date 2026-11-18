@@ -1,8 +1,8 @@
 """把 AI 生成（art/gen-v3）的 gator 线稿转成墨水屏素材。
 
 用法：
-  python scripts/prep_croc_art.py            # 生成 assets/croc/default/*.png 与 plugin/icon.png
-  python scripts/prep_croc_art.py --masters  # 额外把 1254px 原图缩到 512px（瘦身仓库）
+  python scripts/prep_gator_art.py            # 生成 assets/gator/default/*.png 与 plugin/icon.png
+  python scripts/prep_gator_art.py --masters  # 额外把 1254px 原图缩到 512px（瘦身仓库）
 
 规则：
 - 六张图共用同一裁剪框（六张并集的墨迹 bbox），保证角色比例一致。
@@ -16,7 +16,7 @@ from PIL import Image, ImageOps
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "art", "gen-v3")
-OUT = os.path.join(ROOT, "assets", "croc", "default")
+OUT = os.path.join(ROOT, "assets", "gator", "default")
 ICON = os.path.join(ROOT, "plugin", "icon.png")
 ACTIONS = ["idle", "working", "waiting", "done", "error", "sleep"]
 W, H = 90, 120

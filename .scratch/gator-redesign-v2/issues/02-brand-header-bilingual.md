@@ -7,7 +7,7 @@
 **Status:** done
 
 <!-- 验收证据：分支 ticket/02-brand-header；提交 6dad447（品牌行中英双行）与
-3b6150e（合并 feat/croc-v2）。cargo test 68 项全过，cargo build --release 0 警告。
+3b6150e（合并 feat/gator-v2）。cargo test 68 项全过，cargo build --release 0 警告。
 测试 header_is_brand_only_and_idle_footer_reports_device / layouts_obey_hub_limits。
 截图 docs/screens/working.png（单任务页）与 docs/screens/header.png（顶部 60px ×3
 最近邻放大，展示中英双行与分隔线）。 -->

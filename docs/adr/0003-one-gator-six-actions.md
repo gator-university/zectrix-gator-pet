@@ -1,13 +1,13 @@
 # ADR 0003：一只鳄鱼、六个动作（不是六套装扮）
 
 - 状态：Accepted（2026-11-18）
-- 相关：FR-CROC-01..03
+- 相关：FR-GATOR-01..03
 
 ## 决策
 
 - 形象从「六套不同造型的猫」改为「同一只鳄鱼 + 六个动作」：`idle` / `working` / `waiting` / `done` / `error` / `sleep`。
 - 动作由状态机自动触发；单帧静态图，只在动作切换时重绘，避免墨水屏连续闪烁。
-- 装扮（outfit）作为未来扩展：素材路径预留 `assets/croc/<outfit>/<action>.png`，v1 只有 `default`。
+- 装扮（outfit）作为未来扩展：素材路径预留 `assets/gator/<outfit>/<action>.png`，v1 只有 `default`。
 - 尺寸保持现有占位：点阵 30×40，按 3 倍最近邻放大到 90×120，绘制在右下角。
 - 长按确认键不再「换造型」，改为无操作（保留单击/双击/三击）。
 

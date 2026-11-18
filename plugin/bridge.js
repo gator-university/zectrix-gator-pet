@@ -4,7 +4,7 @@
 // - 每次安装生成一个随机 token，落在 %LOCALAPPDATA%\zectrix-dsh-pet\bridge-token；
 //   /token 只对 DSH 桌面 App 的 `dsh-app://app` 渲染进程返回，且每次调用都轮换令牌。
 // - 令牌 10 分钟有效；/config、/test 同时校验令牌内容与有效期。
-// - /config、/test 等需要 X-Croc-Pet-Token；CORS 不再返回 `*`。
+// - /config、/test 等需要 X-Gator-Pet-Token；CORS 不再返回 `*`。
 // - POST /config 的白名单字段做严格校验，先写临时文件再 rename，避免半份 JSON。
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import fs from 'node:fs'
@@ -19,7 +19,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8')).version
 
 const MAX_BODY = 64 * 1024
-const TOKEN_HEADER = 'x-croc-pet-token'
+const TOKEN_HEADER = 'x-gator-pet-token'
 /** 令牌有效期：10 分钟。过期后 /config、/test 一律 401，需重新 GET /token。 */
 const TOKEN_TTL_MS = 10 * 60 * 1000
 /** 同一台设备的「测试连接」冷却：3 秒内重复请求回 429。 */
@@ -305,7 +305,7 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log, to
       }
       res.writeHead(204, {
         'access-control-allow-origin': origin,
-        'access-control-allow-headers': 'content-type, x-croc-pet-token',
+        'access-control-allow-headers': 'content-type, x-gator-pet-token',
         'access-control-allow-methods': 'GET, POST, OPTIONS',
         vary: 'Origin',
         'cache-control': 'no-store',

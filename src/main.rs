@@ -230,7 +230,7 @@ fn retire_legacy_autostart_in(appdata: Option<&Path>, profile: Option<&Path>) ->
             .join("Start Menu")
             .join("Programs");
         targets.push(programs.join("Startup").join("zectrix-dsh-pet.vbs"));
-        targets.push(programs.join("Startup").join("croc-pet.vbs"));
+        targets.push(programs.join("Startup").join("gator-pet.vbs"));
         targets.push(programs.join("DSH 宠物.lnk"));
     }
     if let Some(profile) = profile {

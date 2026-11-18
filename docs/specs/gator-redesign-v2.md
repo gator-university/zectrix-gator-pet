@@ -1,9 +1,9 @@
 # 鳄鱼形象 v2 · 重新设计（SPEC）
 
 > 状态：已确认切面 → 待实施
-> 来源：用户提供 3 张参考图（[docs/reference/croc-style/](reference/croc-style/)），要求「以这些鳄鱼形象为参考，重新设计本项目的新鳄鱼」。
+> 来源：用户提供 3 张参考图（[docs/reference/gator-style/](reference/gator-style/)），要求「以这些鳄鱼形象为参考，重新设计本项目的新鳄鱼」。
 > 追加决定：素材改为 **90×120 直接绘制**（不再 30×40 放大）；左上品牌行加英文产品名 **「Zetrix / DSH pet」**。
-> 关联：[docs/SPEC.md](../SPEC.md) FR-CROC-01/02/03/05、FR-UI-05、[docs/adr/0003-one-croc-six-actions.md](../adr/0003-one-croc-six-actions.md)、[GLOSSARY.md](../../GLOSSARY.md)。
+> 关联：[docs/SPEC.md](../SPEC.md) FR-GATOR-01/02/03/05、FR-UI-05、[docs/adr/0003-one-gator-six-actions.md](../adr/0003-one-gator-six-actions.md)、[GLOSSARY.md](../../GLOSSARY.md)。
 > 注：仓库未配置 issue tracker，本 spec 与 tickets 按 skill 的本地文件模式落盘（`docs/specs/`、`.scratch/`）。
 
 ## Problem Statement
@@ -13,7 +13,7 @@
 ## Solution
 
 1. **素材契约升级**：鳄鱼素材改为 90×120 单色 PNG，按 1:1 画在 (300,152)（不再 3× 放大；原计划 (300,150)，ticket 02 品牌行加高后版心整体下移 2px）。渲染路径不变（`sprite::draw_action` 贪心矩形化），只改素材尺寸与缩放参数；`scale` 参数保留但 v1 传 1。
-2. **六动作 v2 形象**：主角是 **gator（短吻鳄 / alligator）**——短而圆的 U 形吻部、圆头、厚描边、高光眼、浅色肚皮，不是长尖吻的 croc；待命端咖啡（「早上好」参考）、干活敲笔记本（「沉迷工作」参考）、等你举手/问号、完成星星/点赞（「奈斯」参考）、出错绷带/× 眼、睡觉闭眼 + Z。90×120 有足够像素画 2px 描边和表情。
+2. **六动作 v2 形象**：主角是 **gator（短吻鳄 / alligator）**——短而圆的 U 形吻部、圆头、厚描边、高光眼、浅色肚皮，不是长尖吻的 gator；待命端咖啡（「早上好」参考）、干活敲笔记本（「沉迷工作」参考）、等你举手/问号、完成星星/点赞（「奈斯」参考）、出错绷带/× 眼、睡觉闭眼 + Z。90×120 有足够像素画 2px 描边和表情。
 3. **品牌行**：左上第一行中文「鳄鱼大宠物」12px，第二行英文「Zetrix / DSH pet」9px；分隔线下移，版式其余元素顺势下移几个像素，不挤压底部信息。
 4. **配套更新**：插件图标换成新鳄鱼头像（128×128）；README 头图、`docs/screens/` 截图重渲染；SPEC 证据与版本（0.6.1）同步。
 
@@ -58,7 +58,7 @@
 
 ## Implementation Decisions
 
-**切面（seams）**：不新增切面。改动点集中在既有素材契约 `assets/croc/<outfit>/<action>.png`、`sprite::draw_action` 的缩放参数、`layout::draw` 的品牌行，以及 `src/sprite.rs` / `src/layout.rs` 现有测试。插件协议、状态机、刷新策略、配置桥均不改。
+**切面（seams）**：不新增切面。改动点集中在既有素材契约 `assets/gator/<outfit>/<action>.png`、`sprite::draw_action` 的缩放参数、`layout::draw` 的品牌行，以及 `src/sprite.rs` / `src/layout.rs` 现有测试。插件协议、状态机、刷新策略、配置桥均不改。
 
 **最终出厂基线**：本 spec 原始决策写的是 (300,150)；ticket 02 把品牌行改成中英双行后，分隔线由 y=30 下移到 y=34、版心整体下移 2px（`layout.rs` 的 `BODY_SHIFT = 2`），所以最终绘制基线是 **(300,152)**，素材底边 272 仍低于底部分隔线 273。下文数字以最终基线为准。
 
@@ -78,8 +78,8 @@
 **图标与文档**
 - `plugin/icon.png` 用新鳄鱼头像重绘（128×128，单色，白底）。
 - README 头图与 `docs/screens/*.png` 用新素材重渲染。
-- `docs/reference/croc-style/` 保留 3 张参考图，注明「用户提供的风格参考，不直接复制」。
-- 版本 Cargo 与插件 package.json 同步 0.6.1；SPEC 增加 FR-CROC-05「形象 v2 风格基线」，更新 FR-CROC-01/02/03、FR-UI-05 证据。
+- `docs/reference/gator-style/` 保留 3 张参考图，注明「用户提供的风格参考，不直接复制」。
+- 版本 Cargo 与插件 package.json 同步 0.6.1；SPEC 增加 FR-GATOR-05「形象 v2 风格基线」，更新 FR-GATOR-01/02/03、FR-UI-05 证据。
 - 新增 ADR 0007 记录素材契约变更（30×40@3× → 90×120@1×）及理由（细节可读性、用户决定）。
 
 **接口**：`sprite::draw_action(elements, x, y, action, scale) -> usize` 签名不变；`ACTIONS` 不变；素材目录约定不变；`layout` 对外仍是 `draw(model, frame) -> Value`。
@@ -103,7 +103,7 @@
 ## Further Notes
 
 - 三张参考图关键特征：薄荷绿 gator（短吻鳄）、圆头短圆吻、黑粗描边、白色高光眼、浅色肚皮、夸张表情（咖啡师「早上好」、点赞「奈斯」、打工「沉迷工作」）。v2 取造型语言（尤其「短圆吻 + 圆头」这个 gator 特征），不描摹画面。
-- 历史命名说明：资产目录 `assets/croc/...`、插件包名 `zectrix-croc-pet`、FR-CROC-* 编号沿用早期命名；实际角色物种是 gator，若整体改名属独立改动，本次不改路径/包名。
+- 历史命名说明：资产目录 `assets/gator/...`、插件包名 `zectrix-gator-pet`、FR-GATOR-* 编号沿用早期命名；实际角色物种是 gator，若整体改名属独立改动，本次不改路径/包名。
 - 单色墨水屏：素材直接画黑白实心形状，不用灰阶抗锯齿；预览时按阈值渲染，和真机一致。
 - 90×120 下建议先画 idle，再以同一头身模板派生其余五张，保证是同一只。
 - 若某动作在 90×120 仍辨识不足，优先简化道具/姿势，不改尺寸；确需改动再开 ADR 并回改 spec。

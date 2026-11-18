@@ -419,7 +419,7 @@ pub fn draw(model: &Model, now: i64) -> Value {
         } else {
             "idle"
         };
-        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-CROC-03）。
+        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-GATOR-03）。
         // 品牌行加高后版式整体下移 2px（ticket 02），素材跟着下移，仍不压底部分隔线。
         sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 1);
     }

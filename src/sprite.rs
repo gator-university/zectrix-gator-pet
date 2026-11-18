@@ -1,7 +1,7 @@
-//! 鳄鱼大宠物的形象层：把 `assets/croc/<outfit>/<action>.png`（90×120 单色）
+//! 鳄鱼大宠物的形象层：把 `assets/gator/<outfit>/<action>.png`（90×120 单色）
 //! 以 1:1 画到 400×300 画布上。
 //!
-//! 素材契约（见 SPEC FR-CROC-03 / FR-CROC-05）：90×120、L 模式、阈值 <128 为墨，
+//! 素材契约（见 SPEC FR-GATOR-03 / FR-GATOR-05）：90×120、L 模式、阈值 <128 为墨，
 //! 画在右下角 (300,152)（品牌行下移 2px 后的最终基线）。v1 只有 `default` 一套；
 //! 以后加装扮只需加目录。
 //!
@@ -16,17 +16,17 @@ use std::sync::{Mutex, OnceLock};
 const SPRITE_W: usize = 90;
 const SPRITE_H: usize = 120;
 
-/// 六个动作（SPEC FR-CROC-01）。单帧静态，只有动作变了才重绘。
+/// 六个动作（SPEC FR-GATOR-01）。单帧静态，只有动作变了才重绘。
 pub const ACTIONS: [&str; 6] = ["idle", "working", "waiting", "done", "error", "sleep"];
 
 fn embedded(action: &str) -> Option<&'static [u8]> {
     Some(match action {
-        "idle" => include_bytes!("../assets/croc/default/idle.png").as_slice(),
-        "working" => include_bytes!("../assets/croc/default/working.png").as_slice(),
-        "waiting" => include_bytes!("../assets/croc/default/waiting.png").as_slice(),
-        "done" => include_bytes!("../assets/croc/default/done.png").as_slice(),
-        "error" => include_bytes!("../assets/croc/default/error.png").as_slice(),
-        "sleep" => include_bytes!("../assets/croc/default/sleep.png").as_slice(),
+        "idle" => include_bytes!("../assets/gator/default/idle.png").as_slice(),
+        "working" => include_bytes!("../assets/gator/default/working.png").as_slice(),
+        "waiting" => include_bytes!("../assets/gator/default/waiting.png").as_slice(),
+        "done" => include_bytes!("../assets/gator/default/done.png").as_slice(),
+        "error" => include_bytes!("../assets/gator/default/error.png").as_slice(),
+        "sleep" => include_bytes!("../assets/gator/default/sleep.png").as_slice(),
         _ => return None,
     })
 }

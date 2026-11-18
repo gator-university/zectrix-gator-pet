@@ -1,20 +1,20 @@
 # ADR 0007：素材契约改为 90×120 直接绘制（不再 30×40 放大 3×）
 
 - 状态：Accepted（2026-11-18）
-- 相关：FR-CROC-01/02/03/05、FR-UI-01、FR-VER-02
+- 相关：FR-GATOR-01/02/03/05、FR-UI-01、FR-VER-02
 
 ## 背景
 
 v1 沿用 30×40 点阵占位图，按 3 倍最近邻放大到 90×120 再画到 (300,150)。放大的块状像素把细节吃掉：吻部、眼睛高光、道具（咖啡杯 / 笔记本 / 星星 / 绷带）在 90×120 下辨识度差，画面「占位感」明显。
 
-v2 要按用户提供的 gator 参考图（`docs/reference/croc-style/`）重画形象，目标是 90×120 下细节清晰、仍是单色线稿，并且能替换。
+v2 要按用户提供的 gator 参考图（`docs/reference/gator-style/`）重画形象，目标是 90×120 下细节清晰、仍是单色线稿，并且能替换。
 
 ## 决策
 
 - 素材改为 **90×120 单色 PNG（L 模式，只含 0/255），直接按 1:1 画在 (300,152)**（layout 的 `BODY_SHIFT = 2`）；不再缩放。
 - 六张（idle/working/waiting/done/error/sleep）用同一套头/身/腿/尾模板派生，保证是同一只；2px 实心描边、白高光眼、2–3 条肚皮分节线、chibi 头身比。
-- 生成器 `scripts/make_croc_v2.py`：4× 超采样 → MinFilter 腐蚀出描边 → NEAREST 下采样，只输出 0/255；同一脚本 `--icon` 出 128×128 插件图标。
-- `sprite::draw_action(elements, x, y, action, scale)` 保留 `scale` 参数（v1 传 1），给未来更换素材尺寸留口；路径仍是 `assets/croc/<outfit>/<action>.png`。
+- 生成器 `scripts/make_gator_v2.py`：4× 超采样 → MinFilter 腐蚀出描边 → NEAREST 下采样，只输出 0/255；同一脚本 `--icon` 出 128×128 插件图标。
+- `sprite::draw_action(elements, x, y, action, scale)` 保留 `scale` 参数（v1 传 1），给未来更换素材尺寸留口；路径仍是 `assets/gator/<outfit>/<action>.png`。
 - 单帧元素上限从 220 提到 400（`src/layout.rs` 的 `layouts_obey_hub_limits`）；实测单帧 245–280 个场景元素（素材贪婪矩形 208–274 + 版式约 10）。
 
 ## 替代方案
@@ -27,5 +27,5 @@ v2 要按用户提供的 gator 参考图（`docs/reference/croc-style/`）重画
 
 - 单帧元素数增加（245–280 个场景元素），刷新时间略升；仍在 400 上限与 mono 1–2 秒/帧目标内。
 - 美术必须在最终尺寸（90×120）作画，不能再靠放大「凑」；换形象须按契约提供 6 个同尺寸同路径文件。
-- 装扮（outfit）机制不变：`assets/croc/<outfit>/` 仍生效；旧装扮若还是 30×40 需要重画。
-- 预览、README 截图、插件图标全部改用新素材；SPEC FR-CROC-01/02/03 与 README 的尺寸描述同步更新。
+- 装扮（outfit）机制不变：`assets/gator/<outfit>/` 仍生效；旧装扮若还是 30×40 需要重画。
+- 预览、README 截图、插件图标全部改用新素材；SPEC FR-GATOR-01/02/03 与 README 的尺寸描述同步更新。

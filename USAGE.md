@@ -48,7 +48,7 @@ DSH → 设置 → **Plugins → 鳄鱼大宠物**：
 ### 退出与卸载
 
 - 临时停用：设置页关「跟随」，或设备三击。
-- 彻底移除：Plugins 里禁用/移除 `zectrix-croc-pet`；DSH 下次启动不再拉起宠物。
+- 彻底移除：Plugins 里禁用/移除 `zectrix-gator-pet`；DSH 下次启动不再拉起宠物。
 - 本机数据（可删）：`%LOCALAPPDATA%\zectrix-dsh-pet\`（state.json、pet-config.json、pet.log）。
   旧版本留下的开机启动/快捷方式会在新版宠物首次启动时自动清理（见上文「开机自启」）。
 

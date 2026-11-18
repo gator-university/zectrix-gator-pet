@@ -96,7 +96,7 @@ function spawnPet() {
   return child
 }
 
-export const name = 'zectrix-croc-pet'
+export const name = 'zectrix-gator-pet'
 
 export function apply(ctx) {
   ctx.effect(() => {
@@ -129,5 +129,5 @@ export function apply(ctx) {
       } catch {}
       log('DSH 退出：已停止宠物进程与配置桥。')
     }
-  }, 'zectrix-croc-pet')
+  }, 'zectrix-gator-pet')
 }

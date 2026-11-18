@@ -1,4 +1,4 @@
 # 鳄鱼大宠物：DSH 启动时由本 bundle 行拉起宠物进程（kill-on-close Job + exe 自检兜底）。
 - insert:
-    - id: croc-pet
-      name: zectrix-croc-pet
+    - id: gator-pet
+      name: zectrix-gator-pet

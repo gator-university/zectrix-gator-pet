@@ -1,10 +1,10 @@
 [package]
 name = "dsh-pet"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 license = "MIT"
 description = "鳄鱼大宠物：DSH 插件 + ZECTRIX Note 4 墨水屏，跟随本机 DeepSeek Harness 会话状态"
-repository = "https://github.com/gator-university/zectrix-croc-pet"
+repository = "https://github.com/gator-university/zectrix-gator-pet"
 readme = "README.md"
 keywords = ["zectrix", "eink", "deepseek", "harness", "pet"]
 categories = ["command-line-utilities"]

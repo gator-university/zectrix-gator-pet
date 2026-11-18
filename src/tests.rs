@@ -146,7 +146,7 @@ fn retire_legacy_autostart_removes_only_known_artifacts() {
     }
     let known = [
         startup.join("zectrix-dsh-pet.vbs"),
-        startup.join("croc-pet.vbs"),
+        startup.join("gator-pet.vbs"),
         programs.join("DSH 宠物.lnk"),
         desktop.join("DSH 宠物.lnk"),
         desktop.join("鳄鱼大宠物.lnk"),
