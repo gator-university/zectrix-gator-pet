@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use dsh_pet::{
     device, layout,
     model::{Event as TaskEvent, Model, Settings, Status, Task, TitleSource},
@@ -1743,17 +1744,65 @@ fn refresh_due(
     at.saturating_sub(last_push_at) >= throttle
 }
 
+/// 花絮采样间隔：两次 UIA 调用之间至少隔这么久。
+const QUIP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 后台花絮采样器：UIA 是跨进程 COM 调用（`current_quip` 内部还会重试 8 次、
+/// 最坏阻塞 1.5 秒），**绝不能放在推送路径上**。单独起一个线程，每 2 秒最多采一次，
+/// 成功结果塞进 `Arc<Mutex<Option<String>>>`；推送时只读缓存，拿锁是微秒级。
+///
+/// 采样线程是进程级单例：`watch` 会反复进出 `cmd_run`，不能每次会话都再起一条。
+struct QuipSampler {
+    cache: Arc<Mutex<Option<String>>>,
+}
+
+impl QuipSampler {
+    /// 进程内唯一实例；首次调用时启动线程并**立即**采一次。
+    fn global() -> &'static QuipSampler {
+        static INSTANCE: OnceLock<QuipSampler> = OnceLock::new();
+        INSTANCE.get_or_init(QuipSampler::spawn)
+    }
+
+    fn spawn() -> Self {
+        let cache = Arc::new(Mutex::new(None));
+        let shared = Arc::clone(&cache);
+        let spawned = std::thread::Builder::new()
+            .name("quip-sampler".into())
+            .spawn(move || loop {
+                // 启动后第一轮就采，别等 2 秒；读不到（窗口没开/UIA 被占）就保留
+                // 上一句——传 None 会把屏幕上已有的花絮擦掉，那不是用户想看的。
+                if let Some(quip) = uia::current_quip() {
+                    if let Ok(mut slot) = shared.lock() {
+                        *slot = Some(quip);
+                    }
+                }
+                std::thread::sleep(QUIP_INTERVAL);
+            });
+        if spawned.is_err() {
+            // 起不来就退化成「永远读不到花絮」：推送路径完全不受影响。
+            eprintln!("[花絮] 采样线程启动失败，界面花絮将不可用");
+        }
+        Self { cache }
+    }
+
+    /// 推送路径唯一入口：只读缓存，不碰 UIA。
+    fn cached(&self) -> Option<String> {
+        self.cache.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
 /// 只在画面签名变化时推送。签名涵盖状态、标题、进度与当前选中项，
 /// 没有真实变化就一个字节都不发——电子墨水屏刷新很贵，也不该无谓闪烁。
 /// 把当前模型渲染上屏；画面没变就不重刷。
 ///
-/// 花絮（底部那句）**不再单独触发刷新**：只有主画面确实要更新时才顺便读一次界面
-/// 状态行，把花絮并进同一帧。否则界面状态行每变一次（每个工具调用都变）就会
-/// 白闪一下墨水屏——这正是「每 2 秒闪一次」的另一半原因。
+/// 花絮（底部那句）**不再单独触发刷新**：只有主画面确实要更新时才顺便取一次
+/// 后台采样好的界面状态行，把花絮并进同一帧。否则界面状态行每变一次
+/// （每个工具调用都变）就会白闪一下墨水屏——这正是「每 2 秒闪一次」的另一半原因。
 async fn push_if_changed(
     dev: &Device,
     model: &mut Model,
     store: &mut Store,
+    quips: &QuipSampler,
     fonts: &Fonts,
     fmt: ImageFormat,
     frame: usize,
@@ -1769,12 +1818,12 @@ async fn push_if_changed(
     let mut scene = layout::draw(model, now(), phase);
     let sig = scene.to_string();
     if last_sig.as_ref() == Some(&sig) {
-        // 主画面没变：连界面都不去读，安静地返回。
+        // 主画面没变：连花絮缓存都不读，安静地返回。
         return false;
     }
-    // 主画面确实要更新了，顺带把界面当刻的花絮取回来，和这一帧一起上屏。
-    // 读不到（窗口最小化、气泡已关、UIA 被占）就沿用上一句，绝不阻塞推送。
-    if let Some(quip) = uia::current_quip() {
+    // 主画面确实要更新了，顺带把后台采好的花絮并进这一帧。
+    // 只读缓存：这里做任何 UIA 调用都会把推送拖慢到 1.5 秒级。
+    if let Some(quip) = quips.cached() {
         if model.set_live_quip(&quip) {
             println!("[花絮] {quip}");
             store.model = model.clone();
@@ -2637,6 +2686,51 @@ async fn announce(dev: &Device, model: &Model, store: &mut Store, task: &Task) {
     }
 }
 
+/// 录音事件的兜底时限：`RecordingStarted` 之后这么久还没 `RecordingFinished`，
+/// 就认为通知丢了、自己复位（否则 `if recording { continue }` 会让扫描/推送永久停摆）。
+const RECORDING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 原地重连的退避序列：第 1/2/3 次分别等 1s、2s、4s。
+const RECONNECT_BACKOFF_SECS: [u64; 3] = [1, 2, 4];
+
+/// 录音是否已经超时（纯函数，便于单测）。
+fn recording_expired(now: Instant, started_at: Option<Instant>) -> bool {
+    started_at.is_some_and(|start| now.saturating_duration_since(start) >= RECORDING_TIMEOUT)
+}
+
+/// 这一下点击要不要立刻推帧。单击立即推；双击的第二下不推——静音结果等
+/// 650ms 判定窗口结束后由 tick 统一推一帧，否则一次双击会连闪 3 屏。
+fn gesture_pushes_now(click_count: u8) -> bool {
+    click_count <= 1
+}
+
+/// 外层长窗口重连的等待秒数：15s → 30s → 60s 封顶（原来是 15s×次数，越等越久）。
+fn outer_reconnect_wait(fails: u32) -> u64 {
+    match fails {
+        0 | 1 => 15,
+        2 => 30,
+        _ => 60,
+    }
+}
+
+/// 设备断开后在同一个 `cmd_run` 里原地重连：最多 3 次，退避 1/2/4 秒。
+/// 成功返回新连接（调用方负责关掉旧句柄）；3 次都失败返回 None，交回外层长窗口。
+async fn reconnect_in_place(target: Option<&str>) -> Option<Device> {
+    for (i, wait) in RECONNECT_BACKOFF_SECS.iter().enumerate() {
+        let attempt = i + 1;
+        println!("重连第 {attempt} 次：设备断开，{wait} 秒后重试");
+        tokio::time::sleep(Duration::from_secs(*wait)).await;
+        match device::open(target).await {
+            Ok(dev) => {
+                println!("已重新连接（第 {attempt} 次尝试）");
+                return Some(dev);
+            }
+            Err(e) => eprintln!("重连第 {attempt} 次失败：{e}"),
+        }
+    }
+    None
+}
+
 async fn cmd_run(args: &Args) -> Result<()> {
     let mut store = load_store();
     // 用户配置的唯一来源是 pet-config.json（插件面板与 CLI 都写它）。
@@ -2685,8 +2779,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
     }
     let mut watcher = Watcher::new(dsh_root());
     let fonts = Fonts::load()?;
+    // 花絮采样线程：进程级单例，这里只是确保它已经起来了（UIA 调用留在后台线程）。
+    let quips = QuipSampler::global();
 
-    let dev = device::open(target.as_deref()).await?;
+    let mut dev = device::open(target.as_deref()).await?;
     println!(
         "已连接: id={} model={} addr={}｜灰阶 {}｜Ctrl+C 退出",
         dev.summary.id,
@@ -2723,6 +2819,9 @@ async fn cmd_run(args: &Args) -> Result<()> {
     // 设备正在录音时固件占着采集，推送和响铃都会拿到 Busy——这一拍直接跳过，
     // 等 RecordingFinished 再恢复，别让日志里刷一串「推送失败」。
     let mut recording = false;
+    // `RecordingStarted` 的时刻：10 秒没等到 `RecordingFinished` 就自己复位，
+    // 免得固件漏发通知后扫描/推送被永久跳过。
+    let mut recording_started_at: Option<Instant> = None;
     // 设备手势：确认键「双击 = 静音/恢复」「三击 = 退出回普通界面」。
     // 固件只上报单键短按/长按，没有组合键，双击/三击在这里用时间窗识别：
     // 1 次=回首页（原有行为），2 次=静音，3 次=退出。双击会等 650ms 看有没有
@@ -2754,7 +2853,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(450)).await;
     }
     let mut last_push_at = now();
-    if push_if_changed(&dev, &mut model, &mut store, &fonts, fmt, frame, &mut last_sig).await {
+    if push_if_changed(&dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig).await {
         frame = (frame + 1) % 6;
         last_push_at = now();
     }
@@ -2797,6 +2896,13 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     break Ok(());
                 }
                 // 录音期间设备在采集，任何推送都会 Busy：这一拍什么都不做。
+                // 但固件的 `RecordingFinished` 可能丢（被打断、拔线、固件异常），
+                // 不能因此永久停摆——超过 10 秒就自己复位，恢复扫描与推送。
+                if recording && recording_expired(Instant::now(), recording_started_at) {
+                    recording = false;
+                    recording_started_at = None;
+                    println!("[手势] 录音事件超时，已复位（10 秒内没有收到 RecordingFinished）");
+                }
                 if recording {
                     continue;
                 }
@@ -2858,12 +2964,15 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     .into();
                     println!("[手势] 双击确认 → {}", model.quip);
                     // 屏幕右下角给个即时反馈（下一帧会被真实花絮替换）。
+                    // 这是本次双击唯一一帧结果帧：第二下点击在按键分支里被推迟了。
                     let scene = layout::draw(
                         &model,
                         now(),
                         if model.settings.animation { frame } else { 0 },
                     );
-                    push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await;
+                    if push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await {
+                        println!("[手势] 静音结果已上屏（双击判定结束，只推这一帧）");
+                    }
                     last_card = Some(card_sig(&model, now()));
                     // 手势反馈已经闪了一次，主画面别紧跟着再闪：一并走冷却闸门。
                     last_push_at = now();
@@ -2914,9 +3023,13 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     }
                 }
                 // 冷却期内攒着不推；到点一次性推当前最新状态，避免连续整屏闪。
-                if pending_push && now() >= push_not_before {
+                // 双击判定窗口还开着时也不推：中间那一帧会让一次双击闪 3 屏，
+                // 等 650ms 判定完，上面已经按最终状态推过静音结果了。
+                let double_click_pending = clicks.1 == 2
+                    && chrono::Local::now().timestamp_millis() - clicks.0 < 650;
+                if pending_push && !double_click_pending && now() >= push_not_before {
                     if push_if_changed(
-                        &dev, &mut model, &mut store, &fonts, fmt, frame, &mut last_sig,
+                        &dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig,
                     )
                     .await
                     {
@@ -2992,11 +3105,26 @@ async fn cmd_run(args: &Args) -> Result<()> {
                             }
                             _ => false,
                         };
+                        // 双击的第二下不单独推帧：静音结果等 650ms 判定窗口结束后
+                        // 由扫描 tick 统一推一帧。否则一次双击会连闪 3 屏
+                        // （单击回首页、第二下、静音结果）。
+                        let defer_confirm = matches!(
+                            (key, action),
+                            (zectrix_sdk::Key::Confirm, zectrix_sdk::KeyAction::Short)
+                        ) && !gesture_pushes_now(clicks.1);
+                        if defer_confirm {
+                            println!(
+                                "[手势] 双击窗口内的第 {} 次点击：不单独推帧（等判定结束只推静音结果）",
+                                clicks.1
+                            );
+                        }
                         if handled
+                            && !defer_confirm
                             && push_if_changed(
                                 &dev,
                                 &mut model,
                                 &mut store,
+                                quips,
                                 &fonts,
                                 fmt,
                                 frame,
@@ -3013,11 +3141,13 @@ async fn cmd_run(args: &Args) -> Result<()> {
                         // 新版规格：长按确认键不做动作。固件仍会上报录音事件，
                         // 这里只标记「设备正忙」，不转写、不粘贴、不推送。
                         recording = true;
+                        recording_started_at = Some(Instant::now());
                         println!("[手势] 长按确认键：按规格无操作（不录音、不投递）");
                     }
                     Ok(Some(zectrix_sdk::Event::RecordingFinished { audio, reason })) => {
                         // 长按无操作：录音数据直接丢弃，设备回到主画面。
                         recording = false;
+                        recording_started_at = None;
                         if let Some(audio) = audio {
                             println!(
                                 "[手势] 忽略长按录音（{} 秒，{reason:?}）",
@@ -3027,9 +3157,52 @@ async fn cmd_run(args: &Args) -> Result<()> {
                         last_sig = None;
                     }
                     Ok(Some(zectrix_sdk::Event::Disconnected { reason })) => {
-                        break Err(anyhow::anyhow!("设备连接已结束（{reason:?}），按约定不自动重连"));
+                        // 断线先原地重连：1s/2s/4s 共 3 次，成功就留在这一轮会话里；
+                        // 3 次都失败才返回外层，由 `cmd_watch` 用 15s/30s/60s 的长窗口兜底。
+                        println!("[连接] 设备连接已结束（{reason:?}）");
+                        if watch && !dsh_running() {
+                            println!("DeepSeek Harness 已退出：不再重连。");
+                            break Ok(());
+                        }
+                        let Some(new_dev) = reconnect_in_place(target.as_deref()).await else {
+                            break Err(anyhow::anyhow!(
+                                "设备连接已结束（{reason:?}），原地重连 3 次失败"
+                            ));
+                        };
+                        let _ = dev.close().await;
+                        dev = new_dev;
+                        // 新连接的事件流从零开始：录音标记、连击、画面签名都复位，
+                        // 否则旧签名可能把首帧拦住（画面没变就不推）。
+                        recording = false;
+                        recording_started_at = None;
+                        clicks = (0, 0);
+                        last_sig = None;
+                        pending_push = false;
+                        CONNECTED_AT.store(now(), Ordering::Relaxed);
+                        status_at = now();
+                        // 重连成功先推首帧（≤2 秒目标），再取电量——别让状态查询拖慢首帧。
+                        if push_if_changed(
+                            &dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig,
+                        )
+                        .await
+                        {
+                            frame = (frame + 1) % 6;
+                            last_push_at = now();
+                            last_card = Some(card_sig(&model, now()));
+                            push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
+                        }
+                        if let Ok(s) = dev.status().await {
+                            println!(
+                                "电量 {:?}% | RSSI {:?} dBm",
+                                s.battery_percent, s.wifi_rssi_dbm
+                            );
+                            model.battery = s.battery_percent;
+                            model.rssi = s.wifi_rssi_dbm.map(i16::from);
+                            model.battery_at = Some(now());
+                        }
+                        continue;
                     }
-                    Ok(None) => break Err(anyhow::anyhow!("连接已终止，按约定不自动重连")),
+                    Ok(None) => break Err(anyhow::anyhow!("连接已终止（事件流关闭），交给外层重连")),
                     Err(e) => break Err(anyhow::anyhow!("事件通道结束: {e}")),
                 }
             }
@@ -3229,6 +3402,9 @@ async fn cmd_watch(args: &Args) -> Result<()> {
     );
     // 先落一次心跳，状态查询立刻能看到「守护在跑」，不用等第一个 tick。
     write_heartbeat();
+    // 花絮采样线程：UIA 调用留在后台（每 2 秒最多一次），推送路径只读缓存。
+    // 放在待命之前启动，进程一起来就先采一句。
+    QuipSampler::global();
 
     // 显式给了地址就记住（写 pet-config.json）：下次 `watch` / `run` / `push`
     // 不带参数也能连上。用户配置只认这一份文件。
@@ -3339,7 +3515,9 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                     if !dsh_running() {
                         break;
                     }
-                    let wait = 15 * fails as u64;
+                    // 外层兜底：15s → 30s → 60s 封顶。原地重连已经试过 3 次，
+                    // 这里再拖长只会让设备回来得更慢，所以不再线性增长。
+                    let wait = outer_reconnect_wait(fails);
                     println!("{wait} 秒后重连（第 {fails} 次）");
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
@@ -4347,5 +4525,45 @@ mod tests {
             "清理后不得残留正文：{titles:?}"
         );
         assert_eq!(scrub_task_titles(&mut model), 0, "再跑一次应是无操作");
+    }
+
+    #[test]
+    fn recording_expiry_fires_after_ten_seconds() {
+        let started = Instant::now();
+        assert!(
+            !recording_expired(started + Duration::from_secs(9), Some(started)),
+            "9 秒还在时限内，不能复位"
+        );
+        assert!(
+            recording_expired(started + Duration::from_secs(11), Some(started)),
+            "11 秒已超过 10 秒兜底，必须复位"
+        );
+    }
+
+    #[test]
+    fn recording_expiry_needs_a_start_timestamp() {
+        let now = Instant::now();
+        assert!(!recording_expired(now, None), "没收到 RecordingStarted 就不该复位");
+        assert!(
+            !recording_expired(now, Some(now + Duration::from_secs(5))),
+            "时间戳在未来（时钟回拨）也不能误判成超时"
+        );
+    }
+
+    #[test]
+    fn double_click_only_pushes_home_then_mute() {
+        assert!(gesture_pushes_now(1), "单击立即推一帧回首页");
+        assert!(
+            !gesture_pushes_now(2),
+            "双击的第二下不推：静音结果由 650ms 判定窗口结束后的 tick 推"
+        );
+    }
+
+    #[test]
+    fn outer_reconnect_backoff_is_capped_at_sixty_seconds() {
+        assert_eq!(outer_reconnect_wait(1), 15);
+        assert_eq!(outer_reconnect_wait(2), 30);
+        assert_eq!(outer_reconnect_wait(3), 60);
+        assert_eq!(outer_reconnect_wait(9), 60, "封顶 60 秒，不再线性增长");
     }
 }
