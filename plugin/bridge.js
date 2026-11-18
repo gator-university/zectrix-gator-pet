@@ -23,9 +23,8 @@ const TRUSTED_FETCH_SITES = new Set(['same-origin', 'same-site'])
 /**
  * 设置页只允许改这些字段；未知字段直接丢弃。
  *
- * 注意：pet-config.json 里的 `title_source`（session/prompt）与 `pet_skin` 刻意不在此列——
- * 它们由 `dsh-pet set --title-source` / `dsh-pet skin set` 写入（含隐私 opt-in 与造型校验）。
- * 面板保存时会回读并提示用户改用 CLI；要开放到此白名单需另行补 validatePatch 校验。
+ * 注意：`pet_skin` 刻意不在此列——它由 `dsh-pet skin set` 写入（含造型校验）。
+ * `title_source` 在列，但 UI 必须同时写清隐私含义（prompt = 提示词首行会落盘/上屏）。
  */
 const ALLOWED_KEYS = new Set([
   'follow',
@@ -37,10 +36,12 @@ const ALLOWED_KEYS = new Set([
   'refresh_secs',
   'animation',
   'stale_minutes',
+  'title_source',
 ])
 
 const FORMATS = new Set(['mono', 'gray4', 'gray16'])
 const MODES = new Set(['realtime', 'balance', 'calm', 'minimal'])
+const TITLE_SOURCES = new Set(['session', 'prompt'])
 
 /** 只认 http://127.0.0.1:<port> 与 http://localhost:<port>，端口任意。 */
 const TRUSTED_ORIGIN = /^http:\/\/(?:127\.0\.0\.1|localhost):(\d{1,5})$/
@@ -90,6 +91,9 @@ function validatePatch(patch) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'mode') && !MODES.has(patch.mode)) {
     return 'mode 必须是 realtime / balance / calm / minimal'
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'title_source') && !TITLE_SOURCES.has(patch.title_source)) {
+    return 'title_source 必须是 session / prompt'
   }
   return null
 }

@@ -191,6 +191,8 @@ test('POST /config 非法 volume/format/mode 返回 400 且不落盘', async () 
     { volume: '50' },
     { format: 'rgb' },
     { mode: 'turbo' },
+    { title_source: 'all' },
+    { title_source: true },
   ]
   for (const patch of invalidPatches) {
     const res = await request('/config', {
@@ -205,7 +207,7 @@ test('POST /config 非法 volume/format/mode 返回 400 且不落盘', async () 
 
 test('POST /config 合法值原子落盘并能读回', async () => {
   resetConfig()
-  const patch = { target: '10.0.0.9', volume: 55, format: 'gray16', mode: 'calm' }
+  const patch = { target: '10.0.0.9', volume: 55, format: 'gray16', mode: 'calm', title_source: 'prompt' }
   const res = await request('/config', {
     method: 'POST',
     body: patch,
