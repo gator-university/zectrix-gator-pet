@@ -1,6 +1,6 @@
 [package]
 name = "dsh-pet"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "MIT"
 description = "鳄鱼大宠物：DSH 插件 + ZECTRIX Note 4 墨水屏，跟随本机 DeepSeek Harness 会话状态"

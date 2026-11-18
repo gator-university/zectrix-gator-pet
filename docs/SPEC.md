@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.8.0 · 2026-11-18
+> 版本：0.8.1 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -226,9 +226,9 @@
 - 证据：`plugin/bridge.js` + `plugin/test/bridge.test.js`（13 例，`npm test` 全绿）；提交 `9fc45fc`（T1）。
 
 **FR-SEC-02 跨站与最小暴露**
-- 期望：任何非白名单 Origin 或 `Sec-Fetch-Site: cross-site` 一律 403；CORS 只回精确 Origin + `Vary: Origin`，无 `*`；`/test` 只用已存设备 IP，忽略请求体 target。
+- 期望：任何非白名单 Origin 或 `Sec-Fetch-Site: cross-site` 一律 403；例外只有 DSH 桌面渲染进程自己的 `dsh-app://app`（Electron 自定义 scheme，跨源到本机 HTTP 时浏览器固定标 `cross-site`，无法被远程网页伪造）。CORS 只回精确 Origin + `Vary: Origin`，无 `*`；`/test` 只用已存设备 IP，忽略请求体 target。
 - 状态：已验收。
-- 证据：`bridge.test.js` 覆盖 401/403/415/413/400 与 OPTIONS 路径；提交 `9fc45fc`。
+- 证据：`bridge.test.js` 覆盖 401/403/415/413/400 与 OPTIONS 路径，含 `dsh-app://app` 放行与远程 Origin 拒绝各 1 例（16 例全过）；提交 `9fc45fc`、0.8.1 修复 `dsh-app://app` 放行。
 
 **FR-SEC-03 输入校验与原子写**
 - 期望：设备 IP 限私网/回环 IPv4；音量 0–100；格式/模式限枚举；非法值 400 且不写盘；`pet-config.json` 与 `state.json` 均为 tmp+rename 原子写。

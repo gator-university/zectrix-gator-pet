@@ -42,7 +42,14 @@ const FORMATS = new Set(['mono', 'gray4', 'gray16'])
 const MODES = new Set(['realtime', 'balance', 'calm', 'minimal'])
 const TITLE_SOURCES = new Set(['session', 'prompt'])
 
-/** 只认 http://127.0.0.1:<port> 与 http://localhost:<port>，端口任意。 */
+/**
+ * 只认三类来源：
+ * - http://127.0.0.1:<port>、http://localhost:<port>：浏览器里的 DSH 页面；
+ * - dsh-app://app：DSH 桌面应用自己的渲染进程（自定义 scheme，见 Electron
+ *   `--cors-schemes=dsh-app`）。它跨源到 127.0.0.1 时 Sec-Fetch-Site 是
+ *   cross-site，所以需要单独放行；远程网页无法伪造这个 origin。
+ */
+const APP_ORIGIN = 'dsh-app://app'
 const TRUSTED_ORIGIN = /^http:\/\/(?:127\.0\.0\.1|localhost):(\d{1,5})$/
 
 function httpError(statusCode, message) {
@@ -52,6 +59,7 @@ function httpError(statusCode, message) {
 }
 
 function isTrustedOrigin(origin) {
+  if (origin === APP_ORIGIN) return true
   if (typeof origin !== 'string') return false
   const match = TRUSTED_ORIGIN.exec(origin)
   if (!match) return false
@@ -281,8 +289,9 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
       sendJson(req, res, 403, { ok: false, error: 'forbidden' })
       return
     }
-    // 跨站请求即使 token 泄漏也拒绝。
-    if (req.headers['sec-fetch-site'] === 'cross-site') {
+    // 跨站请求即使 token 泄漏也拒绝；DSH 桌面 App 的 dsh-app://app 例外
+    // （自定义 scheme 跨源到本机 HTTP 时浏览器固定标 cross-site）。
+    if (req.headers['sec-fetch-site'] === 'cross-site' && origin !== APP_ORIGIN) {
       sendJson(req, res, 403, { ok: false, error: 'forbidden' })
       return
     }
@@ -295,7 +304,8 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
 
     if (req.method === 'GET' && url.pathname === '/token') {
       // 非浏览器客户端拿不到 token：必须同时有白名单 Origin 和同源/同站标记。
-      if (!isTrustedOrigin(origin) || !TRUSTED_FETCH_SITES.has(req.headers['sec-fetch-site'])) {
+      const fetchSite = req.headers['sec-fetch-site']
+      if (!isTrustedOrigin(origin) || (origin !== APP_ORIGIN && !TRUSTED_FETCH_SITES.has(fetchSite))) {
         sendJson(req, res, 403, { ok: false, error: 'forbidden' })
         return
       }

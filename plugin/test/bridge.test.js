@@ -321,6 +321,27 @@ test('OPTIONS 仅对白名单回 204，带正确的 allow-headers/methods；非�
   assert.equal(bad.headers['access-control-allow-origin'], undefined)
 })
 
+test('DSH 桌面 App 的 dsh-app://app origin 可用：cross-site 也放行', async () => {
+  const APP = 'dsh-app://app'
+  const t = await request('/token', { headers: { origin: APP, 'sec-fetch-site': 'cross-site' } })
+  assert.equal(t.status, 200)
+  assert.equal(t.headers['access-control-allow-origin'], APP)
+  assert.ok(t.json.token)
+  const cfg = await request('/config', {
+    headers: { origin: APP, 'sec-fetch-site': 'cross-site', 'x-croc-pet-token': t.json.token },
+  })
+  assert.equal(cfg.status, 200)
+  assert.equal(cfg.json.config.target, '192.168.1.50')
+})
+
+test('远程网页 origin 仍然拿不到 token', async () => {
+  const r = await request('/token', {
+    headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
+  })
+  assert.equal(r.status, 403)
+  assert.equal(r.headers['access-control-allow-origin'], undefined)
+})
+
 test('token 落盘在 LOCALAPPDATA 下且为 32+ hex', async () => {
   const tokenFile = path.join(tmpDir, 'zectrix-dsh-pet', 'bridge-token')
   const stored = fs.readFileSync(tokenFile, 'utf8').trim()
