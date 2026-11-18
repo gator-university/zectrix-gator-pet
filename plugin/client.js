@@ -7,6 +7,20 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const BASE = 'http://127.0.0.1:4517'
 
+    // 原生 <select> 的下拉选项由系统绘制，默认白底；在深色主题里会变成白底白字。
+    // 这里按 DSH 的 body[data-ds-dark-theme] 显式给 option 上色，并在停用时移除。
+    const STYLE_ID = 'zectrix-croc-pet-style'
+    const STYLE_TEXT = [
+      '.croc-pet-settings select option { background-color: #1d1e21; color: #e9e9ea; }',
+      'body:not([data-ds-dark-theme]) .croc-pet-settings select option { background-color: #ffffff; color: #1d1e21; }',
+    ].join('\n')
+    if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
+      const styleEl = document.createElement('style')
+      styleEl.id = STYLE_ID
+      styleEl.textContent = STYLE_TEXT
+      document.head.appendChild(styleEl)
+    }
+
     const MODES = [
       { value: 'realtime', label: '实时', hint: '状态一变就刷（耗电、闪得勤）' },
       { value: 'balance', label: '平衡', hint: '状态切换立即刷，细节 10 秒合并' },
@@ -119,7 +133,7 @@ window.__ModuleLoader__.load({
 
       return h(
         'div',
-        { style: { padding: '8px 4px 24px', fontSize: 13, lineHeight: 1.6 } },
+        { className: 'croc-pet-settings', style: { padding: '8px 4px 24px', fontSize: 13, lineHeight: 1.6 } },
         h('h3', { style: { margin: '4px 0 2px', fontSize: 15 } }, '鳄鱼大宠物'),
         h(
           'p',
@@ -223,13 +237,21 @@ window.__ModuleLoader__.load({
       inject: ['slots'],
       apply(ctx) {
         ctx.effect(
-          () =>
-            ctx.slots.inject('plugins.bundle.config', () =>
+          () => {
+            const dispose = ctx.slots.inject('plugins.bundle.config', () =>
               ctx.slots.register(
                 { name: 'plugins.bundle.config', key: 'zectrix-croc-pet' },
                 PetSettings,
               ),
-            ),
+            )
+            return () => {
+              if (typeof dispose === 'function') dispose()
+              if (typeof document !== 'undefined') {
+                const el = document.getElementById(STYLE_ID)
+                if (el) el.remove()
+              }
+            }
+          },
           'zectrix-croc-pet: settings page',
         )
       },
