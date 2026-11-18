@@ -554,6 +554,12 @@ struct Store {
     /// 不能让几分钟前的内存快照盖掉 `dsh-pet set` 刚写进磁盘的值。
     #[serde(skip)]
     settings_explicit: bool,
+    /// 本次加载是否读到了损坏的 state.json。只存在内存里（不落盘）：
+    /// 真时 `save_store` 拒绝覆盖磁盘上的 state.json，只写 `state.recovered.json`，
+    /// 直到下一次成功解析干净文件才清除——否则一份坏文件会让默认值把
+    /// 42KB 的任务/提醒/设置整份冲掉。
+    #[serde(skip)]
+    degraded: bool,
 }
 
 /// 从磁盘读当前造型：守护每帧刷新一次，换肤后最多 2 秒就能上屏，
@@ -729,23 +735,164 @@ fn pet_config_path() -> PathBuf {
     data_dir().join("pet-config.json")
 }
 
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone)]
 struct PetConfig {
     follow: Option<bool>,
     sound: Option<bool>,
     volume: Option<u8>,
     target: Option<String>,
     format: Option<String>,
-    /// realtime / balance / quiet / minimal
+    /// realtime / balance / calm / minimal
     mode: Option<String>,
     refresh_secs: Option<u32>,
     animation: Option<bool>,
     stale_minutes: Option<u32>,
 }
 
+/// 插件设置页可选的四种模式（含中文别名）。
+const PET_CONFIG_MODES: [&str; 8] = [
+    "realtime", "实时", "balance", "平衡", "calm", "安静", "minimal", "极简",
+];
+
+/// 插件每 2 秒热读一次配置：坏字段会一直在，不能每拍刷一行日志。
+/// 只有文件内容变了才重新提示。键 = (路径, 内容哈希)。
+static PET_CONFIG_WARN: std::sync::Mutex<Option<(PathBuf, u64)>> = std::sync::Mutex::new(None);
+
+fn pet_config_warn_changed(path: &Path, bytes: &[u8]) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let hash = hasher.finish();
+    let mut last = match PET_CONFIG_WARN.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let same = matches!(last.as_ref(), Some((p, h)) if p == path && *h == hash);
+    if !same {
+        *last = Some((path.to_path_buf(), hash));
+    }
+    !same
+}
+
+/// 字段级容错的取值器：类型/范围不对就记一条警告并丢弃该字段，
+/// 其余字段照常生效——不再因为一个坏 volume 把整份配置丢掉。
+fn pet_bool_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> Option<bool> {
+    let value = obj.get(name)?;
+    match value.as_bool() {
+        Some(v) => Some(v),
+        None => {
+            warnings.push(format!("[配置] 忽略非法字段 {name}={value}"));
+            None
+        }
+    }
+}
+
+fn pet_u32_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    min: u32,
+    max: u32,
+    warnings: &mut Vec<String>,
+) -> Option<u32> {
+    let value = obj.get(name)?;
+    match value.as_u64() {
+        Some(n) if n >= u64::from(min) && n <= u64::from(max) => Some(n as u32),
+        _ => {
+            warnings.push(format!("[配置] 忽略非法字段 {name}={value}"));
+            None
+        }
+    }
+}
+
+fn pet_str_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    warnings: &mut Vec<String>,
+    valid: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let value = obj.get(name)?;
+    let Some(s) = value.as_str() else {
+        warnings.push(format!("[配置] 忽略非法字段 {name}={value}"));
+        return None;
+    };
+    let s = s.trim();
+    if !valid(s) {
+        warnings.push(format!("[配置] 忽略非法字段 {name}={value}"));
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// 整体 JSON 语法错/顶层不是对象：另存 `.corrupt-<ts>.json` 并忽略整份配置。
+fn quarantine_pet_config(path: &Path, why: &str) {
+    let corrupt = corrupt_path_for(path);
+    let name = corrupt
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pet-config.corrupt.json".into());
+    match std::fs::rename(path, &corrupt) {
+        Ok(()) => eprintln!("pet-config.json 解析失败，已另存 {name}: {why}"),
+        Err(err) => eprintln!(
+            "pet-config.json 解析失败，另存 {name} 失败（忽略本次配置）: {why}; {err}"
+        ),
+    }
+}
+
 fn load_pet_config() -> Option<PetConfig> {
-    let bytes = std::fs::read(pet_config_path()).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    load_pet_config_at(&pet_config_path())
+}
+
+/// 读取插件配置：先整体解析成 `Value`，语法错就整份隔离；
+/// 否则逐字段校验，坏字段丢弃并提示，其余照常生效。
+fn load_pet_config_at(path: &Path) -> Option<PetConfig> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(e) => {
+            quarantine_pet_config(path, &e.to_string());
+            return None;
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        quarantine_pet_config(path, "顶层不是 JSON 对象");
+        return None;
+    };
+
+    let mut warnings = Vec::new();
+    let mut cfg = PetConfig {
+        follow: pet_bool_field(obj, "follow", &mut warnings),
+        sound: pet_bool_field(obj, "sound", &mut warnings),
+        volume: pet_u32_field(obj, "volume", 0, 100, &mut warnings).map(|v| v as u8),
+        target: None,
+        format: pet_str_field(obj, "format", &mut warnings, |s| {
+            !s.is_empty() && device::format(s).is_ok()
+        })
+        .and_then(|s| device::format(&s).ok().map(|f| device::format_name(f).to_string())),
+        mode: pet_str_field(obj, "mode", &mut warnings, |s| {
+            PET_CONFIG_MODES.contains(&s)
+        }),
+        refresh_secs: pet_u32_field(obj, "refresh_secs", 0, 3600, &mut warnings),
+        animation: pet_bool_field(obj, "animation", &mut warnings),
+        stale_minutes: pet_u32_field(obj, "stale_minutes", 1, 1440, &mut warnings),
+    };
+    // 空字符串 = 没设过，静默忽略；非字符串才算非法。
+    if let Some(value) = obj.get("target") {
+        match value.as_str() {
+            Some(s) if !s.trim().is_empty() => cfg.target = Some(s.trim().to_string()),
+            Some(_) => {}
+            None => warnings.push(format!("[配置] 忽略非法字段 target={value}")),
+        }
+    }
+    if !warnings.is_empty() && pet_config_warn_changed(path, &bytes) {
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+    }
+    Some(cfg)
 }
 
 /// 把插件配置套进 store（设置 + 设备地址 + 屏幕格式）。返回是否生效了变化。
@@ -753,6 +900,10 @@ fn apply_pet_config(store: &mut Store) -> bool {
     let Some(c) = load_pet_config() else {
         return false;
     };
+    apply_pet_config_value(store, &c)
+}
+
+fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
     let mut changed = false;
     let s = &mut store.model.settings;
     if let Some(v) = c.follow {
@@ -768,7 +919,6 @@ fn apply_pet_config(store: &mut Store) -> bool {
         }
     }
     if let Some(v) = c.volume {
-        let v = v.min(100);
         if s.volume != v {
             s.volume = v;
             changed = true;
@@ -806,16 +956,16 @@ fn apply_pet_config(store: &mut Store) -> bool {
             }
         }
     }
-    if let Some(t) = c.target {
+    if let Some(t) = c.target.as_deref() {
         let t = t.trim().to_string();
         if !t.is_empty() && store.target.as_deref() != Some(t.as_str()) {
             store.target = Some(t);
             changed = true;
         }
     }
-    if let Some(f) = c.format {
+    if let Some(f) = c.format.as_deref() {
         if f != store.format {
-            store.format = f;
+            store.format = f.to_string();
             store.format_set_at = now().max(1) as u64;
             changed = true;
         }
@@ -928,6 +1078,7 @@ impl Default for Store {
             idle_grace: None,
             skin_explicit: false,
             settings_explicit: false,
+            degraded: false,
         }
     }
 }
@@ -940,33 +1091,129 @@ impl Store {
 }
 
 fn load_store() -> Store {
-    let path = state_path();
-    let mut store = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<Store>(&bytes).unwrap_or_else(|e| {
-            eprintln!("配置无法解析，使用默认值（原文件未改动）: {e}");
-            Store::default()
-        }),
+    load_store_at(&state_path())
+}
+
+/// 损坏文件改名用的路径：`state.corrupt-<unix>.json`。拷贝/改名都发生在同目录，
+/// 不删除原文件，也不让默认值覆盖它。同一秒内重复损坏时追加序号，
+/// 不把上一份损坏现场盖掉。
+fn corrupt_path_for(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".into());
+    let ts = now();
+    let mut candidate = path.with_file_name(format!("{stem}.corrupt-{ts}.json"));
+    let mut n = 1;
+    while candidate.exists() {
+        n += 1;
+        candidate = path.with_file_name(format!("{stem}.corrupt-{ts}-{n}.json"));
+    }
+    candidate
+}
+
+/// `state.json` / `pet-config.json` 的同目录兄弟文件（`state.bak.json` 等）。
+fn sibling_json(path: &Path, role: &str) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".into());
+    path.with_file_name(format!("{stem}.{role}.json"))
+}
+
+/// 同目录 tmp → `sync_all` → rename 覆盖。Windows 下目标被杀软/索引/别的进程
+/// 短暂占用时 rename 会失败，此时回退 copy + remove，保证内容仍然落盘。
+fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("创建临时文件 {} 失败", tmp.display()))?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => match std::fs::copy(&tmp, path) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(copy_err) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(anyhow::anyhow!(
+                    "写入 {} 失败（rename: {rename_err}；copy: {copy_err}）",
+                    path.display()
+                ))
+            }
+        },
+    }
+}
+
+/// 从磁盘加载。解析失败时把原文件改名为 `state.corrupt-<ts>.json`
+///（不删除、不复制覆盖），返回默认 Store 并置 `degraded`——
+/// `save_store_at` 据此拒绝覆盖，只写 `state.recovered.json`。
+fn load_store_at(path: &Path) -> Store {
+    let mut store = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Store>(&bytes) {
+            Ok(store) => store,
+            Err(e) => {
+                let corrupt = corrupt_path_for(path);
+                let name = corrupt
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "state.corrupt.json".into());
+                match std::fs::rename(path, &corrupt) {
+                    Ok(()) => {
+                        eprintln!("state.json 解析失败，已另存 {name}: {e}");
+                    }
+                    Err(rename_err) => {
+                        // 改名失败（文件被占用等）也必须降级：原文件留在原地，
+                        // 后面任何 save 都不能拿默认值把它盖掉。
+                        eprintln!(
+                            "state.json 解析失败，另存 {name} 失败（原文件保持不动，进入降级保护）: {e}; {rename_err}"
+                        );
+                    }
+                }
+                let mut default = Store::default();
+                default.degraded = true;
+                default
+            }
+        },
         Err(_) => Store::default(),
     };
     // 缓存版本过旧时重建跟随任务；此前从未调用过迁移，旧的序号式轮次 ID
     // 会一直留在缓存里挡住新事件。
     if store.model.migrate_cache() {
-        let _ = save_store(&store);
+        // 降级时这只写 state.recovered.json，不会覆盖损坏的 state.json。
+        let _ = save_store_at(path, &store);
     }
     store
 }
 
 fn save_store(store: &Store) -> Result<()> {
-    let path = state_path();
+    save_store_at(&state_path(), store)
+}
+
+/// 保存到指定路径，供测试注入临时目录。
+///
+/// - 正常：上一版先滚成 `state.bak.json`（单份，失败不阻塞），再 tmp+fsync+rename。
+/// - 降级（内存里 `degraded`，或磁盘上这份解析不了）：绝不覆盖已有 state.json，
+///   只写 `state.recovered.json` 留给用户手工恢复。
+fn save_store_at(path: &Path, store: &Store) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // 守护与交互命令共用一份 state.json。守护内存里的 store 是启动时的快照，
     // 若整份回写，会把别处（init / autostart / run）刚保存的设备地址覆盖成 None。
     // 写入前合并一次：设备地址与格式以「磁盘上的非空值」为准，除非本次显式改了。
-    let disk = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Store>(&b).ok());
+    let disk_bytes = std::fs::read(path).ok();
+    let disk = disk_bytes
+        .as_deref()
+        .and_then(|b| serde_json::from_slice::<Store>(b).ok());
+    // 磁盘上这份读得出来但解析不了 = 已经损坏；即使调用方没带 degraded 标记，
+    // 也不能覆盖它（例如另一个进程先写出了半份 JSON）。
+    let degraded = store.degraded || (disk_bytes.is_some() && disk.is_none());
+
     let mut out = store.clone();
     if let Some(disk) = disk {
         if out.target.is_none() {
@@ -1003,15 +1250,44 @@ fn save_store(store: &Store) -> Result<()> {
             out.model.settings.refresh_secs = disk.model.settings.refresh_secs;
         }
     }
-    let tmp = path.with_extension("json.tmp");
+    // 内存标记不落盘：recovered / 正常文件里都必须是 false。
+    out.degraded = false;
     let bytes = serde_json::to_vec_pretty(&out)?;
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+
+    if degraded {
+        let recovered = sibling_json(path, "recovered");
+        write_json_atomic(&recovered, &bytes)?;
+        // 守护每拍都可能保存：只提示一次，别把日志刷满。
+        static WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[state] 降级保护中：state.json 损坏未恢复，本次及之后只写 {}（不覆盖原文件）",
+                recovered.display()
+            );
+        }
+        return Ok(());
     }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+
+    // 已经写回真实文件了：下次再损坏时要重新提示一次。
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    WARNED.store(false, Ordering::Relaxed);
+
+    // 每次成功保存前把现有 state.json 留成上一版（单份滚动）。备份失败只影响
+    // 后悔药，不能挡住主保存。
+    if path.exists() {
+        let bak = sibling_json(path, "bak");
+        match std::fs::copy(path, &bak) {
+            Ok(_) => {
+                if let Ok(f) = std::fs::File::open(&bak) {
+                    let _ = f.sync_all();
+                }
+            }
+            Err(e) => eprintln!("[state] 备份上一版 {} 失败（忽略）: {e}", bak.display()),
+        }
+    }
+
+    write_json_atomic(path, &bytes)
 }
 
 struct Args {
@@ -3487,5 +3763,197 @@ mod tests {
             100,
             0
         ));
+    }
+
+    /// 测试用的临时目录：每个测试一份，Drop 时清掉，绝不碰真实 %LOCALAPPDATA%。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "dsh-pet-{tag}-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_load_store_corrupt_renames_and_returns_default() {
+        let dir = TempDir::new("corrupt");
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"{bad").unwrap();
+
+        let store = load_store_at(&path);
+
+        assert!(store.degraded, "解析失败必须标记降级");
+        assert_eq!(store.format, default_format(), "应返回默认 Store");
+        assert!(store.model.tasks.is_empty());
+        assert!(!path.exists(), "损坏文件必须改名，不能留在原位等着被覆盖");
+        let corrupt: Vec<String> = names_in(dir.path())
+            .into_iter()
+            .filter(|n| n.starts_with("state.corrupt-"))
+            .collect();
+        assert_eq!(corrupt.len(), 1, "应生成 state.corrupt-<ts>.json：{corrupt:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&corrupt[0])).unwrap(),
+            b"{bad",
+            "损坏现场必须原样保留"
+        );
+
+        // 降级期间保存：只写 recovered，不重建/不覆盖 state.json。
+        save_store_at(&path, &store).unwrap();
+        assert!(!path.exists(), "降级期间不得重建 state.json");
+        assert!(
+            dir.path().join("state.recovered.json").is_file(),
+            "降级期间应写 state.recovered.json"
+        );
+    }
+
+    #[test]
+    fn test_save_refuses_overwrite_when_degraded() {
+        let dir = TempDir::new("degraded");
+        let path = dir.path().join("state.json");
+        let original = br#"{"format":"gray16","target":"10.9.9.9"}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let mut store = Store::default();
+        store.degraded = true;
+        store.target = Some("10.1.2.3".into());
+        save_store_at(&path, &store).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "降级期间绝不能覆盖已存在的 state.json"
+        );
+        let recovered: Store = serde_json::from_slice(
+            &std::fs::read(dir.path().join("state.recovered.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered.target.as_deref(), Some("10.1.2.3"));
+        assert!(!recovered.degraded, "降级标记只存在内存里，不能落盘");
+
+        // 即使调用方没带标记，磁盘上这份解析不了也不能拿默认值盖掉。
+        std::fs::write(&path, b"{bad").unwrap();
+        let clean = Store::default();
+        save_store_at(&path, &clean).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{bad");
+    }
+
+    #[test]
+    fn test_save_keeps_previous_as_bak() {
+        let dir = TempDir::new("bak");
+        let path = dir.path().join("state.json");
+
+        // 首次保存没有旧文件，不应产生 bak。
+        let mut s1 = Store::default();
+        s1.model.cache_version = 3; // 跳过迁移，避免加载时多写一次
+        s1.target = Some("10.0.0.1".into());
+        save_store_at(&path, &s1).unwrap();
+        assert!(!dir.path().join("state.bak.json").exists());
+        let first = std::fs::read(&path).unwrap();
+
+        let mut s2 = load_store_at(&path);
+        assert!(!s2.degraded);
+        s2.target = Some("10.0.0.2".into());
+        save_store_at(&path, &s2).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("state.bak.json")).unwrap(),
+            first,
+            "第二次保存要把上一版留成 state.bak.json"
+        );
+        let second = std::fs::read(&path).unwrap();
+
+        // 再存一次：bak 滚动成最近一版，且只有一份。
+        let mut s3 = load_store_at(&path);
+        s3.target = Some("10.0.0.3".into());
+        save_store_at(&path, &s3).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("state.bak.json")).unwrap(),
+            second
+        );
+        assert_eq!(
+            names_in(dir.path())
+                .into_iter()
+                .filter(|n| n.starts_with("state.bak"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_pet_config_field_level_fallback() {
+        let dir = TempDir::new("petcfg");
+        let path = dir.path().join("pet-config.json");
+        std::fs::write(
+            &path,
+            br#"{
+                "follow": true,
+                "volume": "loud",
+                "format": "plaid",
+                "target": "192.168.1.9",
+                "stale_minutes": 30,
+                "mode": "minimal"
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = load_pet_config_at(&path).expect("整体语法没错，只该丢坏字段");
+        assert_eq!(cfg.volume, None, "坏 volume 必须丢弃");
+        assert_eq!(cfg.format, None, "坏 format 必须丢弃");
+        assert_eq!(cfg.follow, Some(true), "好字段必须保留");
+        assert_eq!(cfg.target.as_deref(), Some("192.168.1.9"));
+        assert_eq!(cfg.stale_minutes, Some(30));
+        assert_eq!(cfg.mode.as_deref(), Some("minimal"));
+
+        // 其余字段仍然生效：坏字段不把整份配置拖下水。
+        let mut store = Store::default();
+        assert!(apply_pet_config_value(&mut store, &cfg));
+        assert!(store.model.settings.follow_enabled);
+        assert_eq!(store.model.settings.stale_minutes, 30);
+        assert_eq!(store.model.settings.volume, 90, "坏 volume 不能改动音量");
+        assert_eq!(store.target.as_deref(), Some("192.168.1.9"));
+        assert_eq!(store.format, "mono", "坏 format 不能改动屏幕格式");
+        assert!(!store.model.settings.animation);
+        assert_eq!(store.model.settings.refresh_secs, 120);
+
+        // 整体 JSON 语法错：另存 .corrupt-<ts> 并忽略整份配置。
+        let bad = dir.path().join("pet-config-bad.json");
+        std::fs::write(&bad, b"{bad").unwrap();
+        assert!(load_pet_config_at(&bad).is_none());
+        assert!(!bad.exists(), "整份损坏的配置应改名隔离");
+        let quarantined: Vec<String> = names_in(dir.path())
+            .into_iter()
+            .filter(|n| n.starts_with("pet-config-bad.corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&quarantined[0])).unwrap(),
+            b"{bad"
+        );
     }
 }
