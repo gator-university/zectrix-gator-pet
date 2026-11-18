@@ -8,8 +8,11 @@ import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { createBridge } from '../bridge.js'
 
-const ORIGIN = 'http://127.0.0.1:13970'
+// 只读负例：普通 http 页面（含回环）不再受信。
+const HTTP_ORIGIN = 'http://127.0.0.1:13970'
 const LOCALHOST_ORIGIN = 'http://localhost:13970'
+// 唯一受信来源：DSH 桌面 App 的自定义 scheme。
+const APP_ORIGIN = 'dsh-app://app'
 
 let previousLocalAppData
 let tmpDir
@@ -21,7 +24,7 @@ function authHeaders(extra = {}) {
   return { 'x-croc-pet-token': token, ...extra }
 }
 
-function request(pathname, { method = 'GET', body, headers = {} } = {}) {
+function request(pathname, { method = 'GET', body, headers = {}, port = bridge.port } = {}) {
   const payload = body === undefined ? null : typeof body === 'string' ? body : JSON.stringify(body)
   const finalHeaders = { ...headers }
   if (payload !== null && finalHeaders['content-type'] === undefined) {
@@ -29,7 +32,7 @@ function request(pathname, { method = 'GET', body, headers = {} } = {}) {
   }
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: '127.0.0.1', port: bridge.port, path: pathname, method, headers: finalHeaders },
+      { host: '127.0.0.1', port, path: pathname, method, headers: finalHeaders },
       res => {
         let text = ''
         res.setEncoding('utf8')
@@ -106,45 +109,62 @@ test('伪造 Origin 的 /token、/config 返回 403，且不回 ACAO', async () 
   assert.equal(configRes.headers['access-control-allow-origin'], undefined)
 })
 
-test('/token 缺失 Sec-Fetch-Site 或缺失 Origin 一律 403', async () => {
-  const noFetchSite = await request('/token', { headers: { origin: ORIGIN } })
-  assert.equal(noFetchSite.status, 403)
-
-  const crossSite = await request('/token', {
-    headers: { origin: ORIGIN, 'sec-fetch-site': 'cross-site' },
-  })
-  assert.equal(crossSite.status, 403)
-
+test('http 回环 origin（127.0.0.1 / localhost）一律拿不到 token', async () => {
+  for (const origin of [HTTP_ORIGIN, LOCALHOST_ORIGIN]) {
+    for (const fetchSite of ['same-origin', 'same-site', 'cross-site', undefined]) {
+      const headers = { origin }
+      if (fetchSite) headers['sec-fetch-site'] = fetchSite
+      const res = await request('/token', { headers })
+      assert.equal(res.status, 403, `${origin} / ${fetchSite}`)
+      assert.equal(res.headers['access-control-allow-origin'], undefined)
+    }
+  }
+  // 缺 Origin / null Origin 同样拿不到。
   const noOrigin = await request('/token', { headers: { 'sec-fetch-site': 'same-site' } })
   assert.equal(noOrigin.status, 403)
-
   const nullOrigin = await request('/token', {
     headers: { origin: 'null', 'sec-fetch-site': 'same-origin' },
   })
   assert.equal(nullOrigin.status, 403)
 })
 
-test('/token 对白名单 Origin + 同站标记返回 token，ACAO 精确回显且无 *', async () => {
-  const res = await request('/token', {
-    headers: { origin: ORIGIN, 'sec-fetch-site': 'same-site' },
+test('/token 只认 dsh-app://app：无需 Sec-Fetch-Site，且每次调用轮换令牌', async () => {
+  const before = token
+  const first = await request('/token', { headers: { origin: APP_ORIGIN } })
+  assert.equal(first.status, 200)
+  assert.equal(first.json.ok, true)
+  assert.equal(first.headers['access-control-allow-origin'], APP_ORIGIN)
+  assert.match(String(first.headers.vary || ''), /origin/i)
+  assert.notEqual(first.headers['access-control-allow-origin'], '*')
+  assert.match(first.json.token, /^[0-9a-f]{32,}$/i)
+  assert.notEqual(first.json.token, before, '每次 /token 都应换新令牌')
+
+  const second = await request('/token', {
+    headers: { origin: APP_ORIGIN, 'sec-fetch-site': 'cross-site' },
   })
-  assert.equal(res.status, 200)
-  assert.equal(res.json.ok, true)
-  assert.equal(res.json.token, token)
-  assert.equal(res.headers['access-control-allow-origin'], ORIGIN)
-  assert.match(String(res.headers.vary || ''), /origin/i)
-  assert.notEqual(res.headers['access-control-allow-origin'], '*')
-  assert.ok(!res.text.includes('*'))
+  assert.equal(second.status, 200)
+  assert.notEqual(second.json.token, first.json.token, '旧令牌应在下次 /token 时作废')
+
+  // 旧令牌立即失效，新令牌可用。
+  const old = await request('/config', { headers: { 'x-croc-pet-token': first.json.token } })
+  assert.equal(old.status, 401)
+  const fresh = await request('/config', { headers: { 'x-croc-pet-token': second.json.token } })
+  assert.equal(fresh.status, 200)
+  token = second.json.token
 })
 
-test('带正确 token 的 GET /config 返回 200（127.0.0.1 与 localhost 均可用）', async () => {
-  for (const origin of [ORIGIN, LOCALHOST_ORIGIN]) {
+test('带正确 token 的 GET /config 只对 dsh-app://app 生效；http 回环带 token 也 403', async () => {
+  const ok = await request('/config', { headers: authHeaders({ origin: APP_ORIGIN }) })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.json.config.target, '192.168.1.50')
+  assert.equal(ok.headers['access-control-allow-origin'], APP_ORIGIN)
+
+  for (const origin of [HTTP_ORIGIN, LOCALHOST_ORIGIN]) {
     const res = await request('/config', {
       headers: authHeaders({ origin, 'sec-fetch-site': 'same-site' }),
     })
-    assert.equal(res.status, 200)
-    assert.equal(res.json.config.target, '192.168.1.50')
-    assert.equal(res.headers['access-control-allow-origin'], origin)
+    assert.equal(res.status, 403, origin)
+    assert.equal(res.headers['access-control-allow-origin'], undefined)
   }
 })
 
@@ -175,7 +195,7 @@ test('POST /config 非法 target 返回 400 且不落盘', async () => {
     const res = await request('/config', {
       method: 'POST',
       body: { target },
-      headers: authHeaders({ origin: ORIGIN, 'sec-fetch-site': 'same-site' }),
+      headers: authHeaders({ origin: APP_ORIGIN }),
     })
     assert.equal(res.status, 400, `target=${JSON.stringify(target)}`)
   }
@@ -198,7 +218,7 @@ test('POST /config 非法 volume/format/mode 返回 400 且不落盘', async () 
     const res = await request('/config', {
       method: 'POST',
       body: patch,
-      headers: authHeaders({ origin: ORIGIN, 'sec-fetch-site': 'same-site' }),
+      headers: authHeaders({ origin: APP_ORIGIN }),
     })
     assert.equal(res.status, 400, JSON.stringify(patch))
   }
@@ -211,7 +231,7 @@ test('POST /config 合法值原子落盘并能读回', async () => {
   const res = await request('/config', {
     method: 'POST',
     body: patch,
-    headers: authHeaders({ origin: ORIGIN, 'sec-fetch-site': 'same-site' }),
+    headers: authHeaders({ origin: APP_ORIGIN }),
   })
   assert.equal(res.status, 200)
   assert.equal(res.json.config.target, '10.0.0.9')
@@ -229,7 +249,7 @@ test('POST /config 静默丢弃已下线的 animation / pet_skin 字段', async 
   const res = await request('/config', {
     method: 'POST',
     body: { volume: 40, animation: false, pet_skin: 'astro' },
-    headers: authHeaders({ origin: ORIGIN, 'sec-fetch-site': 'same-site' }),
+    headers: authHeaders({ origin: APP_ORIGIN }),
   })
   assert.equal(res.status, 200)
   assert.equal(res.json.config.volume, 40)
@@ -239,6 +259,35 @@ test('POST /config 静默丢弃已下线的 animation / pet_skin 字段', async 
   assert.ok(!onDisk.includes('animation'))
   assert.ok(!onDisk.includes('pet_skin'))
   resetConfig()
+})
+
+test('配置写日志只记 key 名，不记值', async () => {
+  resetConfig()
+  const logs = []
+  const logBridge = await createBridge({
+    port: 0,
+    petConfigPath: configPath,
+    runCli: async () => ({ ok: true, output: '' }),
+    log: line => logs.push(line),
+  })
+  try {
+    const res = await request('/config', {
+      method: 'POST',
+      body: { target: '192.168.1.77', volume: 40 },
+      headers: { origin: APP_ORIGIN, 'x-croc-pet-token': logBridge.token },
+      port: logBridge.port,
+    })
+    assert.equal(res.status, 200)
+    const line = logs.find(l => l.includes('配置已更新'))
+    assert.ok(line, '应记录一条配置更新日志')
+    assert.ok(line.includes('target'), '日志应包含键名 target')
+    assert.ok(line.includes('volume'), '日志应包含键名 volume')
+    assert.ok(!line.includes('192.168.1.77'), '日志不能出现设备地址')
+    assert.ok(!line.includes('40'), '日志不能出现配置值')
+  } finally {
+    await logBridge.close()
+    resetConfig()
+  }
 })
 
 test('POST /test 忽略 body 里的 target，只用已保存的 target', async () => {
@@ -253,27 +302,11 @@ test('POST /test 忽略 body 里的 target，只用已保存的 target', async (
     },
   })
   try {
-    const res = await new Promise((resolve, reject) => {
-      const req = http.request(
-        {
-          host: '127.0.0.1',
-          port: testBridge.port,
-          path: '/test',
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-croc-pet-token': testBridge.token,
-          },
-        },
-        r => {
-          let text = ''
-          r.on('data', chunk => (text += chunk))
-          r.on('end', () => resolve({ status: r.statusCode, json: JSON.parse(text || '{}') }))
-        },
-      )
-      req.on('error', reject)
-      req.write(JSON.stringify({ target: '10.9.9.9' }))
-      req.end()
+    const res = await request('/test', {
+      method: 'POST',
+      body: { target: '10.9.9.9' },
+      headers: { origin: APP_ORIGIN, 'x-croc-pet-token': testBridge.token },
+      port: testBridge.port,
     })
     assert.equal(res.status, 200)
     assert.equal(res.json.ok, true)
@@ -284,54 +317,98 @@ test('POST /test 忽略 body 里的 target，只用已保存的 target', async (
   }
 })
 
+test('POST /test 同设备 3 秒冷却：第二次返回 429', async () => {
+  resetConfig({ target: '192.168.1.50' })
+  const first = await request('/test', {
+    method: 'POST',
+    body: {},
+    headers: authHeaders({ origin: APP_ORIGIN }),
+  })
+  assert.equal(first.status, 200)
+  const second = await request('/test', {
+    method: 'POST',
+    body: {},
+    headers: authHeaders({ origin: APP_ORIGIN }),
+  })
+  assert.equal(second.status, 429)
+  assert.equal(second.json.ok, false)
+  assert.match(second.json.error, /秒/)
+})
+
+test('token 超过有效期后 401，重新 GET /token 可恢复', async () => {
+  const saved = process.env.LOCALAPPDATA
+  const ttlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'croc-bridge-ttl-'))
+  process.env.LOCALAPPDATA = ttlDir
+  let short = null
+  try {
+    short = await createBridge({
+      port: 0,
+      petConfigPath: path.join(ttlDir, 'pet-config.json'),
+      tokenTtlMs: 40,
+      runCli: async () => ({ ok: true, output: '' }),
+    })
+    const got = await request('/token', { headers: { origin: APP_ORIGIN }, port: short.port })
+    assert.equal(got.status, 200)
+    const issued = got.json.token
+    await new Promise(resolve => setTimeout(resolve, 80))
+
+    const expired = await request('/config', {
+      headers: { 'x-croc-pet-token': issued },
+      port: short.port,
+    })
+    assert.equal(expired.status, 401, '过期令牌必须 401')
+
+    const renewed = await request('/token', {
+      headers: { origin: APP_ORIGIN },
+      port: short.port,
+    })
+    assert.equal(renewed.status, 200)
+    assert.notEqual(renewed.json.token, issued)
+    const ok = await request('/config', {
+      headers: { 'x-croc-pet-token': renewed.json.token },
+      port: short.port,
+    })
+    assert.equal(ok.status, 200)
+  } finally {
+    if (short) await short.close()
+    process.env.LOCALAPPDATA = saved
+    fs.rmSync(ttlDir, { recursive: true, force: true })
+  }
+})
+
 test('POST 非 application/json 返回 415', async () => {
   const res = await request('/config', {
     method: 'POST',
     body: JSON.stringify({ target: '192.168.1.50' }),
     headers: authHeaders({
-      origin: ORIGIN,
-      'sec-fetch-site': 'same-site',
+      origin: APP_ORIGIN,
       'content-type': 'text/plain',
     }),
   })
   assert.equal(res.status, 415)
 })
 
-test('OPTIONS 仅对白名单回 204，带正确的 allow-headers/methods；非白名单 403', async () => {
+test('OPTIONS 仅对 dsh-app://app 回 204；http 回环与非白名单 403', async () => {
   const ok = await request('/config', {
     method: 'OPTIONS',
     headers: {
-      origin: ORIGIN,
+      origin: APP_ORIGIN,
       'access-control-request-method': 'POST',
       'access-control-request-headers': 'content-type, x-croc-pet-token',
     },
   })
   assert.equal(ok.status, 204)
-  assert.equal(ok.headers['access-control-allow-origin'], ORIGIN)
+  assert.equal(ok.headers['access-control-allow-origin'], APP_ORIGIN)
   assert.match(String(ok.headers['access-control-allow-headers']), /x-croc-pet-token/)
   assert.match(String(ok.headers['access-control-allow-methods']), /GET/)
   assert.match(String(ok.headers['access-control-allow-methods']), /POST/)
   assert.match(String(ok.headers['access-control-allow-methods']), /OPTIONS/)
 
-  const bad = await request('/config', {
-    method: 'OPTIONS',
-    headers: { origin: 'https://evil.example' },
-  })
-  assert.equal(bad.status, 403)
-  assert.equal(bad.headers['access-control-allow-origin'], undefined)
-})
-
-test('DSH 桌面 App 的 dsh-app://app origin 可用：cross-site 也放行', async () => {
-  const APP = 'dsh-app://app'
-  const t = await request('/token', { headers: { origin: APP, 'sec-fetch-site': 'cross-site' } })
-  assert.equal(t.status, 200)
-  assert.equal(t.headers['access-control-allow-origin'], APP)
-  assert.ok(t.json.token)
-  const cfg = await request('/config', {
-    headers: { origin: APP, 'sec-fetch-site': 'cross-site', 'x-croc-pet-token': t.json.token },
-  })
-  assert.equal(cfg.status, 200)
-  assert.equal(cfg.json.config.target, '192.168.1.50')
+  for (const origin of [HTTP_ORIGIN, 'https://evil.example']) {
+    const bad = await request('/config', { method: 'OPTIONS', headers: { origin } })
+    assert.equal(bad.status, 403, origin)
+    assert.equal(bad.headers['access-control-allow-origin'], undefined)
+  }
 })
 
 test('远程网页 origin 仍然拿不到 token', async () => {

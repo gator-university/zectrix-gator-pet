@@ -397,6 +397,73 @@ fn test_save_keeps_previous_as_bak() {
 }
 
 #[test]
+fn parent_guard_keeps_a_live_process_and_drops_a_dead_pid() {
+    // 快照必须在启动时只记一次；同一进程的创建时间不变，应一直判存活。
+    let guard = parent_guard(Some(std::process::id())).expect("当前进程必然存在");
+    assert!(guard.alive(), "同一进程的创建时间/镜像没变，应判存活");
+    assert!(
+        guard.created.is_some(),
+        "活进程应能通过 GetProcessTimes 取到创建时间（PID 复用防护的前提）"
+    );
+    assert!(
+        guard.image.is_some(),
+        "活进程应能通过 QueryFullProcessImageNameW 取到镜像名"
+    );
+
+    // 不存在的 pid 打不开进程句柄 → 视为已退出（单独构造，不污染全局快照）。
+    let dead = ParentGuard::resolve(u32::MAX);
+    assert!(!dead.alive(), "打不开的 pid 不能判存活");
+}
+
+#[test]
+fn target_must_be_a_private_or_loopback_ipv4_literal() {
+    for ok in [
+        "192.168.1.9",
+        "10.0.0.7",
+        "172.16.5.4",
+        "172.31.255.254",
+        "127.0.0.1",
+    ] {
+        assert!(valid_target(ok), "应接受私网/回环 IPv4：{ok}");
+    }
+    for bad in [
+        "8.8.8.8",         // 公网地址
+        "1.2.3.4:32342",   // 带端口
+        "evil",            // 主机名
+        "[::1]",           // IPv6 字面量
+        "192.168.1.0/24",  // 网段
+        "192.168.1",       // 不完整
+    ] {
+        assert!(!valid_target(bad), "必须拒绝非私网 IPv4 字面量：{bad:?}");
+    }
+}
+
+#[test]
+fn invalid_target_in_pet_config_is_dropped_with_warning() {
+    let dir = TempDir::new("petcfg-target");
+    let path = dir.path().join("pet-config.json");
+    std::fs::write(&path, br#"{"target":"8.8.8.8","volume":42}"#).unwrap();
+    let cfg = load_pet_config_at(&path).expect("语法没错，只该丢坏 target");
+    assert_eq!(cfg.target, None, "公网地址要丢弃，回落默认发现流程");
+    assert_eq!(cfg.volume, Some(42), "坏 target 不该影响其它字段");
+
+    let value = serde_json::json!({"target": "1.2.3.4:32342"});
+    let mut warnings = Vec::new();
+    let cfg = pet_config_from_obj(value.as_object().unwrap(), &mut warnings);
+    assert!(cfg.target.is_none());
+    assert!(
+        warnings.iter().any(|w| w.contains("target")),
+        "丢弃非法 target 要留一条警告：{warnings:?}"
+    );
+
+    let value = serde_json::json!({"target": "192.168.1.9"});
+    let mut warnings = Vec::new();
+    let cfg = pet_config_from_obj(value.as_object().unwrap(), &mut warnings);
+    assert_eq!(cfg.target.as_deref(), Some("192.168.1.9"));
+    assert!(warnings.is_empty(), "合法地址不该产生警告：{warnings:?}");
+}
+
+#[test]
 fn test_pet_config_field_level_fallback() {
     let dir = TempDir::new("petcfg");
     let path = dir.path().join("pet-config.json");
@@ -670,6 +737,111 @@ fn forget_titles_scrubs_existing_tasks() {
 }
 
 #[test]
+fn forget_titles_removes_leftovers_that_hold_old_titles() {
+    let dir = TempDir::new("forget-titles");
+    let path = dir.path().join("state.json");
+
+    let mut model = Model::default();
+    model.cache_version = 3; // 跳过迁移：加载时不会把 dsh 任务清掉
+    let mut with_session = event(1, Status::Working);
+    with_session.thread_id = Some("session-aaaa-bbbbcccc".into());
+    with_session.title = "机密：客户数据库口令".into();
+    model.apply(with_session, "dsh", 100).unwrap();
+    let mut store = Store::default();
+    store.model = model;
+    assert_eq!(store.model.tasks.len(), 1, "夹具任务应进入 model");
+    save_store_at(&path, &store).unwrap();
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("机密"),
+        "保存后的 state.json 应含待清理标题"
+    );
+
+    // 历史版本留下的旁路文件：每份都可能带着要抹掉的标题。
+    std::fs::write(dir.path().join("state.bak.json"), "机密：客户数据库口令").unwrap();
+    std::fs::write(
+        dir.path().join("state.corrupt-1700000000.json"),
+        r#"{"title":"机密：客户数据库口令"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("state.recovered.json"), "机密：客户数据库口令").unwrap();
+    std::fs::write(dir.path().join("watch.log"), "[花絮] 机密：客户数据库口令").unwrap();
+
+    forget_titles_at(&path).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !saved.contains("机密") && !saved.contains("数据库"),
+        "净化后 state.json 不得残留旧标题：{saved}"
+    );
+    assert!(saved.contains("session-aaaa"), "应换成 session-短号：{saved}");
+    for leftover in [
+        "state.bak.json",
+        "state.recovered.json",
+        "state.corrupt-1700000000.json",
+        "watch.log",
+    ] {
+        assert!(
+            !dir.path().join(leftover).exists(),
+            "{leftover} 可能带着旧标题，forget --titles 后必须不存在"
+        );
+    }
+}
+
+#[test]
+fn forget_titles_keeps_corrupt_evidence_when_degraded() {
+    // T3：损坏的 state.json 不得被覆盖，也不该被 forget 顺手销毁。
+    let dir = TempDir::new("forget-degraded");
+    let path = dir.path().join("state.json");
+    std::fs::write(&path, "{\"bad\": \"机密：客户数据库口令\"").unwrap();
+    std::fs::write(dir.path().join("state.bak.json"), "机密：旧标题").unwrap();
+
+    forget_titles_at(&path).unwrap();
+
+    assert!(!path.exists(), "降级时不得重建 state.json");
+    let corrupt: Vec<String> = names_in(dir.path())
+        .into_iter()
+        .filter(|n| n.starts_with("state.corrupt-"))
+        .collect();
+    assert_eq!(corrupt.len(), 1, "损坏现场必须保留：{corrupt:?}");
+    assert!(
+        std::fs::read_to_string(dir.path().join(&corrupt[0]))
+            .unwrap()
+            .contains("机密"),
+        "损坏现场应原样保留，便于手工恢复"
+    );
+    assert!(
+        dir.path().join("state.recovered.json").is_file(),
+        "降级时净化结果写 recovered"
+    );
+    assert!(
+        !dir.path().join("state.bak.json").exists(),
+        "备份可能带旧标题，仍应清掉"
+    );
+}
+
+#[test]
+fn forget_all_removes_state_and_leftovers() {
+    let dir = TempDir::new("forget-all");
+    let path = dir.path().join("state.json");
+    let mut store = Store::default();
+    store.target = Some("10.0.0.9".into());
+    save_store_at(&path, &store).unwrap();
+    std::fs::write(dir.path().join("state.bak.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("state.corrupt-1700000000.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("state.recovered.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("watch.log"), "log").unwrap();
+
+    forget_all_at(&path);
+
+    let leftovers: Vec<String> = names_in(dir.path())
+        .into_iter()
+        .filter(|n| n != "state.lock")
+        .filter(|n| n.starts_with("state.") || n == "watch.log")
+        .collect();
+    assert!(leftovers.is_empty(), "forget 后不得留任何状态旁路文件：{leftovers:?}");
+}
+
+#[test]
 fn recording_expiry_fires_after_ten_seconds() {
     let started = Instant::now();
     assert!(
@@ -747,6 +919,34 @@ fn team_scan_prune_drops_stale_and_missing() {
         !files.contains_key(&gone),
         "已经不存在（目录被删）的路径要丢掉"
     );
+}
+
+/// 超大子会话日志不整份读进内存：只 stat 后跳过，且每个文件只警告一次。
+#[test]
+fn team_scan_skips_oversized_logs_and_warns_once() {
+    let dir = TempDir::new("team-oversize");
+    let path = dir.path().join("huge.jsonl.zstd");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(TEAM_MAX_LOG_BYTES + 1).unwrap();
+    drop(f);
+    let meta = std::fs::metadata(&path).unwrap();
+
+    let mut scan = TeamScan::default();
+    scan.touch(&path, meta.len(), mtime_secs(&meta));
+
+    assert!(
+        !scan.files.contains_key(&path),
+        "超限日志不应被读入或缓存"
+    );
+    assert!(
+        scan.warned_oversize.contains(&path),
+        "超限文件要记一次警告，供后续去重"
+    );
+
+    // 再扫一次仍然跳过，但不改变已记录的状态（不会反复读、反复警告）。
+    scan.touch(&path, meta.len(), mtime_secs(&meta));
+    assert!(!scan.files.contains_key(&path));
+    assert_eq!(scan.warned_oversize.len(), 1);
 }
 
 /// 签名只依赖内容：同样内容同签名，坐标/文本/元素数量变了都要换签名，

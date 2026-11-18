@@ -34,6 +34,7 @@
   "files": [
     "index.js",
     "bridge.js",
+    "winacl.js",
     "client.js",
     "dsh.bundle.patch",
     "icon.png",

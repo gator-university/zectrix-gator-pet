@@ -28,8 +28,22 @@ use std::time::Duration;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// 读一次界面上当前的活动描述；读不到时返回 None（调用方回退内置短语池）。
+///
+/// 界面文字可能带命令、路径等敏感片段：上屏/落日志前统一净化并截到 40 字符，
+/// 避免整句原文跟着 pet.log 或屏幕一起被转发出去。
 pub fn current_quip() -> Option<String> {
-    imp::current_quip()
+    imp::current_quip().and_then(|q| sanitize_quip(&q))
+}
+
+/// 花絮净化：去掉控制字符与双向控制符，最多保留 40 个字符；空串视为没读到。
+fn sanitize_quip(raw: &str) -> Option<String> {
+    let cleaned = crate::model::clean(raw, 40);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// 可访问性树里节点的类别。只需要区分「文本」「按钮」和「其它」。
@@ -452,6 +466,21 @@ mod tests {
     fn falls_back_to_the_short_label_and_drops_the_elapsed_time() {
         let items = vec![text("深度求索中"), text("深度求索中，用时 6分54秒 ···")];
         assert_eq!(pick_quip(&items).as_deref(), Some("深度求索中"));
+    }
+
+    #[test]
+    fn quips_are_sanitized_and_capped_before_leaving_uia() {
+        // 控制字符 / 双向控制符：不能让它们跟着花絮上屏或进日志。
+        assert_eq!(
+            sanitize_quip("正在运行\u{202e}命令\u{0007}").as_deref(),
+            Some("正在运行命令")
+        );
+        // 超长的一句话只留前 40 个字符。
+        let long = "命".repeat(100);
+        assert_eq!(sanitize_quip(&long).unwrap().chars().count(), 40);
+        // 纯空白/纯控制字符 = 没读到，交给内置短语池。
+        assert!(sanitize_quip("  \u{0007} ").is_none());
+        assert!(sanitize_quip("").is_none());
     }
 
     #[test]
