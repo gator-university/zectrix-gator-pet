@@ -65,9 +65,9 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
 
-    // 配置桥每次安装生成随机 token，只对同源/同站的浏览器页面返回。
-    // 首次请求先 GET /token（浏览器会自动带 Origin 与 Sec-Fetch-Site），
-    // 之后所有请求都带 X-Croc-Pet-Token。
+    // 配置桥的令牌只对 DSH 桌面 App（dsh-app://app）的渲染进程返回，
+    // 且 10 分钟过期、每次 GET /token 都轮换。首次请求先取令牌，
+    // 之后所有请求都带 X-Croc-Pet-Token；遇到 401 说明过期/被轮换，自动重取一次。
     let tokenPromise = null
     function getToken() {
       if (!tokenPromise) {
@@ -87,9 +87,18 @@ window.__ModuleLoader__.load({
     }
 
     async function api(path, init) {
-      const token = await getToken()
-      const headers = { ...((init && init.headers) || {}), 'x-croc-pet-token': token }
-      const r = await fetch(BASE + path, { ...init, headers })
+      const send = async token => {
+        const headers = { ...((init && init.headers) || {}), 'x-croc-pet-token': token }
+        return fetch(BASE + path, { ...init, headers })
+      }
+      let token = await getToken()
+      let r = await send(token)
+      if (r.status === 401) {
+        // 令牌过期（10 分钟）或已被别的 /token 调用轮换：丢掉缓存重取一次。
+        tokenPromise = null
+        token = await getToken()
+        r = await send(token)
+      }
       const body = await r.json().catch(() => ({}))
       if (!r.ok || body.ok === false) throw new Error(body.error || '请求失败')
       return body

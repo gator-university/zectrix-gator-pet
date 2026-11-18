@@ -2,7 +2,8 @@
 //
 // 安全模型：
 // - 每次安装生成一个随机 token，落在 %LOCALAPPDATA%\zectrix-dsh-pet\bridge-token；
-//   /token 只对「白名单 Origin + 同源/同站 Sec-Fetch-Site」的浏览器请求返回，避免任意网页读取。
+//   /token 只对 DSH 桌面 App 的 `dsh-app://app` 渲染进程返回，且每次调用都轮换令牌。
+// - 令牌 10 分钟有效；/config、/test 同时校验令牌内容与有效期。
 // - /config、/test 等需要 X-Croc-Pet-Token；CORS 不再返回 `*`。
 // - POST /config 的白名单字段做严格校验，先写临时文件再 rename，避免半份 JSON。
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -18,7 +19,10 @@ const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf
 
 const MAX_BODY = 64 * 1024
 const TOKEN_HEADER = 'x-croc-pet-token'
-const TRUSTED_FETCH_SITES = new Set(['same-origin', 'same-site'])
+/** 令牌有效期：10 分钟。过期后 /config、/test 一律 401，需重新 GET /token。 */
+const TOKEN_TTL_MS = 10 * 60 * 1000
+/** 同一台设备的「测试连接」冷却：3 秒内重复请求回 429。 */
+const TEST_COOLDOWN_MS = 3000
 
 /**
  * 设置页只允许改这些字段；未知字段直接丢弃（旧版本落盘的 `pet_skin`、
@@ -43,14 +47,14 @@ const MODES = new Set(['realtime', 'balance', 'calm', 'minimal'])
 const TITLE_SOURCES = new Set(['session', 'prompt'])
 
 /**
- * 只认三类来源：
- * - http://127.0.0.1:<port>、http://localhost:<port>：浏览器里的 DSH 页面；
- * - dsh-app://app：DSH 桌面应用自己的渲染进程（自定义 scheme，见 Electron
- *   `--cors-schemes=dsh-app`）。它跨源到 127.0.0.1 时 Sec-Fetch-Site 是
- *   cross-site，所以需要单独放行；远程网页无法伪造这个 origin。
+ * 只认 DSH 桌面应用自己的渲染进程（自定义 scheme，见 Electron
+ * `--cors-schemes=dsh-app`）。它跨源到 127.0.0.1 时 Sec-Fetch-Site 是
+ * cross-site，所以不能拿它当门槛；远程网页与普通 http 页面都无法伪造这个 origin。
+ *
+ * 注意：`http://127.0.0.1:<port>` / `http://localhost:<port>` 不再受信——
+ * 本机网页同样可能被 XSS、恶意扩展或调试端口劫持，不能凭「来自回环」放行。
  */
 const APP_ORIGIN = 'dsh-app://app'
-const TRUSTED_ORIGIN = /^http:\/\/(?:127\.0\.0\.1|localhost):(\d{1,5})$/
 
 function httpError(statusCode, message) {
   const err = new Error(message)
@@ -59,12 +63,7 @@ function httpError(statusCode, message) {
 }
 
 function isTrustedOrigin(origin) {
-  if (origin === APP_ORIGIN) return true
-  if (typeof origin !== 'string') return false
-  const match = TRUSTED_ORIGIN.exec(origin)
-  if (!match) return false
-  const port = Number(match[1])
-  return port >= 0 && port <= 65535
+  return origin === APP_ORIGIN
 }
 
 /**
@@ -230,13 +229,33 @@ function tokenMatches(headerValue, token) {
  * @param {string} options.petConfigPath pet-config.json 路径
  * @param {(args: string[], timeoutMs?: number) => Promise<{ok: boolean, output: string}>} options.runCli
  * @param {(line: string) => void} [options.log]
+ * @param {number} [options.tokenTtlMs] 令牌有效期（测试用；默认 10 分钟）
  * @returns {Promise<{server: import('node:http').Server, port: number, token: string, close: () => Promise<void>}>}
  */
-export async function createBridge({ port = 4517, petConfigPath, runCli, log } = {}) {
+export async function createBridge({ port = 4517, petConfigPath, runCli, log, tokenTtlMs = TOKEN_TTL_MS } = {}) {
   if (!petConfigPath) throw new Error('createBridge 需要 petConfigPath')
   const cli = typeof runCli === 'function' ? runCli : async () => ({ ok: false, output: 'runCli 未注入' })
   const logLine = typeof log === 'function' ? log : () => {}
-  const token = loadOrCreateToken()
+  let token = loadOrCreateToken()
+  // 有效期从「最近一次签发」算起：/token 每次调用都换新令牌，旧令牌立即作废。
+  let tokenIssuedAt = Date.now()
+  // 同一台设备的测试连接冷却：key = target（未配置时用 auto），value = 上次毫秒时间戳。
+  const testCooldown = new Map()
+
+  const tokenAlive = () => Date.now() - tokenIssuedAt <= tokenTtlMs
+
+  /** 轮换令牌并落盘；返回新令牌。落盘失败只警告，本次进程内仍按新令牌鉴权。 */
+  function issueToken() {
+    const next = randomBytes(24).toString('hex')
+    token = next
+    tokenIssuedAt = Date.now()
+    try {
+      atomicWrite(tokenFilePath(), `${next}\n`, 0o600)
+    } catch (e) {
+      logLine(`令牌落盘失败（本次运行仍生效）：${e.message || e}`)
+    }
+    return next
+  }
 
   function readConfig() {
     try {
@@ -249,16 +268,19 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
 
   function writeConfig(patch) {
     const next = { ...readConfig() }
+    const changed = []
     for (const [key, value] of Object.entries(patch || {})) {
       if (!ALLOWED_KEYS.has(key)) continue
       if (value === undefined || value === null) continue
       next[key] = value
+      changed.push(key)
     }
     const text = JSON.stringify(next, null, 2)
     // 写前自校验，确保落盘的一定是合法 JSON。
     JSON.parse(text)
     atomicWrite(petConfigPath, `${text}\n`)
-    logLine(`配置已更新：${JSON.stringify(next)}`)
+    // 只记改动的键名：值里可能有设备地址等信息，不进日志。
+    logLine(`配置已更新：${changed.length ? changed.join(', ') : '（无）'}`)
     return next
   }
 
@@ -282,8 +304,8 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
       return
     }
 
-    // 浏览器带了 Origin 但不是白名单 → 一律 403；没有 Origin 的非浏览器客户端
-    // 仍可凭 token 访问（本机脚本 / curl）。
+    // 浏览器带了 Origin 但不是 dsh-app://app → 一律 403；没有 Origin 的非浏览器
+    // 客户端仍可凭 token 访问（本机脚本 / curl）。
     const origin = requestOrigin(req)
     if (origin !== undefined && !isTrustedOrigin(origin)) {
       sendJson(req, res, 403, { ok: false, error: 'forbidden' })
@@ -303,18 +325,19 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
     }
 
     if (req.method === 'GET' && url.pathname === '/token') {
-      // 非浏览器客户端拿不到 token：必须同时有白名单 Origin 和同源/同站标记。
-      const fetchSite = req.headers['sec-fetch-site']
-      if (!isTrustedOrigin(origin) || (origin !== APP_ORIGIN && !TRUSTED_FETCH_SITES.has(fetchSite))) {
+      // 只认 DSH 桌面 App 的渲染进程；Sec-Fetch-Site 不作额外门槛
+      // （自定义 scheme 跨源到本机 HTTP 时它固定是 cross-site）。
+      // 每次调用都轮换令牌，旧令牌立即失效。
+      if (origin !== APP_ORIGIN) {
         sendJson(req, res, 403, { ok: false, error: 'forbidden' })
         return
       }
-      sendJson(req, res, 200, { ok: true, token })
+      sendJson(req, res, 200, { ok: true, token: issueToken() })
       return
     }
 
-    // 其余路由一律要求 token。
-    if (!tokenMatches(req.headers[TOKEN_HEADER], token)) {
+    // 其余路由一律要求 token，且必须在有效期内。
+    if (!tokenAlive() || !tokenMatches(req.headers[TOKEN_HEADER], token)) {
       sendJson(req, res, 401, { ok: false, error: 'unauthorized' })
       return
     }
@@ -340,6 +363,16 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
       // 忽略 body 里的 target，只用已保存的值，避免被跨站页面当 UDP 探测器。
       await readBody(req)
       const saved = readConfig()
+      const device = typeof saved.target === 'string' && saved.target ? saved.target : 'auto'
+      const nowMs = Date.now()
+      const last = testCooldown.get(device)
+      if (last !== undefined && nowMs - last < TEST_COOLDOWN_MS) {
+        const wait = Math.ceil((TEST_COOLDOWN_MS - (nowMs - last)) / 1000)
+        sendJson(req, res, 429, { ok: false, error: `测试过于频繁，请 ${wait} 秒后再试` })
+        return
+      }
+      // 先记冷却再执行：并发请求不能绕过 3 秒窗口。
+      testCooldown.set(device, nowMs)
       const args = ['check']
       if (typeof saved.target === 'string' && saved.target) args.push('--target', saved.target)
       sendJson(req, res, 200, await cli(args))
@@ -356,6 +389,12 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log } =
       sendJson(req, res, statusCode, { ok: false, error: message })
     })
   })
+
+  // 本机桥只服务设置页：请求 10 秒超时、请求头 8 秒、最多 8 条并发连接，
+  // 避免慢连接/半开连接（Slowloris）把宿主进程的句柄拖住。
+  server.requestTimeout = 10_000
+  server.headersTimeout = 8_000
+  server.maxConnections = 8
 
   await new Promise((resolve, reject) => {
     const onError = err => {
