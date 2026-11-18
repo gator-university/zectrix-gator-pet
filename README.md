@@ -153,7 +153,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 ## 从源码构建
 
 ```powershell
-cargo test                 # 55 lib + 34 bin = 89
+cargo test --offline       # 55 lib + 46 bin = 101
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```
@@ -164,12 +164,25 @@ copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 dsh-pet preview --demo working --out out\working.png
 ```
 
+## 开发
+
+```powershell
+cargo test --offline       # Rust 单测：55 lib + 46 bin = 101，0 warning
+cargo build --release      # 发布构建同样要求 0 warning
+cd plugin; npm test        # 插件侧单测（node --test，覆盖鉴权与 target 校验）
+```
+
+Rust 侧模块划分：`main.rs` 只留 `main()`、进程/路径探测与隐私清洗；其余按职责拆开——
+`store.rs`（state.json 读写、跨进程合并、写盘节流）、`config.rs`（pet-config.json 校验与生效）、
+`scan.rs`（会话扫描、TeamScan、占用/释放判定）、`daemon.rs`（设备循环与守护）、
+`cli.rs`（子命令）。测试集中在 `src/tests.rs`，夹具（事件、临时目录、Model 构造）共用一份。
+
 ## 目录结构
 
 ```
 plugin\             DSH 插件包（package.json / index.js / client.js / bin / locale / icon）
 src\                Rust：dsh.rs 会话跟随、layout.rs 版式、sprite.rs 鳄鱼、raster.rs 绘制、
-                    device.rs 设备通道、model.rs 状态模型
+                    device.rs 设备通道、model.rs 状态模型；main.rs 入口 + store/config/scan/daemon/cli 模块
 assets\croc\        鳄鱼动作 PNG（default 装扮）
 assets\quips.txt    右下角花絮
 docs\SPEC.md        功能清单与逐项验收（唯一功能规格）
