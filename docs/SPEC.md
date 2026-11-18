@@ -188,7 +188,7 @@
 
 ## 7. 模式（FR-MODE）
 
-- 实时（animation on，刷新 0s）、平衡（10s）、安静（30s）、极简（120s）。
+- 实时（0s）、平衡（10s）、安静（30s）、极简（120s）：模式只决定细节合并节流，没有动画维度。
 - 徽章显示当前模式；模式改变后 ≤2 秒生效并推一帧。
 - 状态：已验收。
 - 证据：`apply_pet_config()` mode 映射 + 日志「[配置] 插件配置已生效：follow=true 模式=安静 …」；徽章见 preview。
@@ -232,8 +232,8 @@
 
 ## 10. 可验证性（FR-VER）
 
-**FR-VER-01 自动化**：`cargo test` 全过（≥65 项）。
-- 状态：已验收。59 lib + 22 bin = **81** 项。
+**FR-VER-01 自动化**：`cargo test` 全过（≥88 项）。
+- 状态：已验收。55 lib + 34 bin = **89** 项。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
@@ -242,7 +242,7 @@
 **FR-VER-03 真机**：关键页面推送到设备后由用户拍照确认。
 - 状态：待验证（已有实时推送日志与用户可见画面；照片待用户补）。
 
-**FR-VER-04 诊断命令保留**：`check`/`push`/`preview`/`sessions`/`set`/`sound`/`voice`/`where`/`forget`；
+**FR-VER-04 诊断命令保留**：`check`/`push`/`preview`/`sessions`/`set`/`sound`/`where`/`forget`；
 `watch`/`run` 支持 `--verbose`（状态行附加标题）；`forget --titles` 只做隐私清理
 （任务标题换 `session-<短号>`、清空提醒指纹，不删设置）。
 - 状态：已验收（见 `usage()` 与 USAGE.md 第 3 节）。
@@ -251,5 +251,7 @@
 
 - 同一时刻只能一个程序占设备（固件约束）。
 - 动作调试页（FR-SET-02 子项）、GitHub 建仓与发布未做。
-- 语音输入已按 Q18 决定从设备手势移除（`voice` CLI 仍可诊断转写/粘贴链路）；如需恢复，需重新定义手势。
+- 语音输入（`voice` 模块 + CLI）与六套猫造型已按规格移除（0.8.0）：设备长按无操作，
+  `voice`/`skin` 命令、`pet_skin`/`animation` 设置项与相关模块全部删除；旧
+  `pet-config.json`/`state.json` 里残留的 `pet_skin`、`animation` 键按未知字段静默忽略。
 - 设置页需重启 DSH 后才可见（client bundle 在启动时加载）。

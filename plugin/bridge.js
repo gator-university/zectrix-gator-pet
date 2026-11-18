@@ -21,9 +21,9 @@ const TOKEN_HEADER = 'x-croc-pet-token'
 const TRUSTED_FETCH_SITES = new Set(['same-origin', 'same-site'])
 
 /**
- * 设置页只允许改这些字段；未知字段直接丢弃。
+ * 设置页只允许改这些字段；未知字段直接丢弃（旧版本落盘的 `pet_skin`、
+ * `animation` 之类键会被静默忽略，不报错）。
  *
- * 注意：`pet_skin` 刻意不在此列——它由 `dsh-pet skin set` 写入（含造型校验）。
  * `title_source` 在列，但 UI 必须同时写清隐私含义（prompt = 提示词首行会落盘/上屏）。
  */
 const ALLOWED_KEYS = new Set([
@@ -34,7 +34,6 @@ const ALLOWED_KEYS = new Set([
   'format',
   'mode',
   'refresh_secs',
-  'animation',
   'stale_minutes',
   'title_source',
 ])

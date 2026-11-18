@@ -15,8 +15,7 @@ use dsh_pet::{
     model::{Event as TaskEvent, Model, Settings, Status, Task, TitleSource},
     raster::{self, Fonts},
     sound,
-    sprite::Skin,
-    uia, voice,
+    uia,
     dsh::Watcher,
 };
 use zectrix_sdk::{Device, ImageFormat};
@@ -29,17 +28,7 @@ fn data_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    let dir = base.join("zectrix-dsh-pet");
-    // 从早期 dsh-pet 版本升级上来时把状态搬过来（只复制、不删源），
-    // 这样任务历史与设置不会因为换目录而丢。已有新目录就不动。
-    if !dir.join("state.json").exists() {
-        let old = base.join("zectrix-dsh-pet").join("state.json");
-        if old.is_file() {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::copy(&old, dir.join("state.json"));
-        }
-    }
-    dir
+    base.join("zectrix-dsh-pet")
 }
 
 fn state_path() -> PathBuf {
@@ -271,7 +260,7 @@ fn pid_alive(pid: u32) -> bool {
 
 /// 本机持久化：只存运行时状态缓存，不含任何会话正文。
 ///
-/// 用户设置（跟随/提示音/音量/动画/刷新/标题来源/造型/设备地址/屏幕格式）
+/// 用户设置（跟随/提示音/音量/刷新/标题来源/设备地址/屏幕格式）
 /// 的唯一真源是 `pet-config.json`；这里的 `model.settings` / `target` / `format`
 /// 只是**快照**（面板与预览读它，不必去解析配置），写入时不再参与「谁更权威」
 /// 的合并——每拍 `apply_user_config` 会从配置重新生成。
@@ -547,7 +536,7 @@ fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
 /// 由 DSH 插件读写、宠物进程热读的唯一用户配置源：
 /// %LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json。
 ///
-/// 插件设置页、`dsh-pet set`、`dsh-pet skin set`、设备手势改的都是这一个文件；
+/// 插件设置页、`dsh-pet set`、设备手势改的都是这一个文件；
 /// 守护每拍比较 mtime，改完 ≤2 秒生效，不用重启。`state.json` 里那份
 /// `model.settings` 只是快照，读设置时不再参考它（旧版本的值会在首次启动时
 /// 一次性迁移过来）。
@@ -565,13 +554,9 @@ struct PetConfig {
     /// realtime / balance / calm / minimal
     mode: Option<String>,
     refresh_secs: Option<u32>,
-    animation: Option<bool>,
     stale_minutes: Option<u32>,
     /// 标题来源：session（默认，只读 session/title）/ prompt（显式 opt-in）。
     title_source: Option<TitleSource>,
-    /// Buddy 造型（sprite::Skin 的 id）。放在配置里而不是 state.json，
-    /// 否则守护回写快照会把 `skin set` 刚改的造型盖回去。
-    pet_skin: Option<String>,
 }
 
 /// 一次写入 `pet-config.json` 的字段集合：只有这里声明的键能被写进文件，
@@ -585,12 +570,10 @@ struct PetConfigPatch {
     format: Option<String>,
     mode: Option<String>,
     refresh_secs: Option<u32>,
-    animation: Option<bool>,
     stale_minutes: Option<u32>,
     title_source: Option<TitleSource>,
-    pet_skin: Option<String>,
-    /// 显式删掉 `mode`。CLI 单独改 animation/refresh 时必须清掉它，
-    /// 否则面板写下的模式会在下一拍把这两项又盖回去。
+    /// 显式删掉 `mode`。CLI 单独改 refresh 时必须清掉它，
+    /// 否则面板写下的模式会在下一拍把这项又盖回去。
     clear_mode: bool,
 }
 
@@ -620,17 +603,11 @@ impl PetConfigPatch {
         if let Some(v) = self.refresh_secs {
             map.insert("refresh_secs".into(), Value::from(v));
         }
-        if let Some(v) = self.animation {
-            map.insert("animation".into(), Value::Bool(v));
-        }
         if let Some(v) = self.stale_minutes {
             map.insert("stale_minutes".into(), Value::from(v));
         }
         if let Some(v) = self.title_source {
             map.insert("title_source".into(), Value::String(v.as_str().into()));
-        }
-        if let Some(v) = self.pet_skin.as_deref() {
-            map.insert("pet_skin".into(), Value::String(v.to_string()));
         }
         map
     }
@@ -750,14 +727,11 @@ fn pet_config_from_obj(
         .and_then(|s| device::format(&s).ok().map(|f| device::format_name(f).to_string())),
         mode: pet_str_field(obj, "mode", warnings, |s| PET_CONFIG_MODES.contains(&s)),
         refresh_secs: pet_u32_field(obj, "refresh_secs", 0, 3600, warnings),
-        animation: pet_bool_field(obj, "animation", warnings),
         stale_minutes: pet_u32_field(obj, "stale_minutes", 1, 1440, warnings),
         title_source: pet_str_field(obj, "title_source", warnings, |s| {
             TitleSource::parse(s).is_some()
         })
         .and_then(|s| TitleSource::parse(&s)),
-        pet_skin: pet_str_field(obj, "pet_skin", warnings, |s| Skin::parse(s).is_some())
-            .and_then(|s| Skin::parse(&s).map(|k| k.id().to_string())),
     };
     // 空字符串 = 没设过，静默忽略；非字符串才算非法。
     if let Some(value) = obj.get("target") {
@@ -874,14 +848,24 @@ fn write_pet_config_at(path: &Path, patch: &PetConfigPatch) -> Result<()> {
     Ok(())
 }
 
-/// 面板上的模式 → (是否动画, 细节合并秒数)。没写 `mode` 时才用配置里的
-/// animation / refresh_secs，二者不要同时管同一件事。
-fn mode_preset(mode: &str) -> (bool, u32) {
+/// 面板上的模式 → 细节合并秒数。模式只决定刷新节流，没有别的维度：
+/// realtime=0、balance=10、calm=30、minimal=120。
+fn mode_preset(mode: &str) -> u32 {
     match mode {
-        "realtime" | "实时" => (true, 0),
-        "balance" | "平衡" => (true, 10),
-        "minimal" | "极简" => (false, 120),
-        _ => (false, 30),
+        "realtime" | "实时" => 0,
+        "balance" | "平衡" => 10,
+        "minimal" | "极简" => 120,
+        _ => 30,
+    }
+}
+
+/// 从刷新节流反推模式显示名（日志与诊断用，和插件设置页一致）。
+fn mode_label(refresh_secs: u32) -> &'static str {
+    match refresh_secs {
+        0 => "实时",
+        120.. => "极简",
+        30..=45 => "安静",
+        _ => "平衡",
     }
 }
 
@@ -905,19 +889,9 @@ fn settings_from_pet_config(c: &PetConfig) -> Settings {
         s.title_source = v;
     }
     if let Some(mode) = c.mode.as_deref() {
-        let (animation, refresh) = mode_preset(mode);
-        s.animation = animation;
-        s.refresh_secs = refresh;
-    } else {
-        if let Some(v) = c.animation {
-            s.animation = v;
-        }
-        if let Some(v) = c.refresh_secs {
-            s.refresh_secs = v;
-        }
-    }
-    if let Some(skin) = c.pet_skin.as_deref().and_then(Skin::parse) {
-        s.pet_skin = skin.id().into();
+        s.refresh_secs = mode_preset(mode);
+    } else if let Some(v) = c.refresh_secs {
+        s.refresh_secs = v;
     }
     s
 }
@@ -926,12 +900,10 @@ fn settings_from_pet_config(c: &PetConfig) -> Settings {
 /// 这里逐项比较，语义等价。
 fn settings_equal(a: &Settings, b: &Settings) -> bool {
     a.follow_enabled == b.follow_enabled
-        && a.animation == b.animation
         && a.stale_minutes == b.stale_minutes
         && a.sound_enabled == b.sound_enabled
         && a.volume == b.volume
         && a.refresh_secs == b.refresh_secs
-        && a.pet_skin == b.pet_skin
         && a.title_source == b.title_source
 }
 
@@ -961,26 +933,20 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
     if changed {
         let s = &store.model.settings;
         println!(
-            "[配置] pet-config.json 已生效：follow={} 模式={} 音量={} 目标={} 格式={} 标题来源={} 造型={}",
+            "[配置] pet-config.json 已生效：follow={} 模式={} 音量={} 目标={} 格式={} 标题来源={}",
             s.follow_enabled,
-            match (s.animation, s.refresh_secs) {
-                (true, 0) => "实时",
-                (true, _) => "平衡",
-                (false, 120) => "极简",
-                _ => "安静",
-            },
+            mode_label(s.refresh_secs),
             s.volume,
             store.target.as_deref().unwrap_or("自动发现"),
             store.format,
             s.title_source.as_str(),
-            s.pet_skin,
         );
     }
     changed
 }
 
 /// 一次性迁移：`pet-config.json` 不存在、但同目录已有 `state.json` 时，
-/// 把旧版本写在 state.json 里的设置/地址/格式/造型搬进配置。之后一律只认配置。
+/// 把旧版本写在 state.json 里的设置/地址/格式搬进配置。之后一律只认配置。
 ///
 /// 全新安装不建这个文件：首次加载会顺手写出一个「全默认」的 state.json，
 /// 那份东西没有值得保留的东西，凭空造出配置反而会让人以为迁移过。
@@ -1002,10 +968,8 @@ fn migrate_state_settings_to_pet_config(path: &Path, store: &Store) -> bool {
         target: store.target.clone(),
         format: Some(store.format.clone()),
         refresh_secs: Some(s.refresh_secs),
-        animation: Some(s.animation),
         stale_minutes: Some(s.stale_minutes),
         title_source: Some(s.title_source),
-        pet_skin: Some(s.pet_skin.clone()),
         ..Default::default()
     };
     match write_pet_config_at(path, &patch) {
@@ -1024,7 +988,7 @@ fn migrate_state_settings_to_pet_config(path: &Path, store: &Store) -> bool {
 }
 
 /// 用户配置的唯一入口：把 pet-config.json 套进 store（设置 + 设备地址 +
-/// 屏幕格式 + 造型）。每拍 / 每 2 秒调一次；文件没变时只做比较、不重复解析
+/// 屏幕格式）。每拍 / 每 2 秒调一次；文件没变时只做比较、不重复解析
 /// （mtime 缓存）。返回 true = 有字段生效（调用方据此更新模型、格式并强推一帧）。
 fn apply_user_config(store: &mut Store) -> bool {
     apply_user_config_at(&pet_config_path(), store)
@@ -1360,7 +1324,7 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
         if out.idle_grace.is_none() {
             out.idle_grace = disk.idle_grace;
         }
-        // 注意：`model.settings` / 造型**不再**参与合并——它们是 pet-config.json
+        // 注意：`model.settings` **不再**参与合并——它们是 pet-config.json
         // 的只读快照，真源在那边；这里合并只会把别处刚改的设置盖回旧值。
     }
     // 内存标记不落盘：recovered / 正常文件里都必须是 false。
@@ -1608,130 +1572,6 @@ impl Args {
     }
 }
 
-/// v0.4.0 实验：设备录音 → 本机转写 → 投递到 DeepSeek Harness 输入框。
-///
-/// - `voice probe`：定位输入框，只读，不动界面
-/// - `voice paste --text ... [--send]`：把文字贴进输入框（可选回车发送）
-/// - `voice say --wav ...`：对一个 WAV 跑转写（验证 ASR 命令是否可用）
-fn cmd_voice(args: &Args) -> Result<()> {
-    match args.get("arg0").unwrap_or("probe") {
-        "probe" => println!("{}", voice::probe()?),
-        "paste" => {
-            let text = args
-                .get("text")
-                .context("用法：voice paste --text \"要投递的文字\" [--send]")?;
-            voice::deliver(text, args.has("send"))?;
-            println!(
-                "已投递到输入框{}",
-                if args.has("send") {
-                    " 并回车发送"
-                } else {
-                    "（未发送）"
-                }
-            );
-        }
-        "windows" => {
-            for line in voice::list_windows() {
-                println!("{line}");
-            }
-        }
-        "focus" => println!("{}", voice::focus_probe()?),
-        // 诊断：真的去点侧边栏把目标会话切到前台（会动界面，但不会写任何文字）。
-        // 用法：voice open --title "会话标题"
-        "open" => {
-            let title = args.get("title").context("用法：voice open --title \"会话标题\"")?;
-            voice::open_session("", title)?;
-            println!("已切到会话：{title}");
-        }
-        // 诊断：屏幕上「↑↓ 换会话」到底能换到哪些会话，顺序是否和预期一致。
-        "targets" => {
-            let store = load_store();
-            let list = voice_targets(&store.model, now());
-            if list.is_empty() {
-                println!("没有可投递的会话（会直接贴到当前输入框）");
-            }
-            for (i, t) in list.iter().enumerate() {
-                println!("{:>2}. {}  [{}]", i + 1, t.title, t.session);
-            }
-        }
-        // 环境自检：转写跑不起来时先看这条，能一次说清是缺解释器、
-        // 缺脚本、还是缺模型（以及要等多久）。
-        "doctor" => {
-            let python = voice::python_exe();
-            let script = voice::worker_script()?;
-            println!(
-                "解释器：{}（{}）",
-                python.display(),
-                if python.exists() { "存在" } else { "不存在" }
-            );
-            println!("脚本：{}", script.display());
-            let started = std::time::Instant::now();
-            let mut asr = voice::Asr::spawn()?;
-            println!(
-                "模型 {} 已就绪，用时 {:.1} 秒（只在第一段音频前付一次）",
-                asr.model,
-                started.elapsed().as_secs_f32()
-            );
-            match args.get("wav") {
-                Some(wav) => {
-                    let t = std::time::Instant::now();
-                    let text = asr.transcribe(Path::new(wav))?;
-                    println!(
-                        "试转写：{:.2} 秒 → {}",
-                        t.elapsed().as_secs_f32(),
-                        if text.is_empty() { "（空）" } else { &text }
-                    );
-                }
-                None => println!("加 --wav 路径可以顺带试转一段音频"),
-            }
-        }
-        "say" => {
-            let wav = args.get("wav").context("用法：voice say --wav 路径")?;
-            let path = Path::new(wav);
-            println!("音频：{}", voice::describe_wav(path)?);
-            let mut asr = voice::Asr::spawn()?;
-            let t = std::time::Instant::now();
-            let text = asr.transcribe(path)?;
-            println!("识别结果（{:.2} 秒）：{text}", t.elapsed().as_secs_f32());
-        }
-        // 本地渲染语音确认页，不连设备：调版式和做文档配图都用它。
-        // 默认按日常形态渲染（一个会话），`--two` 才出多会话切换的样子。
-        "preview" => {
-            let text = args
-                .get("text")
-                .unwrap_or("把今天的会议纪要整理成三条要点，发到项目群里。");
-            let title = args.get("session").unwrap_or("DeepSeek Harness 宠物");
-            let mut targets = vec![voice::Target {
-                session: "demo-a".into(),
-                title: title.to_string(),
-            }];
-            if args.has("two") {
-                targets.push(voice::Target {
-                    session: "demo-b".into(),
-                    title: "写周报".into(),
-                });
-            }
-            let d = voice::Draft::new(text.to_string(), 3.2, targets, now());
-            let scene = layout::voice(&d, now());
-            let fonts = Fonts::load()?;
-            let png = raster::to_png(&scene, &fonts)?;
-            let path = args
-                .get("out")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| out_dir().join("voice.png"));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, png)?;
-            println!("已生成：{}", path.display());
-        }
-        other => anyhow::bail!(
-            "未知子命令 voice {other}，可用 doctor / say / paste / probe / windows"
-        ),
-    }
-    Ok(())
-}
-
 fn parse_status(value: &str) -> Result<Option<Status>> {    Ok(match value.trim().to_ascii_lowercase().as_str() {
         "idle" | "none" | "off" => None,
         "working" | "work" => Some(Status::Working),
@@ -1830,9 +1670,9 @@ fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool)
     (applied, changed)
 }
 
-fn render(model: &Model, frame: usize) -> Result<Vec<u8>> {
+fn render(model: &Model) -> Result<Vec<u8>> {
     let fonts = Fonts::load()?;
-    let scene = layout::draw(model, now(), frame);
+    let scene = layout::draw(model, now());
     raster::to_png(&scene, &fonts)
 }
 
@@ -2160,7 +2000,7 @@ fn hash_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
 
 /// 当前模型渲染出的场景元素数：`--trace-tick` 打印用，只在真要打印时才调。
 fn scene_element_count(model: &Model) -> usize {
-    layout::draw(model, now(), 0)
+    layout::draw(model, now())
         .get("elements")
         .and_then(|v| v.as_array())
         .map_or(0, Vec::len)
@@ -2232,17 +2072,9 @@ async fn push_if_changed(
     quips: &QuipSampler,
     fonts: &Fonts,
     fmt: ImageFormat,
-    frame: usize,
     last_sig: &mut Option<u64>,
 ) -> bool {
-    // 造型的真源是 pet-config.json，`apply_user_config` 每拍已经把它套进 store；
-    // 这里只把 store 的快照同步给 model（`skin set` 之后下一帧就换）。放在签名
-    // 渲染之前，皮肤一变这一帧就会因为 sig 不同而刷到设备上。
-    if store.model.settings.pet_skin != model.settings.pet_skin {
-        model.settings.pet_skin = store.model.settings.pet_skin.clone();
-    }
-    let phase = if model.settings.animation { frame } else { 0 };
-    let mut scene = layout::draw(model, now(), phase);
+    let mut scene = layout::draw(model, now());
     // 只比哈希，不序列化整棵树：空闲时这一句省下每秒几十 KB 的分配。
     let mut sig = scene_value_signature(&scene);
     if last_sig.as_ref() == Some(&sig) {
@@ -2258,7 +2090,7 @@ async fn push_if_changed(
             if let Err(e) = save_store(store) {
                 eprintln!("配置保存失败: {e}");
             }
-            scene = layout::draw(model, now(), phase);
+            scene = layout::draw(model, now());
             // 花絮上了屏，签名要跟着这一帧走，否则下次同样的画面会被当成没变。
             sig = scene_value_signature(&scene);
         }
@@ -2297,7 +2129,7 @@ async fn push_if_changed(
     true
 }
 
-/// 把现成的场景树推到设备（语音页、过渡页用：它们不属于 `Model` 的正常排版）。
+/// 把现成的场景树推到设备（过渡页用：它不属于 `Model` 的正常排版）。
 ///
 /// 返回是否真的推了：签名相同就不推，避免对一个静态页面反复刷墨水屏。
 async fn push_scene(
@@ -2329,109 +2161,6 @@ async fn push_scene(
     true
 }
 
-/// 可以投递的会话：正在跑/等确认的排前面，其余按最近活动补到最多 8 个。
-///
-/// **id 用 `thread_id`（基础会话 UUID），不是 `task_id`**：task_id 带轮次后缀
-///（`…-t3`），而侧边栏一行对应的是**基础会话**。投递前要靠标题去侧边栏里
-/// task_id，选「别的会话」时其实切不过去，文字会落回原来那个会话里。
-///
-/// 候选范围是「Watcher 扫得到的会话」（最近 12 小时有活动）：包括已经答完的。
-/// 语音是在接着手上的活说，但用户明确要投给另一个会话时，那个会话多半刚用过。
-fn voice_targets(model: &Model, at: i64) -> Vec<voice::Target> {
-    const MAX: usize = 8;
-    let mut out: Vec<voice::Target> = Vec::new();
-    // 先放正在跑的：它们是「顺手补一句」最可能的目标，排在前面不用按键找。
-    for t in model.running(at) {
-        push_target(&mut out, &t);
-    }
-    for t in model.live(at) {
-        if out.len() >= MAX {
-            break;
-        }
-        push_target(&mut out, &t);
-    }
-    out.truncate(MAX);
-    out
-}
-
-fn push_target(out: &mut Vec<voice::Target>, t: &Task) {
-    if t.source != "dsh" {
-        return;
-    }
-    let id = t
-        .event
-        .thread_id
-        .clone()
-        .unwrap_or_else(|| t.event.task_id.clone());
-    if id.is_empty() || out.iter().any(|x| x.session == id) {
-        return;
-    }
-    out.push(voice::Target {
-        session: id,
-        title: t.event.title.clone(),
-    });
-}
-
-/// 转写一段录音。首次会拉起常驻进程（要载模型，几秒），之后只付推理时间。
-///
-/// 转写失败就把进程丢掉重起：whisper 崩过一次之后，同一个进程再问也是坏的，
-/// 留着只会让后面每一段都失败。
-#[allow(dead_code)]
-async fn transcribe_voice(asr: &mut Option<voice::Asr>, wav: &Path) -> Result<String> {
-    if asr.is_none() {
-        *asr = Some(tokio::task::spawn_blocking(voice::Asr::spawn).await??);
-        println!(
-            "[语音] 转写进程就绪（模型 {}）",
-            asr.as_ref().map(|w| w.model.as_str()).unwrap_or("?")
-        );
-    }
-    let mut worker = asr.take().expect("上面刚补上");
-    let path = wav.to_path_buf();
-    let (worker, result) = tokio::task::spawn_blocking(move || {
-        let r = worker.transcribe(&path);
-        (worker, r)
-    })
-    .await?;
-    match result {
-        Ok(text) => {
-            *asr = Some(worker);
-            Ok(text)
-        }
-        Err(e) => {
-            drop(worker);
-            Err(e)
-        }
-    }
-}
-
-/// 把草稿投进目标会话的输入框。只粘贴、不回车——识别错字还有机会在电脑上改。
-#[allow(dead_code)]
-async fn deliver_voice(draft: voice::Draft) -> Result<String> {
-    let text = draft.text.clone();
-    let target = draft.target().cloned();
-    // 目标就是当前显示的那个会话就不切：切会话会抢焦点、动窗口，
-    // 而单会话场景压根不需要——之前「一按确认窗口就缩小」正是这类多余动作。
-    let need_switch = target
-        .as_ref()
-        .is_some_and(|t| draft.current.as_deref() != Some(t.session.as_str()));
-    let what = match (&target, need_switch) {
-        (Some(t), true) => format!("已粘贴到「{}」的输入框（未发送）", t.title),
-        (Some(_), false) => "已粘贴到当前会话的输入框（未发送）".to_string(),
-        (None, _) => "已粘贴到当前输入框（未发送）".to_string(),
-    };
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        if let Some(t) = target.filter(|_| need_switch) {
-            // 点侧边栏切会话（UIA SelectionItem），并等窗口标题确认真的切过去了。
-            voice::open_session(&t.session, &t.title)?;
-            // 切会话后组件要重建：给输入框一点时间，否则文字会粘到上一个会话里。
-            std::thread::sleep(Duration::from_millis(900));
-        }
-        voice::deliver(&text, false)
-    })
-    .await??;
-    Ok(what)
-}
-
 fn describe(model: &Model) -> String {
     let at = now();
     let current = model.current(at);
@@ -2456,15 +2185,10 @@ fn describe(model: &Model) -> String {
         None => out.push_str("当前：无任务（等待任务）\n"),
     }
     out.push_str(&format!(
-        "进行中/等待：{} 个｜已知任务：{} 个｜跟随：{}｜动画：{}｜提示音：{}（音量 {}）\n",
+        "进行中/等待：{} 个｜已知任务：{} 个｜跟随：{}｜提示音：{}（音量 {}）\n",
         running.len(),
         model.tasks.len(),
         if model.settings.follow_enabled {
-            "开"
-        } else {
-            "关"
-        },
-        if model.settings.animation {
             "开"
         } else {
             "关"
@@ -2502,19 +2226,7 @@ fn label_of(model: &Model) -> String {
         .to_string()
 }
 
-/// `--skin` 只覆盖本次预览/推送，不落盘：先看效果再决定要不要 `skin set`。
 fn with_model(args: &Args, store: &mut Store) -> Model {
-    let mut model = with_model_inner(args, store);
-    if let Some(v) = args.get("skin") {
-        match Skin::parse(v) {
-            Some(s) => model.settings.pet_skin = s.id().into(),
-            None => eprintln!("未知造型 {v}，用 `skin list` 看可选造型；本次沿用 {}", model.settings.pet_skin),
-        }
-    }
-    model
-}
-
-fn with_model_inner(args: &Args, store: &mut Store) -> Model {
     let mut model = store.model.clone();
     match args.get("demo").map(parse_status) {
         Some(Ok(demo)) => {
@@ -2548,74 +2260,6 @@ fn with_model_inner(args: &Args, store: &mut Store) -> Model {
             model
         }
     }
-}
-
-/// 位置参数：Args 把命令后的裸词依次存成 argN。
-fn positional(args: &Args) -> Vec<&str> {
-    args.flags
-        .iter()
-        .filter(|(k, _)| k.starts_with("arg"))
-        .map(|(_, v)| v.as_str())
-        .collect()
-}
-
-/// Buddy 图鉴造型：list / set，写进 pet-config.json，守护下一帧自动生效。
-fn cmd_skin(args: &Args) -> Result<()> {
-    let pos = positional(args);
-    let mut store = load_store();
-    // 造型的真源也在 pet-config.json：先套进来，打印的「当前」才是真生效的。
-    let _ = apply_user_config(&mut store);
-    let current = Skin::parse(&store.model.settings.pet_skin).unwrap_or_default();
-    let action = pos.first().copied().unwrap_or("list");
-    match action {
-        "list" | "ls" => {
-            println!("Buddy 图鉴（当前：{} · {}）", current.name(), current.id());
-            for s in Skin::ALL {
-                println!(
-                    "  {} {:<8} {:<10} {}",
-                    if s == current { "*" } else { " " },
-                    s.id(),
-                    s.name(),
-                    s.desc()
-                );
-            }
-            println!("\n切换：dsh-pet skin set <id>");
-            println!("设备上：长按上/下键挨个换（设备正在显示宠物时即可，换完立刻上屏并记住）");
-            println!("临时试看：dsh-pet preview --demo working --skin <id> --out <路径>");
-            Ok(())
-        }
-        "current" | "now" => {
-            println!("{}（{}）", current.name(), current.id());
-            Ok(())
-        }
-        "set" => {
-            let id = pos
-                .get(1)
-                .context("用法：dsh-pet skin set <pixel|abacus|fortune|astro>")?;
-            set_skin(id)
-        }
-        other => set_skin(other),
-    }
-}
-
-fn set_skin(value: &str) -> Result<()> {
-    let skin = Skin::parse(value).with_context(|| {
-        format!("未知造型 {value}；可用 {}", Skin::ALL.iter().map(|s| s.id()).collect::<Vec<_>>().join(" / "))
-    })?;
-    let mut store = load_store();
-    let _ = apply_user_config(&mut store);
-    write_pet_config_at(
-        &pet_config_path(),
-        &PetConfigPatch {
-            pet_skin: Some(skin.id().into()),
-            ..Default::default()
-        },
-    )?;
-    let _ = apply_user_config(&mut store);
-    save_store_now(&store)?;
-    println!("已切换造型：{}（{}）", skin.name(), skin.id());
-    println!("守护下一帧自动生效；想立刻看一次：dsh-pet push --demo working");
-    Ok(())
 }
 
 /// `on` / `off` / `true` / `false` / `1` / `0` / `开` / `关`。
@@ -2658,12 +2302,6 @@ fn cmd_set(args: &Args) -> Result<()> {
     if let Some(v) = args.get("follow") {
         patch.follow = Some(parse_onoff(v)?);
     }
-    if let Some(v) = args.get("animation") {
-        patch.animation = Some(parse_onoff(v)?);
-        // 单独调这两项时把面板的「模式」清掉：mode 会覆盖 animation/refresh，
-        // 不清掉就会出现「我明明关了动画，它俩秒后又自己开了」。
-        patch.clear_mode = true;
-    }
     if let Some(v) = args.get("stale") {
         let n: u32 = v
             .parse()
@@ -2686,11 +2324,10 @@ fn cmd_set(args: &Args) -> Result<()> {
         // 只接受 mono / gray4 / gray16；写回统一的名字，守护下一拍热切换。
         patch.format = Some(device::format_name(device::format(v)?).to_string());
     }
-    // 一键「安静模式」：关动画 + 30 秒节流。嫌墨水屏一闪一闪时用这个，
-    // 比单独调两项省事；`--calm off` 恢复实时跟随。
+    // 一键「安静模式」：30 秒节流。嫌墨水屏一闪一闪时用这个；
+    // `--calm off` 恢复实时跟随。
     if let Some(v) = args.get("calm") {
         let calm = parse_onoff(v)?;
-        patch.animation = Some(!calm);
         patch.refresh_secs = Some(if calm { 30 } else { 0 });
         patch.clear_mode = true;
     }
@@ -2702,7 +2339,6 @@ fn cmd_set(args: &Args) -> Result<()> {
             onoff_label(s.sound_enabled),
             s.volume
         );
-        println!("动画：{}", onoff_label(s.animation));
         if s.refresh_secs == 0 {
             println!("刷新节流：关（内容变化就刷，最多 2 秒一次）");
         } else {
@@ -2721,8 +2357,7 @@ fn cmd_set(args: &Args) -> Result<()> {
         println!("配置位置：{}", pet_config_path().display());
         println!();
         println!("改法示例：");
-        println!("  dsh-pet set --calm on            安静模式：关动画 + 30 秒节流（推荐先试这个）");
-        println!("  dsh-pet set --animation off      只关动画");
+        println!("  dsh-pet set --calm on            安静模式：30 秒节流（推荐先试这个）");
         println!("  dsh-pet set --refresh 60         内容更新至少隔 60 秒才刷");
         println!("  dsh-pet set --format mono        黑白 1 位：整屏刷新快 4 倍、闪得少（默认）");
         println!("  dsh-pet set --sound off          完全静音");
@@ -2738,11 +2373,10 @@ fn cmd_set(args: &Args) -> Result<()> {
     save_store_now(&store)?;
     let s = &store.model.settings;
     println!(
-        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}｜造型 {}",
+        "已保存：跟随 {}｜提示音 {}（音量 {}）｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}",
         onoff_label(s.follow_enabled),
         onoff_label(s.sound_enabled),
         s.volume,
-        onoff_label(s.animation),
         if s.refresh_secs == 0 {
             "关".to_string()
         } else {
@@ -2750,32 +2384,18 @@ fn cmd_set(args: &Args) -> Result<()> {
         },
         s.stale_minutes,
         store.format,
-        s.title_source.as_str(),
-        s.pet_skin
+        s.title_source.as_str()
     );
     println!("写入：{}", pet_config_path().display());
     println!("守护下一拍生效，不需要重启。");
     Ok(())
 }
 
-/// 图鉴里的下一只/上一只，走到头绕回去。
-///
-/// 单独拎出来是为了能单测：`cycle_skin` 要落盘，测试里不该碰 state.json。
-#[allow(dead_code)]
-fn step_skin(cur: Skin, step: i32) -> Skin {
-    let n = Skin::ALL.len() as i32;
-    let at = Skin::ALL.iter().position(|s| *s == cur).unwrap_or(0) as i32;
-    Skin::ALL[(((at + step) % n + n) % n) as usize]
-}
-
-/// 渲染一张预览图（不连设备）。造型与设置都走 pet-config.json，
-/// 所以 `skin set` / `set --volume` 之后预览立刻和真机一致。
 async fn cmd_preview(args: &Args) -> Result<()> {
     let mut store = load_store();
     let _ = apply_user_config(&mut store);
     let model = with_model(args, &mut store);
-    let frame = args.get("frame").and_then(|f| f.parse().ok()).unwrap_or(0);
-    let scene = layout::draw(&model, now(), frame);
+    let scene = layout::draw(&model, now());
     if args.has("scene") {
         println!("{}", serde_json::to_string_pretty(&scene)?);
         return Ok(());
@@ -2896,7 +2516,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
         store.target.as_deref().unwrap_or("（未设置）")
     );
     println!(
-        "当前设置      跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜格式 {}",
+        "当前设置      跟随 {}｜提示音 {}（音量 {}）｜格式 {}",
         if store.model.settings.follow_enabled {
             "开"
         } else {
@@ -2908,11 +2528,6 @@ async fn cmd_init(args: &Args) -> Result<()> {
             "关"
         },
         store.model.settings.volume,
-        if store.model.settings.animation {
-            "开"
-        } else {
-            "关"
-        },
         store.format
     );
 
@@ -2996,7 +2611,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
     println!("\n[2/2] 生成预览");
     let mut watcher = Watcher::new(dsh_root());
     scan_into(&mut store.model, &mut watcher);
-    let scene = layout::draw(&store.model, now(), 0);
+    let scene = layout::draw(&store.model, now());
     let png = raster::to_png(&scene, &Fonts::load()?)?;
     let path = out_dir().join("pet-init.png");
     write_png(&path, &png)?;
@@ -3039,7 +2654,7 @@ async fn cmd_push(args: &Args) -> Result<()> {
     let _ = apply_user_config(&mut store);
     let model = with_model(args, &mut store);
     let fmt = device::format(args.get("format").unwrap_or(&store.format))?;
-    let png = render(&model, 0)?;
+    let png = render(&model)?;
     let target = args
         .get("target")
         .map(str::to_string)
@@ -3175,9 +2790,6 @@ async fn cmd_run(args: &Args) -> Result<()> {
     if args.has("no-sound") {
         store.model.settings.sound_enabled = false;
     }
-    if args.has("no-animation") {
-        store.model.settings.animation = false;
-    }
     let mut fmt = device::format(args.get("format").unwrap_or(&store.format))?;
     // 显式地址优先并记住（写 pet-config.json），避免每次都得带 --target。
     if let Some(t) = args.get("target").map(str::to_string) {
@@ -3198,12 +2810,6 @@ async fn cmd_run(args: &Args) -> Result<()> {
         .map(str::to_string)
         .or(store.target.clone());
     let mut model = store.model.clone();
-    // run 的 --skin 只作用于本次会话（守护传下来的参数也算），不落盘。
-    // 存成局部变量：每拍套完 pet-config 之后还要再盖一次，否则会被配置冲掉。
-    let session_skin = args.get("skin").and_then(Skin::parse);
-    if let Some(s) = session_skin {
-        model.settings.pet_skin = s.id().into();
-    }
     // 守护模式（standby）下跟随被手动关掉：别去占设备，直接回待命。
     // 判在 `device::open` 之前——否则会在用户说「先别上屏」之后还去抢一次连接。
     if args.has("standby") && !model.settings.follow_enabled {
@@ -3245,10 +2851,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v as i64)
         .unwrap_or_else(|| store.idle_grace());
-    let mut frame = 0usize;
     let mut last_sig: Option<u64> = None;
-    // 语音输入按新版规格从设备手势里移除：确认键长按不再触发录音转写。
-    // `voice` 诊断命令仍在（`dsh-pet voice ...`），设备侧只保留单击/双击/三击。
     // 设备正在录音时固件占着采集，推送和响铃都会拿到 Busy——这一拍直接跳过，
     // 等 RecordingFinished 再恢复，别让日志里刷一串「推送失败」。
     let mut recording = false;
@@ -3286,8 +2889,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(450)).await;
     }
     let mut last_push_at = now();
-    if push_if_changed(&dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig).await {
-        frame = (frame + 1) % 6;
+    if push_if_changed(&dev, &mut model, &mut store, quips, &fonts, fmt, &mut last_sig).await {
         last_push_at = now();
     }
     // 两次刷新之间的最小间隔：状态抖动（子任务开始/结束、多会话轮流上报）
@@ -3357,10 +2959,6 @@ async fn cmd_run(args: &Args) -> Result<()> {
                 // 解析结果）：插件面板或 `dsh-pet set` 改完 2 秒内生效，不用重启守护。
                 if apply_user_config(&mut store) {
                     model.settings = store.model.settings.clone();
-                    // run 的 --skin 只作用于本次会话：配置覆盖回来后再盖一次。
-                    if let Some(skin) = session_skin {
-                        model.settings.pet_skin = skin.id().into();
-                    }
                     if args.get("format").is_none() {
                         if let Ok(new_fmt) = device::format(&store.format) {
                             if device::format_name(new_fmt) != device::format_name(fmt) {
@@ -3412,11 +3010,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     println!("[手势] 双击确认 → {}", model.quip);
                     // 屏幕右下角给个即时反馈（下一帧会被真实花絮替换）。
                     // 这是本次双击唯一一帧结果帧：第二下点击在按键分支里被推迟了。
-                    let scene = layout::draw(
-                        &model,
-                        now(),
-                        if model.settings.animation { frame } else { 0 },
-                    );
+                    let scene = layout::draw(&model, now());
                     if push_scene(&dev, scene, &fonts, fmt, &mut last_sig).await {
                         println!("[手势] 静音结果已上屏（双击判定结束，只推这一帧）");
                     }
@@ -3477,11 +3071,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     && chrono::Local::now().timestamp_millis() - clicks.0 < 650;
                 if pending_push && !double_click_pending && now() >= push_not_before {
                     if push_if_changed(
-                        &dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig,
+                        &dev, &mut model, &mut store, quips, &fonts, fmt, &mut last_sig,
                     )
                     .await
                     {
-                        frame = (frame + 1) % 6;
                         last_push_at = now();
                         push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
                         last_card = Some(card_sig(&model, now()));
@@ -3576,12 +3169,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
                                 quips,
                                 &fonts,
                                 fmt,
-                                frame,
                                 &mut last_sig,
                             )
                             .await
                         {
-                            frame = (frame + 1) % 6;
                             last_push_at = now();
                             last_card = Some(card_sig(&model, now()));
                         }
@@ -3634,11 +3225,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
                         status_at = now();
                         // 重连成功先推首帧（≤2 秒目标），再取电量——别让状态查询拖慢首帧。
                         if push_if_changed(
-                            &dev, &mut model, &mut store, quips, &fonts, fmt, frame, &mut last_sig,
+                            &dev, &mut model, &mut store, quips, &fonts, fmt, &mut last_sig,
                         )
                         .await
                         {
-                            frame = (frame + 1) % 6;
                             last_push_at = now();
                             last_card = Some(card_sig(&model, now()));
                             push_not_before = last_push_at + PUSH_COOLDOWN_SECS;
@@ -4058,11 +3648,11 @@ fn usage() {
   state.json 只存运行时状态（任务、提醒指纹、电量、设备占用与交还时间）。
 
 诊断命令：
-  dsh-pet preview [--demo <状态>] [--out 路径] [--frame N] [--session <ID>]
+  dsh-pet preview [--demo <状态>] [--out 路径] [--session <ID>]
                                            渲染 400×300 预览，不连设备
   dsh-pet scene   [--demo <状态>]          打印布局 JSON（调试用）
   dsh-pet sessions                         列出可跟随的本机会话、状态与清单进度
-  dsh-pet set     [--sound on|off] [--volume 0-100] [--follow on|off] [--animation on|off]
+  dsh-pet set     [--sound on|off] [--volume 0-100] [--follow on|off]
                   [--refresh 秒] [--calm on|off] [--format mono|gray4|gray16]
                   [--title-source session|prompt]
                                            查看/修改用户配置（写 pet-config.json，2 秒内生效）
@@ -4074,8 +3664,6 @@ fn usage() {
   dsh-pet watch   [--watch-pid PID] [--idle-grace 秒] [--verbose] [--trace-tick]
                                            守护：有任务才占用设备，任务结束 5 分钟无新任务即交还
                                            --trace-tick：每 10 拍打印 [tick] 耗时与元素数（默认关闭）
-  dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
-                                           语音链路诊断
   dsh-pet where                            显示数据与配置路径（配置 = pet-config.json）
   dsh-pet forget                           删除本机状态缓存
   dsh-pet forget --titles                  只清理隐私：已有任务标题换成 session-短号，清空提醒指纹
@@ -4152,12 +3740,10 @@ async fn dispatch(args: Args) -> Result<()> {
             }
         }
         "sessions" | "ls" => cmd_sessions(&args).await,
-        "skin" | "buddy" | "pet" => cmd_skin(&args),
         "set" | "settings" | "config" => cmd_set(&args),
         "init" | "setup" | "guide" => cmd_init(&args).await,
         "check" => cmd_check(&args).await,
         "sound" | "tone" => cmd_sound(&args).await,
-        "voice" | "say" => cmd_voice(&args),
         "uia" | "tree" => {
             // 诊断用：把 DeepSeek Harness 窗口的可访问性树打出来，定位输入框与发送按钮。
             let nodes = uia::dump_nodes();
@@ -4209,11 +3795,6 @@ async fn dispatch(args: Args) -> Result<()> {
         "push" | "once" => cmd_push(&args).await,
         "run" | "start" => cmd_run(&args).await,
         "watch" | "daemon" => cmd_watch(&args).await,
-        "balance" | "credit" => {
-            println!("积分余额是云端数据、本地读不到，该显示项已下线；");
-            println!("左下角现在显示当前会话的上下文占用（读 DSH 会话日志里的 token 用量 / contextWindow）。");
-            Ok(())
-        }
         "where" => {
             println!("配置: {}（唯一用户配置源）", pet_config_path().display());
             println!("状态缓存: {}（运行时状态，不是设置）", state_path().display());
@@ -4271,62 +3852,6 @@ mod tests {
         m.settings.follow_enabled = true;
         m.apply(event(seq, status), "dsh", at).unwrap();
         m
-    }
-
-    /// 一轮刚答完时用户常马上补一句：此刻没有「正在跑」的会话，也必须能
-    /// 指出投给谁，不能只剩一句「当前窗口」让人猜。
-    #[test]
-    fn voice_targets_fall_back_to_the_session_that_just_finished() {
-        let m = model_with(1, Status::Done, 1_000);
-        let targets = voice_targets(&m, 1_010);
-        assert_eq!(targets.len(), 1, "刚完成的会话要能作为投递目标");
-        assert_eq!(targets[0].session, "t1");
-        assert_eq!(targets[0].title, "真实任务");
-
-        // 超过 stale_minutes 也还在候选里：用户可能就是想投给刚放下的那个会话。
-        // 真正的边界是 Watcher 的 12 小时扫描窗口，不是 15 分钟陈旧标记。
-        let stale_at = 1_000 + m.settings.stale_minutes as i64 * 60 + 5;
-        assert_eq!(voice_targets(&m, stale_at).len(), 1);
-    }
-
-    /// 会话 id 必须是基础 UUID，且「别的会话」也要能选——录音不是只能投给
-    /// 正在跑的那一个。
-    #[test]
-    fn voice_targets_use_base_session_id_and_cover_other_chats() {
-        let mk = |task: &str, thread: &str, seq: u64, status: Status| TaskEvent {
-            task_id: task.into(),
-            thread_id: Some(thread.into()),
-            seq,
-            status,
-            title: thread.into(),
-            detail: String::new(),
-            progress: None,
-            progress_source: ProgressSource::Agent,
-            progress_steps: None,
-            agent: "DeepSeek Harness".into(),
-        };
-        let mut m = Model::default();
-        m.settings.follow_enabled = true;
-        m.apply(mk("a-u1", "sess-a", 1, Status::Working), "dsh", 100)
-            .unwrap();
-        m.apply(mk("a-u2", "sess-a", 2, Status::Done), "dsh", 110)
-            .unwrap();
-        m.apply(mk("b-u1", "sess-b", 1, Status::Done), "dsh", 120)
-            .unwrap();
-
-        let targets = voice_targets(&m, 130);
-        let ids: Vec<_> = targets.iter().map(|t| t.session.as_str()).collect();
-        assert!(ids.contains(&"sess-a"), "正在跑的会话要在列表里：{ids:?}");
-        assert!(ids.contains(&"sess-b"), "别的会话也要能选：{ids:?}");
-        assert!(
-            !ids.iter().any(|id| id.contains("-u")),
-            "必须用基础会话 id，不能用带轮次后缀的 task_id：{ids:?}"
-        );
-        assert_eq!(
-            ids.iter().filter(|id| **id == "sess-b").count(),
-            1,
-            "同一会话的多轮要去重：{ids:?}"
-        );
     }
 
     #[test]
@@ -4480,56 +4005,17 @@ mod tests {
     }
 
     #[test]
-    fn device_long_press_cycles_skins() {
-        // 长按一下换一只，走到头绕回去，正反两个方向都要对。
-        assert_eq!(step_skin(Skin::Pixel, 1), Skin::Abacus);
-        assert_eq!(step_skin(Skin::Lens, 1), Skin::Latte);
-        assert_eq!(step_skin(Skin::Latte, 1), Skin::Pixel);
-        assert_eq!(step_skin(Skin::Pixel, -1), Skin::Latte);
-        // 六只一轮回：连按六次回到原样，不会越界 panic。
-        let mut s = Skin::Pixel;
-        for _ in 0..6 {
-            s = step_skin(s, 1);
-        }
-        assert_eq!(s, Skin::Pixel);
-    }
-
-    #[test]
-    fn device_hint_points_at_the_real_cause() {
-        // 连不上最常见的原因是设备断网休眠，提示里必须给出「联网保持」这条出路，
-        // 否则日志只有「没有发现可用设备」，用户会去查 IP 和路由器。
-        let offline: anyhow::Error = zectrix_sdk::Error::NoDevice.into();
-        assert!(device_hint(&offline).unwrap().contains("联网保持"));
-        let busy: anyhow::Error = zectrix_sdk::Error::Busy.into();
-        assert!(device_hint(&busy).unwrap().contains("8 秒"));
-        // 别的错误不硬套建议，免得把人带偏。
-        let other = anyhow::anyhow!("图像无效");
-        assert!(device_hint(&other).is_none());
-    }
-
-    #[test]
-    fn old_state_without_skin_defaults_to_pixel() {
-        // v0.1.6 及更早的 state.json 没有 pet_skin：升级后必须还是像素喵。
+    fn legacy_skin_and_animation_fields_are_ignored() {
+        // 0.8.0 删掉了造型与动画：旧 state.json 里的这些键必须按未知字段静默
+        // 忽略，升级后照样能读出目标地址、音量等真正还在的字段。
         let old = r#"{"model":{"settings":{"follow_enabled":true,"animation":true,
-            "stale_minutes":15,"sound_enabled":true,"volume":90}},
+            "pet_skin":"astro","stale_minutes":15,"sound_enabled":true,"volume":90}},
             "target":"192.168.50.123","format":"gray16"}"#;
         let store: Store = serde_json::from_str(old).unwrap();
-        assert_eq!(store.model.settings.pet_skin, "pixel");
         assert_eq!(store.target.as_deref(), Some("192.168.50.123"));
+        assert_eq!(store.model.settings.volume, 90);
+        assert!(store.model.settings.follow_enabled);
     }
-
-    #[test]
-    fn skin_survives_a_round_trip() {
-        let mut store = Store::default();
-        store.model.settings.pet_skin = "astro".into();
-        let bytes = serde_json::to_vec(&store).unwrap();
-        // state.json 只是状态缓存：里面只有快照，不该再出现任何「显式写入」标记。
-        assert!(!String::from_utf8_lossy(&bytes).contains("skin_explicit"));
-        assert!(!String::from_utf8_lossy(&bytes).contains("settings_explicit"));
-        let back: Store = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.model.settings.pet_skin, "astro");
-    }
-
     #[test]
     fn onoff_parser_accepts_common_forms() {
         for v in ["on", "ON", "true", "1", "yes", "开"] {
@@ -4771,8 +4257,7 @@ mod tests {
         assert_eq!(store.model.settings.volume, 90, "坏 volume 不能改动音量");
         assert_eq!(store.target.as_deref(), Some("192.168.1.9"));
         assert_eq!(store.format, "mono", "坏 format 不能改动屏幕格式");
-        assert!(!store.model.settings.animation);
-        assert_eq!(store.model.settings.refresh_secs, 120);
+        assert_eq!(store.model.settings.refresh_secs, 120, "mode=minimal → 120 秒节流");
 
         // 整体 JSON 语法错：另存 .corrupt-<ts> 并忽略整份配置。
         let bad = dir.path().join("pet-config-bad.json");
@@ -4795,8 +4280,9 @@ mod tests {
         let dir = TempDir::new("single-source");
         let pet = dir.path().join("pet-config.json");
         let state = dir.path().join("state.json");
-        // state.json 里还留着旧快照（音量 12、跟随关、造型 astro、标题来源 prompt）。
-        // pet-config 只写了音量与跟随：其余字段必须回落到 Rust 默认值，不能拿快照补。
+        // state.json 里还留着旧快照（音量 12、跟随关、animation/pet_skin 这类
+        // 已删除的字段、标题来源 prompt）。pet-config 只写了音量与跟随：其余字段
+        // 必须回落到 Rust 默认值，不能拿快照补；已删除的字段静默忽略。
         std::fs::write(
             &state,
             br#"{"model":{"cache_version":3,"settings":{"follow_enabled":false,
@@ -4815,9 +4301,7 @@ mod tests {
         assert!(s.follow_enabled);
         assert!(s.sound_enabled, "配置里没写的字段回落到 Rust 默认，而不是 state.json");
         assert_eq!(s.stale_minutes, 15);
-        assert!(s.animation);
         assert_eq!(s.refresh_secs, 0);
-        assert_eq!(s.pet_skin, "pixel");
         assert_eq!(s.title_source, TitleSource::Session);
         // 配置里没有 target/format：沿用运行时状态，不能被清空。
         assert_eq!(store.format, "gray16");
@@ -4854,8 +4338,7 @@ mod tests {
         let s = &store.model.settings;
         assert_eq!(s.volume, 33, "CLI 写的音量不能被插件保存吞掉");
         assert_eq!(s.title_source, TitleSource::Prompt);
-        assert!(!s.animation, "插件写的 mode 生效");
-        assert_eq!(s.refresh_secs, 30);
+        assert_eq!(s.refresh_secs, 30, "插件写的 mode 生效");
     }
 
     #[test]
@@ -5255,7 +4738,7 @@ mod tests {
 
         let started = Instant::now();
         for _ in 0..rounds {
-            let scene = layout::draw(&model, now(), 0);
+            let scene = layout::draw(&model, now());
             std::hint::black_box(scene_value_signature(std::hint::black_box(&scene)));
         }
         let draw_ms = per(started);

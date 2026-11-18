@@ -130,7 +130,6 @@ impl Task {
 #[serde(default)]
 pub struct Settings {
     pub follow_enabled: bool,
-    pub animation: bool,
     pub stale_minutes: u32,
     pub sound_enabled: bool,
     pub volume: u8,
@@ -140,31 +139,21 @@ pub struct Settings {
     /// 状态切换（工作/等待/完成/出错）仍然立刻上屏，只有细节变化要等这个间隔。
     #[serde(default)]
     pub refresh_secs: u32,
-    /// 当前 Buddy 造型 id（sprite::Skin）。老 state.json 没这个字段，
-    /// `default_pet_skin` 让它退回像素喵，升级不会把画面换成别的猫。
-    #[serde(default = "default_pet_skin")]
-    pub pet_skin: String,
     /// 任务标题来源。默认 `session`，老 state.json 没这个字段时也按它处理。
     #[serde(default)]
     pub title_source: TitleSource,
-}
-
-fn default_pet_skin() -> String {
-    "pixel".into()
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             follow_enabled: true,
-            animation: true,
             stale_minutes: 15,
             sound_enabled: true,
             volume: 90,
             // 默认不节流，保持原有「跟着 Agent 实时动」的行为；嫌闪的人用
-            // `dsh-pet set --calm on` 一键切成安静模式（关动画 + 30 秒节流）。
+            // `dsh-pet set --calm on` 一键切成安静模式（30 秒节流）。
             refresh_secs: 0,
-            pet_skin: default_pet_skin(),
             title_source: TitleSource::Session,
         }
     }
@@ -328,7 +317,7 @@ impl Model {
         if self.cache_version >= 3 {
             return false;
         }
-        self.tasks.retain(|t| t.source != "dsh" && t.source != "dsh");
+        self.tasks.retain(|t| t.source != "dsh");
         self.cache_version = 3;
         true
     }
