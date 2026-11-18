@@ -567,30 +567,73 @@ pub(crate) fn usage() {
 /// 把 state.json 里每条任务的 title 换成 `session-<短号>`（没有会话 id 的用
 /// `task-<序号>`），并清空 announced 指纹。旧版本曾把提示词首行当标题写进
 /// state.json，升级后这些历史值不会自己消失，需要这条命令手动抹一次。
+///
+/// 净化后的状态直接覆盖 state.json（不滚 `state.bak.json`），随后删掉可能
+/// 残留旧标题的备份、损坏现场、恢复文件与 `watch.log`。状态文件曾损坏时仍
+/// 遵守降级保护：只写 `state.recovered.json`，不覆盖、也不销毁损坏现场。
 pub(crate) fn cmd_forget_titles() -> Result<()> {
-    let path = state_path();
+    forget_titles_at(&state_path())
+}
+
+pub(crate) fn forget_titles_at(path: &Path) -> Result<()> {
+    let mut degraded = false;
     if !path.exists() {
         println!("没有已保存的状态。");
-        return Ok(());
-    }
-    let mut store = load_store_at(&path);
-    let replaced = scrub_task_titles(&mut store.model);
-    let fingerprints = store.announced.len();
-    store.announced.clear();
-    store.announced_at = now().max(1);
-    save_store_at(&path, &store)?;
-    if store.degraded {
+    } else {
+        let mut store = load_store_at(path);
+        let replaced = scrub_task_titles(&mut store.model);
+        let fingerprints = store.announced.len();
+        store.announced.clear();
+        store.announced_at = now().max(1);
+        save_store_at_no_backup(path, &store)?;
+        degraded = store.degraded;
+        if degraded {
+            println!(
+                "[清理] 状态文件曾损坏：已写 {}，损坏现场与恢复文件保持不变（不覆盖 state.json）。",
+                sibling_json(path, "recovered").display()
+            );
+        }
         println!(
-            "[清理] 状态文件曾损坏：已写 {}，原 state.json 保持不变。",
-            sibling_json(&path, "recovered").display()
+            "[清理] 标题已替换 {replaced} 条（无会话 id 用 task-<序号>），清空提醒指纹 {fingerprints} 条：{}",
+            path.display()
         );
     }
-    println!(
-        "[清理] 标题已替换 {replaced} 条（无会话 id 用 task-<序号>），清空提醒指纹 {fingerprints} 条：{}",
-        path.display()
-    );
+    cleanup_forget_leftovers(path, degraded);
     println!("提示：pet.log / 设备上的旧画面属于历史输出，不会被这条命令改写。");
     Ok(())
+}
+
+/// `forget` 无参数：删掉整份 state.json，并清理同一批旁路文件。
+pub(crate) fn forget_all_at(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => println!("已删除 {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("没有已保存的状态。"),
+        Err(e) => eprintln!("删除失败: {e}"),
+    }
+    cleanup_forget_leftovers(path, false);
+}
+
+/// 删除 forget 的旁路文件并逐项输出。降级时保留损坏现场与恢复文件：
+/// 它们是 T3 的恢复依据，销毁比留着更糟。
+fn cleanup_forget_leftovers(path: &Path, keep_evidence: bool) {
+    for leftover in forget_leftovers(path) {
+        let name = leftover
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if keep_evidence && (name.contains(".corrupt-") || name.ends_with(".recovered.json")) {
+            println!(
+                "[清理] 保留 {}（降级保护：不销毁损坏现场）",
+                leftover.display()
+            );
+            continue;
+        }
+        match std::fs::remove_file(&leftover) {
+            Ok(()) => println!("已删除 {}", leftover.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("[清理] 删除 {} 失败（忽略）: {e}", leftover.display()),
+        }
+    }
 }
 
 pub(crate) async fn dispatch(args: Args) -> Result<()> {
@@ -672,14 +715,7 @@ pub(crate) async fn dispatch(args: Args) -> Result<()> {
             if args.has("titles") {
                 return cmd_forget_titles();
             }
-            let path = state_path();
-            match std::fs::remove_file(&path) {
-                Ok(()) => println!("已删除 {}", path.display()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    println!("没有已保存的状态。")
-                }
-                Err(e) => eprintln!("删除失败: {e}"),
-            }
+            forget_all_at(&state_path());
             Ok(())
         }
         _ => {

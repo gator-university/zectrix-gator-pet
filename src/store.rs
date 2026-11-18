@@ -237,6 +237,46 @@ pub(crate) fn sibling_json(path: &Path, role: &str) -> PathBuf {
     path.with_file_name(format!("{stem}.{role}.json"))
 }
 
+/// `forget` 需要一并清理的旁路文件：上一版备份、损坏现场（可能有多份）、
+/// 降级恢复文件、守护日志。只返回实际存在的路径，顺序稳定（备份→恢复→日志→损坏）。
+pub(crate) fn forget_leftovers(path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for candidate in [
+        sibling_json(path, "bak"),
+        sibling_json(path, "recovered"),
+        path.with_file_name("watch.log"),
+    ] {
+        if candidate.exists() {
+            out.push(candidate);
+        }
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".into());
+    let prefix = format!("{stem}.corrupt-");
+    if let Some(parent) = path.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let mut corrupt: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| {
+                            let n = n.to_string_lossy();
+                            n.starts_with(&prefix) && n.ends_with(".json")
+                        })
+                        .unwrap_or(false)
+                })
+                .filter(|p| p.exists())
+                .collect();
+            corrupt.sort();
+            out.extend(corrupt);
+        }
+    }
+    out
+}
+
 /// 同目录 tmp → `sync_all` → rename 覆盖。Windows 下目标被杀软/索引/别的进程
 /// 短暂占用时 rename 会失败，此时回退 copy + remove，保证内容仍然落盘。
 pub(crate) fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -328,6 +368,17 @@ pub(crate) fn load_store_at(path: &Path) -> Store {
 /// - 降级（内存里 `degraded`，或磁盘上这份解析不了）：绝不覆盖已有 state.json，
 ///   只写 `state.recovered.json` 留给用户手工恢复。
 pub(crate) fn save_store_at(path: &Path, store: &Store) -> Result<()> {
+    save_store_at_inner(path, store, true)
+}
+
+/// 与 [`save_store_at`] 相同，但 `backup=false` 时不把旧版滚成 `state.bak.json`。
+///
+/// `forget --titles` 专用：旧 state 里正是要抹掉的标题，滚成备份等于没清理。
+pub(crate) fn save_store_at_no_backup(path: &Path, store: &Store) -> Result<()> {
+    save_store_at_inner(path, store, false)
+}
+
+fn save_store_at_inner(path: &Path, store: &Store, backup: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -397,8 +448,8 @@ pub(crate) fn save_store_at(path: &Path, store: &Store) -> Result<()> {
     WARNED.store(false, Ordering::Relaxed);
 
     // 每次成功保存前把现有 state.json 留成上一版（单份滚动）。备份失败只影响
-    // 后悔药，不能挡住主保存。
-    if path.exists() {
+    // 后悔药，不能挡住主保存。`forget --titles` 走 no_backup，避免旧标题留在备份里。
+    if backup && path.exists() {
         let bak = sibling_json(path, "bak");
         match std::fs::copy(path, &bak) {
             Ok(_) => {

@@ -670,6 +670,111 @@ fn forget_titles_scrubs_existing_tasks() {
 }
 
 #[test]
+fn forget_titles_removes_leftovers_that_hold_old_titles() {
+    let dir = TempDir::new("forget-titles");
+    let path = dir.path().join("state.json");
+
+    let mut model = Model::default();
+    model.cache_version = 3; // 跳过迁移：加载时不会把 dsh 任务清掉
+    let mut with_session = event(1, Status::Working);
+    with_session.thread_id = Some("session-aaaa-bbbbcccc".into());
+    with_session.title = "机密：客户数据库口令".into();
+    model.apply(with_session, "dsh", 100).unwrap();
+    let mut store = Store::default();
+    store.model = model;
+    assert_eq!(store.model.tasks.len(), 1, "夹具任务应进入 model");
+    save_store_at(&path, &store).unwrap();
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("机密"),
+        "保存后的 state.json 应含待清理标题"
+    );
+
+    // 历史版本留下的旁路文件：每份都可能带着要抹掉的标题。
+    std::fs::write(dir.path().join("state.bak.json"), "机密：客户数据库口令").unwrap();
+    std::fs::write(
+        dir.path().join("state.corrupt-1700000000.json"),
+        r#"{"title":"机密：客户数据库口令"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("state.recovered.json"), "机密：客户数据库口令").unwrap();
+    std::fs::write(dir.path().join("watch.log"), "[花絮] 机密：客户数据库口令").unwrap();
+
+    forget_titles_at(&path).unwrap();
+
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !saved.contains("机密") && !saved.contains("数据库"),
+        "净化后 state.json 不得残留旧标题：{saved}"
+    );
+    assert!(saved.contains("session-aaaa"), "应换成 session-短号：{saved}");
+    for leftover in [
+        "state.bak.json",
+        "state.recovered.json",
+        "state.corrupt-1700000000.json",
+        "watch.log",
+    ] {
+        assert!(
+            !dir.path().join(leftover).exists(),
+            "{leftover} 可能带着旧标题，forget --titles 后必须不存在"
+        );
+    }
+}
+
+#[test]
+fn forget_titles_keeps_corrupt_evidence_when_degraded() {
+    // T3：损坏的 state.json 不得被覆盖，也不该被 forget 顺手销毁。
+    let dir = TempDir::new("forget-degraded");
+    let path = dir.path().join("state.json");
+    std::fs::write(&path, "{\"bad\": \"机密：客户数据库口令\"").unwrap();
+    std::fs::write(dir.path().join("state.bak.json"), "机密：旧标题").unwrap();
+
+    forget_titles_at(&path).unwrap();
+
+    assert!(!path.exists(), "降级时不得重建 state.json");
+    let corrupt: Vec<String> = names_in(dir.path())
+        .into_iter()
+        .filter(|n| n.starts_with("state.corrupt-"))
+        .collect();
+    assert_eq!(corrupt.len(), 1, "损坏现场必须保留：{corrupt:?}");
+    assert!(
+        std::fs::read_to_string(dir.path().join(&corrupt[0]))
+            .unwrap()
+            .contains("机密"),
+        "损坏现场应原样保留，便于手工恢复"
+    );
+    assert!(
+        dir.path().join("state.recovered.json").is_file(),
+        "降级时净化结果写 recovered"
+    );
+    assert!(
+        !dir.path().join("state.bak.json").exists(),
+        "备份可能带旧标题，仍应清掉"
+    );
+}
+
+#[test]
+fn forget_all_removes_state_and_leftovers() {
+    let dir = TempDir::new("forget-all");
+    let path = dir.path().join("state.json");
+    let mut store = Store::default();
+    store.target = Some("10.0.0.9".into());
+    save_store_at(&path, &store).unwrap();
+    std::fs::write(dir.path().join("state.bak.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("state.corrupt-1700000000.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("state.recovered.json"), "{}").unwrap();
+    std::fs::write(dir.path().join("watch.log"), "log").unwrap();
+
+    forget_all_at(&path);
+
+    let leftovers: Vec<String> = names_in(dir.path())
+        .into_iter()
+        .filter(|n| n != "state.lock")
+        .filter(|n| n.starts_with("state.") || n == "watch.log")
+        .collect();
+    assert!(leftovers.is_empty(), "forget 后不得留任何状态旁路文件：{leftovers:?}");
+}
+
+#[test]
 fn recording_expiry_fires_after_ten_seconds() {
     let started = Instant::now();
     assert!(
