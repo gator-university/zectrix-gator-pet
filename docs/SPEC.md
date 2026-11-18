@@ -286,8 +286,8 @@
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
 - 性能目标：单帧元素上限从 220 提到 **400**（90×120 素材的贪心矩形比 30×40 多；实测单帧 245–280 个场景元素 = 素材 208–274 个矩形 + 版式约 10，见 `src/layout.rs` 的 `layouts_obey_hub_limits`，上限 400；再高应简化素材而不是拆动作）。
 
-**FR-VER-03 真机**：关键页面推送到设备后由用户拍照确认。
-- 状态：待验证（已有实时推送日志与用户可见画面；照片待用户补）。
+**FR-VER-03 真机**：关键页面推送到设备后由用户确认。
+- 状态：已验收（2026-11-18 用户在真机运行 0.8.0 后确认：启动/跟随/多任务/完成停留/断线重连均正常；照片如需入库可后续补到 `docs/screens/`）。
 
 **FR-VER-04 诊断命令保留**：`check`/`push`/`preview`/`sessions`/`set`/`sound`/`where`/`forget`；
 `watch`/`run` 支持 `--verbose`（状态行附加标题）；`forget --titles` 只做隐私清理
@@ -302,4 +302,3 @@
   `voice`/`skin` 命令、`pet_skin`/`animation` 设置项与相关模块全部删除；旧
   `pet-config.json`/`state.json` 里残留的 `pet_skin`、`animation` 键按未知字段静默忽略。
 - 设置页需重启 DSH 后才可见（client bundle 在启动时加载）。
-- FR-VER-03 真机照片待用户补。
