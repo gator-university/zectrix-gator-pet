@@ -56,6 +56,23 @@ const IMPORT_WINDOW: i64 = 12 * 3600;
 const DONE_SETTLE: i64 = 8;
 /// zstd 帧魔数（小端 0xFD2FB528）。
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// 单次解压输出的硬上限。日志是逐帧追加的，正常帧只有几十 KB；这个上限只
+/// 用来挡住「高压缩比 / 恶意构造」的帧把内存打爆，超出部分直接截断。
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `decode_all_frames` 最多消费的帧数：再多的历史日志也不值得整份解开。
+const MAX_FRAMES: usize = 4096;
+
+/// 截断只警告一次：守护每拍都可能重读，刷日志没有意义。
+static DECODE_TRUNCATED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn warn_decode_truncated() {
+    if !DECODE_TRUNCATED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[dsh] 会话日志过大，解压结果已截断（单次上限 64MB / 4096 帧）");
+    }
+}
 /// 尾巴连续多少拍解不开就跳过：正常追加每拍都会增长；连续不动还解不开，
 /// 说明写进程崩在半帧上，后面的帧必须靠跳过它才能接上。
 const STALL_SKIP: u32 = 3;
@@ -597,15 +614,39 @@ fn find_magic(buf: &[u8], from: usize) -> Option<usize> {
 pub fn decode_all_frames(buf: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut pos = 0;
+    let mut frames = 0usize;
     while pos < buf.len() {
+        if frames >= MAX_FRAMES || out.len() as u64 >= MAX_DECODED_BYTES {
+            warn_decode_truncated();
+            break;
+        }
         let (chunk, used) = decode_frames(&buf[pos..]);
         if used == 0 {
             break;
         }
+        let room = (MAX_DECODED_BYTES as usize).saturating_sub(out.len());
+        if chunk.len() > room {
+            out.extend_from_slice(&chunk[..room]);
+            warn_decode_truncated();
+            break;
+        }
         out.extend_from_slice(&chunk);
         pos += used;
+        frames += 1;
     }
     out
+}
+
+/// 解一段（可能含多帧的）zstd 数据，最多取 `cap` 字节输出。
+///
+/// 用 `Read::take` 而不是先 `decode_all` 再截：后者会先把完整输出分配出来，
+/// 高压缩比日志（1MB 压缩 → 几 GB 明文）足以把进程打爆。输入不完整时仍然
+/// 返回 `Err`，让 `decode_frames` 继续往前退候选。
+fn decode_capped(bytes: &[u8], cap: u64) -> std::io::Result<Vec<u8>> {
+    let decoder = zstd::Decoder::new(IoCursor::new(bytes))?;
+    let mut out = Vec::new();
+    decoder.take(cap).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// 解出 `buf` 里**完整** zstd 帧的内容，返回拼接后的字节与已消费长度。
@@ -637,7 +678,10 @@ fn decode_frames(buf: &[u8]) -> (Vec<u8>, usize) {
         if end <= start {
             break;
         }
-        if let Ok(decoded) = zstd::decode_all(IoCursor::new(&buf[start..end])) {
+        if let Ok(decoded) = decode_capped(&buf[start..end], MAX_DECODED_BYTES) {
+            if decoded.len() as u64 >= MAX_DECODED_BYTES {
+                warn_decode_truncated();
+            }
             return (decoded, end);
         }
     }
@@ -1436,6 +1480,39 @@ mod tests {
         let evs = w.scan().unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].0.status, Status::Working);
+    }
+
+    #[test]
+    fn decode_capped_returns_decoded_prefix_without_panicking() {
+        // 小输入正常解出全部内容。
+        let text = "hello 世界 ".repeat(200);
+        let frame = zstd::encode_all(text.as_bytes(), 3).unwrap();
+        let decoded = decode_capped(&frame, MAX_DECODED_BYTES).unwrap();
+        assert_eq!(decoded, text.as_bytes());
+
+        // 超限只返回已解出的前缀，不 panic（上限用 1KB 模拟 64MB 的截断）。
+        let big = vec![b'a'; 8192];
+        let frame = zstd::encode_all(&big[..], 3).unwrap();
+        let decoded = decode_capped(&frame, 1024).unwrap();
+        assert_eq!(decoded.len(), 1024, "超限只返回已解部分");
+        assert!(decoded.iter().all(|b| *b == b'a'));
+
+        // 非 zstd 字节返回 Err，交给 decode_frames 继续退候选。
+        assert!(decode_capped(b"not a zstd frame", 1024).is_err());
+    }
+
+    #[test]
+    fn decode_all_frames_roundtrips_many_small_frames() {
+        let mut buf = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..8 {
+            let text = format!("{{\"type\":\"turn/start\",\"seq\":{i}}}\n");
+            buf.extend(zstd::encode_all(text.as_bytes(), 3).unwrap());
+            expected.extend_from_slice(text.as_bytes());
+        }
+        assert_eq!(decode_all_frames(&buf), expected);
+        assert!(decode_all_frames(&[]).is_empty());
+        assert!(decode_all_frames(b"garbage").is_empty());
     }
 
     #[test]

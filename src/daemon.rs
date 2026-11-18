@@ -1196,7 +1196,8 @@ pub(crate) async fn push_if_changed(
     // 只读缓存：这里做任何 UIA 调用都会把推送拖慢到 1.5 秒级。
     if let Some(quip) = quips.cached() {
         if model.set_live_quip(&quip) {
-            println!("[花絮] {quip}");
+            // 花絮原文可能是界面上的命令/路径片段：只记固定文本，原文不落 pet.log。
+            println!("[花絮] 界面状态行已更新（原文不上屏、不落日志）");
             store.model = model.clone();
             if let Err(e) = save_store(store) {
                 eprintln!("配置保存失败: {e}");

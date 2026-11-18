@@ -854,6 +854,34 @@ fn team_scan_prune_drops_stale_and_missing() {
     );
 }
 
+/// 超大子会话日志不整份读进内存：只 stat 后跳过，且每个文件只警告一次。
+#[test]
+fn team_scan_skips_oversized_logs_and_warns_once() {
+    let dir = TempDir::new("team-oversize");
+    let path = dir.path().join("huge.jsonl.zstd");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(TEAM_MAX_LOG_BYTES + 1).unwrap();
+    drop(f);
+    let meta = std::fs::metadata(&path).unwrap();
+
+    let mut scan = TeamScan::default();
+    scan.touch(&path, meta.len(), mtime_secs(&meta));
+
+    assert!(
+        !scan.files.contains_key(&path),
+        "超限日志不应被读入或缓存"
+    );
+    assert!(
+        scan.warned_oversize.contains(&path),
+        "超限文件要记一次警告，供后续去重"
+    );
+
+    // 再扫一次仍然跳过，但不改变已记录的状态（不会反复读、反复警告）。
+    scan.touch(&path, meta.len(), mtime_secs(&meta));
+    assert!(!scan.files.contains_key(&path));
+    assert_eq!(scan.warned_oversize.len(), 1);
+}
+
 /// 签名只依赖内容：同样内容同签名，坐标/文本/元素数量变了都要换签名，
 /// 否则「没变就不推」会把真实变化吞掉。
 #[test]

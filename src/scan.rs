@@ -21,12 +21,18 @@ pub(crate) const TEAM_STALE_SECS: i64 = 12 * 3600;
 /// busy 溯源的最大层数（agent team 可能多层嵌套）。
 pub(crate) const TEAM_MAX_DEPTH: usize = 8;
 
+/// 单个子会话日志的读取上限。超过就整份跳过：32MB 压缩日志解出来可能是
+/// 几百 MB，扫描线程不该为此吃满内存。文件回落到上限以内会重新开始跟踪。
+pub(crate) const TEAM_MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct TeamScan {
     /// 子日志路径 → (文件长度, mtime 秒, parentSession, 是否还有未结束回合)
     pub(crate) files: std::collections::HashMap<std::path::PathBuf, (u64, i64, Option<String>, bool)>,
     pub(crate) last_full_scan: Option<std::time::Instant>,
     pub(crate) busy: std::collections::HashMap<String, i64>,
+    /// 已经警告过「文件过大」的路径：每个文件只提醒一次，别每 2 秒刷屏。
+    pub(crate) warned_oversize: std::collections::HashSet<std::path::PathBuf>,
 }
 
 impl TeamScan {
@@ -59,6 +65,19 @@ impl TeamScan {
     /// 记录一个子会话日志的当前状态；长度/mtime 变了才解压。读失败保持旧值，
     /// 下一轮再试（文件可能正被写进程 rename，读到半份不值得缓存）。
     pub(crate) fn touch(&mut self, path: &Path, len: u64, mtime: i64) {
+        // 读之前先看长度：`fs::read` 会把整份文件装进内存，32MB 的压缩日志
+        // 解压后可能几百 MB。超限就丢掉旧缓存并跳过（不缓存错误状态）。
+        if len > TEAM_MAX_LOG_BYTES {
+            self.files.remove(path);
+            if self.warned_oversize.insert(path.to_path_buf()) {
+                eprintln!(
+                    "[scan] 子会话日志超过 {}MB，跳过（只影响 busy 判定）：{}",
+                    TEAM_MAX_LOG_BYTES / 1024 / 1024,
+                    path.display()
+                );
+            }
+            return;
+        }
         let entry = self
             .files
             .entry(path.to_path_buf())
