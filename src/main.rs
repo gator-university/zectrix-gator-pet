@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 use dsh_pet::{
     device, layout,
-    model::{Event as TaskEvent, Model, Status, Task},
+    model::{Event as TaskEvent, Model, Status, Task, TitleSource},
     raster::{self, Fonts},
     sound,
     sprite::Skin,
@@ -747,6 +747,8 @@ struct PetConfig {
     refresh_secs: Option<u32>,
     animation: Option<bool>,
     stale_minutes: Option<u32>,
+    /// 标题来源：session（默认，只读 session/title）/ prompt（显式 opt-in）。
+    title_source: Option<TitleSource>,
 }
 
 /// 插件设置页可选的四种模式（含中文别名）。
@@ -878,6 +880,10 @@ fn load_pet_config_at(path: &Path) -> Option<PetConfig> {
         refresh_secs: pet_u32_field(obj, "refresh_secs", 0, 3600, &mut warnings),
         animation: pet_bool_field(obj, "animation", &mut warnings),
         stale_minutes: pet_u32_field(obj, "stale_minutes", 1, 1440, &mut warnings),
+        title_source: pet_str_field(obj, "title_source", &mut warnings, |s| {
+            TitleSource::parse(s).is_some()
+        })
+        .and_then(|s| TitleSource::parse(&s)),
     };
     // 空字符串 = 没设过，静默忽略；非字符串才算非法。
     if let Some(value) = obj.get("target") {
@@ -930,6 +936,12 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
             changed = true;
         }
     }
+    if let Some(v) = c.title_source {
+        if s.title_source != v {
+            s.title_source = v;
+            changed = true;
+        }
+    }
     if let Some(mode) = c.mode.as_deref() {
         let (animation, refresh) = match mode {
             "realtime" | "实时" => (true, 0),
@@ -972,7 +984,7 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
     }
     if changed {
         println!(
-            "[配置] 插件配置已生效：follow={} 模式={} 音量={} 目标={} 格式={}",
+            "[配置] 插件配置已生效：follow={} 模式={} 音量={} 目标={} 格式={} 标题来源={}",
             s.follow_enabled,
             match (s.animation, s.refresh_secs) {
                 (true, 0) => "实时",
@@ -982,7 +994,8 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
             },
             s.volume,
             store.target.as_deref().unwrap_or("自动发现"),
-            store.format
+            store.format,
+            s.title_source.as_str(),
         );
     }
     changed
@@ -998,7 +1011,8 @@ fn refresh_settings(model: &mut Model) -> bool {
         || model.settings.volume != s.volume
         || model.settings.animation != s.animation
         || model.settings.stale_minutes != s.stale_minutes
-        || model.settings.refresh_secs != s.refresh_secs;
+        || model.settings.refresh_secs != s.refresh_secs
+        || model.settings.title_source != s.title_source;
     if changed {
         model.settings.follow_enabled = s.follow_enabled;
         model.settings.sound_enabled = s.sound_enabled;
@@ -1006,6 +1020,7 @@ fn refresh_settings(model: &mut Model) -> bool {
         model.settings.animation = s.animation;
         model.settings.stale_minutes = s.stale_minutes;
         model.settings.refresh_secs = s.refresh_secs;
+        model.settings.title_source = s.title_source;
     }
     changed
 }
@@ -1183,7 +1198,17 @@ fn load_store_at(path: &Path) -> Store {
     };
     // 缓存版本过旧时重建跟随任务；此前从未调用过迁移，旧的序号式轮次 ID
     // 会一直留在缓存里挡住新事件。
-    if store.model.migrate_cache() {
+    let cache_migrated = store.model.migrate_cache();
+    // 旧版 announced 存的是「任务 key|状态|60 字文案」，可能含提示词正文。
+    // 只保留新格式（sha256 前 16 位），其余一律清掉；用新的 announced_at
+    // 保证 save_store_at 的按时间合并不会把旧条目从磁盘捞回来。
+    let before = store.announced.len();
+    store.announced.retain(|sig| sound::is_notice_hash(sig));
+    let announced_migrated = store.announced.len() != before;
+    if announced_migrated {
+        store.announced_at = now().max(1);
+    }
+    if cache_migrated || announced_migrated {
         // 降级时这只写 state.recovered.json，不会覆盖损坏的 state.json。
         let _ = save_store_at(path, &store);
     }
@@ -1477,6 +1502,8 @@ fn parse_status(value: &str) -> Result<Option<Status>> {    Ok(match value.trim(
 }
 
 fn scan_into(model: &mut Model, watcher: &mut Watcher) -> (Vec<TaskEvent>, bool) {
+    // 设置每拍都可能被 `set` / 插件配置改掉：扫描前同步，prompt 模式才读正文。
+    watcher.use_prompt_titles(model.settings.title_source == TitleSource::Prompt);
     let mut applied = vec![];
     match watcher.scan() {
         Ok(events) => {
@@ -1595,14 +1622,60 @@ fn may_release(model: &Model, at: i64, grace: i64) -> bool {
     !should_hold(model, at, grace)
 }
 
+/// 状态行里的会话短号：`session-<前 8 位>`，不含标题或提问正文。
+/// 没有 thread_id 时从 task_id 去掉轮次后缀再取前 8 位；都没有就用 task。
+fn short_session(thread: Option<&str>) -> Option<String> {
+    let raw = thread?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let core = raw.strip_prefix("session-").unwrap_or(raw);
+    // 会话 id 常见形态 `session-<uuid>`：取 uuid 第一段（最多 8 位）当短号。
+    let short: String = core.chars().take_while(|c| *c != '-').take(8).collect();
+    if short.is_empty() {
+        return None;
+    }
+    Some(format!("session-{short}"))
+}
+
+fn short_task_ref(ev: &TaskEvent) -> String {
+    short_session(ev.thread_id.as_deref())
+        .or_else(|| {
+            let base = ev
+                .task_id
+                .rsplit_once("-t")
+                .map(|(b, _)| b)
+                .unwrap_or(&ev.task_id);
+            short_session(Some(base))
+        })
+        .unwrap_or_else(|| "task".to_string())
+}
+
+/// 把已有任务的标题抹成不含正文的短号，返回实际替换条数。
+/// `forget --titles` 与测试共用这一份规则。
+fn scrub_task_titles(model: &mut Model) -> usize {
+    let mut replaced = 0usize;
+    for (i, t) in model.tasks.iter_mut().enumerate() {
+        let label = short_session(t.event.thread_id.as_deref())
+            .unwrap_or_else(|| format!("task-{}", i + 1));
+        if t.event.title != label {
+            t.event.title = label;
+            replaced += 1;
+        }
+    }
+    replaced
+}
+
 /// 扫描一次会话：只有真实状态变化才落盘、打日志、响提示音。
-/// `allow_chime` 用于抑制首次导入历史时的一串提示音。
+/// `allow_chime` 用于抑制首次导入历史时的一串提示音；`verbose` 决定状态行
+/// 是否附带标题（默认只记 `session-短号` + 状态词）。
 async fn scan_and_report(
     model: &mut Model,
     watcher: &mut Watcher,
     store: &mut Store,
     dev: &Device,
     allow_chime: bool,
+    verbose: bool,
 ) -> bool {
     let before: Vec<(String, Option<Status>)> = model
         .tasks
@@ -1622,15 +1695,23 @@ async fn scan_and_report(
             .iter()
             .find(|(id, _)| *id == ev.task_id)
             .and_then(|(_, s)| *s);
-        println!(
-            "[状态] {} · {} → {}{}",
-            ev.title,
-            ev.task_id,
-            ev.status.label(),
-            ev.progress
-                .map(|p| format!("（清单 {p}%）"))
-                .unwrap_or_default()
-        );
+        let progress = ev
+            .progress
+            .map(|p| format!("（清单 {p}%）"))
+            .unwrap_or_default();
+        if verbose {
+            println!(
+                "[状态] {} · {}{} · 标题：{}",
+                short_task_ref(ev),
+                ev.status.label(),
+                progress,
+                ev.title
+            );
+        } else {
+            // 默认只留会话短号 + 状态词：pet.log 可能被转发/上传，标题可能来自
+            // 提示词首行（prompt 模式）或项目名，不应出现在日志里。
+            println!("[状态] {} · {}", short_task_ref(ev), ev.status.label());
+        }
         // 同一批记录里可能先出现「完成」又立刻回到「工作」（上一轮完成记录
         // 延迟补写的场景），提示音只认每个任务的最终状态，中间态不响铃。
         let is_final = !events[i + 1..].iter().any(|e| e.task_id == ev.task_id);
@@ -1763,11 +1844,11 @@ async fn push_if_changed(
     let show_started = std::time::Instant::now();
     match dev.show_with_format(&png, fmt).await {
         Ok(()) => match model.current(now()) {
+            // 只记状态词，不记标题：stdout 会进 pet.log，可能与 state.json 一起被转发。
             Some(t) => println!(
-                "[{}] 已推送：{} · {}（{:.2}s）",
+                "[{}] 已推送：{}（{:.2}s）",
                 chrono::Local::now().format("%H:%M:%S%.3f"),
                 t.label(),
-                t.event.title,
                 show_started.elapsed().as_secs_f32()
             ),
             None => println!(
@@ -2158,6 +2239,12 @@ fn cmd_set(args: &Args) -> Result<()> {
         store.model.settings.refresh_secs = n;
         touched = true;
     }
+    if let Some(v) = args.get("title-source") {
+        store.model.settings.title_source = TitleSource::parse(v).with_context(|| {
+            format!("--title-source 只能是 session（默认）或 prompt，收到 {v}")
+        })?;
+        touched = true;
+    }
     if let Some(v) = args.get("format") {
         // 只接受 mono / gray4 / gray16；写回统一的名字，守护下一拍热切换。
         let f = device::format(v)?;
@@ -2189,6 +2276,10 @@ fn cmd_set(args: &Args) -> Result<()> {
         }
         println!("陈旧判定：{} 分钟无更新降级为「状态待确认」", s.stale_minutes);
         println!(
+            "标题来源：{}（session = 只读 DSH 会话标题；prompt = 允许把提示词首行写进 state.json / 设备）",
+            s.title_source.as_str()
+        );
+        println!(
             "屏幕格式：{}（mono 刷新最快/最不闪，gray4 折中，gray16 最细腻）",
             store.format
         );
@@ -2201,13 +2292,15 @@ fn cmd_set(args: &Args) -> Result<()> {
         println!("  dsh-pet set --sound off          完全静音");
         println!("  dsh-pet set --volume 20          只把提示音调小");
         println!("  dsh-pet set --follow off         暂停跟随，释放设备");
+        println!("  dsh-pet set --title-source prompt 允许标题取提示词首行（会写入 state.json / 设备）");
+        println!("  dsh-pet set --title-source session 恢复默认：标题只来自 DSH 会话标题");
         return Ok(());
     }
     store.settings_explicit = true;
     save_store(&store)?;
     let s = &store.model.settings;
     println!(
-        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}",
+        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}",
         onoff_label(s.follow_enabled),
         onoff_label(s.sound_enabled),
         s.volume,
@@ -2218,7 +2311,8 @@ fn cmd_set(args: &Args) -> Result<()> {
             format!("{} 秒", s.refresh_secs)
         },
         s.stale_minutes,
-        store.format
+        store.format,
+        s.title_source.as_str()
     );
     println!("守护下一拍生效，不需要重启。");
     Ok(())
@@ -2637,6 +2731,8 @@ async fn cmd_run(args: &Args) -> Result<()> {
     let watch = args.has("exit-with-dsh");
     // 待命模式（守护用）：任务结束就交还设备。手动 `run` 默认一直占着，便于调试。
     let standby = args.has("standby");
+    // 默认状态行不带标题；`--verbose` 才附加，便于排查（可能含提示词首行）。
+    let verbose = args.has("verbose");
     let grace = args
         .get("idle-grace")
         .and_then(|v| v.parse::<u32>().ok())
@@ -2669,7 +2765,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
     // 别在过渡动画中间再推一帧（会叠加成连闪）。
     tokio::time::sleep(Duration::from_millis(1200)).await;
     for _ in 0..4 {
-        scan_and_report(&mut model, &mut watcher, &mut store, &dev, false).await;
+        scan_and_report(&mut model, &mut watcher, &mut store, &dev, false, verbose).await;
         team.sync(&mut model, &dsh_root());
         let sig = card_sig(&model, now());
         let stable = settle_prev.as_ref() == Some(&sig);
@@ -2823,7 +2919,8 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     continue;
                 }
                 // 扫描到变化：先只标记「想刷新」，真正的推送统一走下面的冷却闸门。
-                let changed = scan_and_report(&mut model, &mut watcher, &mut store, &dev, true).await;
+                let changed =
+                    scan_and_report(&mut model, &mut watcher, &mut store, &dev, true, verbose).await;
                 // 子智能体状态也要每拍更新：父会话「已完成」但队友还在跑时，
                 // 主卡应显示「队友在跑」而不是完成（DSH 侧边栏也是这么显示的）。
                 if team.sync(&mut model, &dsh_root()) {
@@ -3324,23 +3421,56 @@ fn usage() {
   dsh-pet sessions                         列出可跟随的本机会话、状态与清单进度
   dsh-pet set     [--sound on|off] [--volume 0-100] [--follow on|off] [--animation on|off]
                   [--refresh 秒] [--calm on|off] [--format mono|gray4|gray16]
+                  [--title-source session|prompt]
                                            查看/修改跟随与刷新设置（2 秒内生效）
   dsh-pet check   [--target IP|ID]         只核对设备，不推画面
   dsh-pet sound   --status waiting|done [--target IP|ID] [--volume 0-100]
                                            只播放一次提示音
   dsh-pet push    [--demo <状态>] [--target IP|ID] [--format mute]
                                            单次推送后立即断开
-  dsh-pet watch   [--watch-pid PID] [--idle-grace 秒]
+  dsh-pet watch   [--watch-pid PID] [--idle-grace 秒] [--verbose]
                                            守护：有任务才占用设备，任务结束 5 分钟无新任务即交还
   dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
                                            语音链路诊断
   dsh-pet where                            显示数据与配置路径
   dsh-pet forget                           删除本机状态缓存
+  dsh-pet forget --titles                  只清理隐私：已有任务标题换成 session-短号，清空提醒指纹
 
 状态：working / waiting / done / error / stopped / unknown / idle
 设备需与电脑同一局域网，并在设备上开启「设置 → 网络同步 → 待机保持 Wi-Fi」。
 "#
     );
+}
+
+/// `forget --titles`：只清理隐私，不删整份状态。
+///
+/// 把 state.json 里每条任务的 title 换成 `session-<短号>`（没有会话 id 的用
+/// `task-<序号>`），并清空 announced 指纹。旧版本曾把提示词首行当标题写进
+/// state.json，升级后这些历史值不会自己消失，需要这条命令手动抹一次。
+fn cmd_forget_titles() -> Result<()> {
+    let path = state_path();
+    if !path.exists() {
+        println!("没有已保存的状态。");
+        return Ok(());
+    }
+    let mut store = load_store_at(&path);
+    let replaced = scrub_task_titles(&mut store.model);
+    let fingerprints = store.announced.len();
+    store.announced.clear();
+    store.announced_at = now().max(1);
+    save_store_at(&path, &store)?;
+    if store.degraded {
+        println!(
+            "[清理] 状态文件曾损坏：已写 {}，原 state.json 保持不变。",
+            sibling_json(&path, "recovered").display()
+        );
+    }
+    println!(
+        "[清理] 标题已替换 {replaced} 条（无会话 id 用 task-<序号>），清空提醒指纹 {fingerprints} 条：{}",
+        path.display()
+    );
+    println!("提示：pet.log / 设备上的旧画面属于历史输出，不会被这条命令改写。");
+    Ok(())
 }
 
 fn main() {
@@ -3439,6 +3569,9 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         "forget" => {
+            if args.has("titles") {
+                return cmd_forget_titles();
+            }
             let path = state_path();
             match std::fs::remove_file(&path) {
                 Ok(()) => println!("已删除 {}", path.display()),
@@ -3955,5 +4088,90 @@ mod tests {
             std::fs::read(dir.path().join(&quarantined[0])).unwrap(),
             b"{bad"
         );
+    }
+
+    #[test]
+    fn title_source_defaults_to_session_and_prompt_is_opt_in() {
+        // 旧 state.json / 旧 pet-config 里没有这个键：必须落回 session。
+        let old: dsh_pet::model::Settings = serde_json::from_str(r#"{"volume":10}"#).unwrap();
+        assert_eq!(old.title_source, TitleSource::Session);
+        assert_eq!(old.title_source.as_str(), "session");
+
+        let opt_in: dsh_pet::model::Settings =
+            serde_json::from_str(r#"{"title_source":"prompt"}"#).unwrap();
+        assert_eq!(opt_in.title_source, TitleSource::Prompt);
+
+        // 大小写与空白由 parse 兜住；非法值不能悄悄落成 prompt。
+        assert_eq!(TitleSource::parse(" PROMPT "), Some(TitleSource::Prompt));
+        assert_eq!(TitleSource::parse("SESSION"), Some(TitleSource::Session));
+        assert_eq!(TitleSource::parse("always"), None);
+
+        // state.json 的完整反序列化路径也走 default。
+        let store: Store =
+            serde_json::from_str(r#"{"model":{"settings":{"volume":20}}}"#).unwrap();
+        assert_eq!(store.model.settings.title_source, TitleSource::Session);
+    }
+
+    #[test]
+    fn load_clears_legacy_announced_entries_and_keeps_hashes() {
+        let dir = TempDir::new("announced");
+        let path = dir.path().join("state.json");
+        let mut store = Store::default();
+        store.model.cache_version = 3;
+        store.announced = vec![
+            "dsh:session-aaaa-t1|w|要部署到哪台机器？".into(),
+            "0123456789abcdef".into(),
+        ];
+        store.announced_at = 1;
+        save_store_at(&path, &store).unwrap();
+
+        let loaded = load_store_at(&path);
+        assert_eq!(
+            loaded.announced,
+            vec!["0123456789abcdef".to_string()],
+            "旧格式（含文案）必须清掉，只留 16 位 sha256"
+        );
+        let disk: Store =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.announced,
+            vec!["0123456789abcdef".to_string()],
+            "迁移结果要落盘"
+        );
+        assert!(
+            disk.announced_at > 1,
+            "用新的 announced_at 防止按时间合并把旧条目捞回来"
+        );
+    }
+
+    #[test]
+    fn forget_titles_scrubs_existing_tasks() {
+        let mut model = Model::default();
+        let mut with_session = event(1, Status::Working);
+        with_session.thread_id = Some("session-aaaa-bbbb-cccc".into());
+        with_session.title = "机密需求：把客户数据库导出到 U 盘".into();
+        model.apply(with_session, "dsh", 100).unwrap();
+
+        let mut legacy = event(2, Status::Working);
+        legacy.task_id = "legacy-1".into();
+        legacy.thread_id = None;
+        legacy.title = "另一个不能留的标题".into();
+        model.apply(legacy, "dsh", 200).unwrap();
+
+        assert_eq!(scrub_task_titles(&mut model), 2);
+        let titles: Vec<&str> = model.tasks.iter().map(|t| t.event.title.as_str()).collect();
+        assert!(
+            titles.iter().any(|t| *t == "session-aaaa"),
+            "有会话 id 的用 session-短号：{titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| t.starts_with("task-")),
+            "没有会话 id 的用 task-<序号>：{titles:?}"
+        );
+        assert!(
+            titles.iter().all(|t| !t.contains("机密") && !t.contains("数据库")),
+            "清理后不得残留正文：{titles:?}"
+        );
+        assert_eq!(scrub_task_titles(&mut model), 0, "再跑一次应是无操作");
     }
 }

@@ -12,7 +12,9 @@
 - 原项目 MIT，Copyright (c) 2026 MuskCheng；本 fork 保留原版权声明，修改部分同 MIT（见 `LICENSE`）。
 - 设备：Zectrix Note 4（400×300 单色，`zectrix-s3-epaper-4.2`），固件 ≥ 3.7.5 才支持本地推送。
 - 设备通道：`zectrix-local-push-sdk` 0.2.0（UDP 32342，局域网直连；本机 mDNS 被防火墙拦，一律用 IP）。
-- DSH 侧只读 `~/.dsh/sessions` 下的会话日志，不写 DSH 数据。
+- DSH 侧只读 `~/.dsh/sessions` 下的会话日志，不写 DSH 数据；默认只读生命周期元数据
+  （状态、`session/title`、token 用量），不读 `user/message` 正文与工具参数正文。
+  `title_source=prompt` 是唯一例外（显式 opt-in，见 FR-DSH-03）。
 
 ## 1. 生命周期（FR-LIFE）
 
@@ -87,16 +89,22 @@
 - 证据：`TeamScan` 扫裸 uuid 子会话日志（`decode_all_frames` + turn 配对 + parentSession 溯源 ≤8 层）；`state.team_busy`；实测推送「子智能体运行中 · 从 handoff 继续用 DeepSeek 完成开发（1.48s）」。
 
 **FR-DSH-03 标题**
-- 期望：优先 DSH 会话标题；没有时用首条用户消息前 80 字；不显示裸 uuid。
-- 状态：已验收。
-- 证据：`session/title` 事件 + 回退逻辑测试。
+- 期望：默认（`title_source=session`）标题只来自 DSH `session/title`；没有会话标题时用
+  「项目目录名 + 第 N 轮」（N 用该项目内 rank，无 rank 记 1），**绝不读 `user/message` 正文**。
+  `title_source=prompt` 是显式 opt-in：此时才允许用提示词首行兜底、才保留提问正文，
+  且会把相应文字写入 `state.json` 并显示在设备上（README/USAGE/设置说明均标注）。
+  两种模式都不显示裸 uuid。
+- 状态：已验收（默认不读正文；prompt 模式测试覆盖 opt-in 边界）。
+- 证据：`TitleSource`（`session` 默认 / `prompt` opt-in）、`Watcher::prompt_titles`、
+  回退 `fallback_title()`（`project_name` + `rank_in_project`）；测试
+  `user_message_never_becomes_title_by_default`、`prompt_mode_opt_in_only`。
 
 ## 4. 版式（FR-UI）
 
 **FR-UI-01 单任务详情页**
 - 内容：左上品牌「鳄鱼大宠物」12px（副行「Zetrix / DSH pet」9px）、右上模式徽章；状态大字+图标；标题≤3 行；详情一行；进度条；等待页题干/徽章；底部两态。
 - 状态：已验收。
-- 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 54 项（含 layout）。
+- 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 59 项（含 layout）。
 
 **FR-UI-02 双任务**
 - 期望：两行，每行「状态图标 + 标题 2 行 + 状态短语」；不画鳄鱼；Waiting 置顶。
@@ -170,8 +178,13 @@
 
 **FR-AUD-01 提示音**
 - 期望：进入 Waiting/Done 时响一次，同一等待指纹不重复；音量 0–100；设备双击静音切换。
+  指纹只存 `sha256(key|状态)` 的前 16 位十六进制，不含标题或提问正文；Waiting 的
+  `detail` 默认固定为「有 1 个问题待确认」（prompt 模式例外）；`pet.log` 状态行默认
+  只记 `session-<短号>` + 状态词，`--verbose` 才附加标题。
 - 状态：已验收。
-- 证据：`announce()` + `announced` 指纹；设备双击「已静音 / 提示音已开」即时反馈。
+- 证据：`announce()` + `announced`（`sound::notice_sig` / `is_notice_hash`）；旧格式条目
+  在 `load_store_at` 加载时清空；设备双击「已静音 / 提示音已开」即时反馈；测试
+  `announced_contains_hash_not_text`、`waiting_detail_has_no_question_text`。
 
 ## 7. 模式（FR-MODE）
 
@@ -190,6 +203,8 @@
 **FR-SET-02 字段**
 - 术语说明：见 GLOSSARY「配置桥」「宿主插件」「client bundle」。
 - 跟随开关、模式、提示音+音量、设备 IP+「测试连接」、刷新格式（mono/gray4/gray16）。
+- `title_source`（`session`/`prompt`）已支持 `pet-config.json` 与 `dsh-pet set --title-source`；
+  设置页控件尚未接入（本票写范围不含 `plugin/`），默认 `session` 即为隐私安全值。
 - 动作调试（6 动作预览）v1 未做：列为后续项，不阻塞验收。
 - 状态：待验证（字段已实现；动作调试未实现）。
 
@@ -218,7 +233,7 @@
 ## 10. 可验证性（FR-VER）
 
 **FR-VER-01 自动化**：`cargo test` 全过（≥65 项）。
-- 状态：已验收。54 lib + 15 bin = **69** 项。
+- 状态：已验收。59 lib + 22 bin = **81** 项。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
@@ -227,7 +242,9 @@
 **FR-VER-03 真机**：关键页面推送到设备后由用户拍照确认。
 - 状态：待验证（已有实时推送日志与用户可见画面；照片待用户补）。
 
-**FR-VER-04 诊断命令保留**：`check`/`push`/`preview`/`sessions`/`set`/`sound`/`voice`/`where`/`forget`。
+**FR-VER-04 诊断命令保留**：`check`/`push`/`preview`/`sessions`/`set`/`sound`/`voice`/`where`/`forget`；
+`watch`/`run` 支持 `--verbose`（状态行附加标题）；`forget --titles` 只做隐私清理
+（任务标题换 `session-<短号>`、清空提醒指纹，不删设置）。
 - 状态：已验收（见 `usage()` 与 USAGE.md 第 3 节）。
 
 ## 11. 已知限制 / 后续项

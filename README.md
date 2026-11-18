@@ -122,14 +122,26 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 
 ## 隐私边界
 
-- 只**读** `~/.dsh/sessions` 下的会话日志（状态、标题、token 用量），不写 DSH 数据；
-- 会话标题会显示在墨水屏上，内容不会离开本机；
+- 只**读** `~/.dsh/sessions` 下的会话日志，不写 DSH 数据；
+- 默认只读生命周期元数据（状态、DSH 会话标题 `session/title`、token 用量），
+  **不读** `user/message` 正文，也不读工具调用参数里的提问正文；
+- 没有会话标题时，屏幕标题用「项目目录名 + 第 N 轮」（N 是该目录内第几个会话），
+  不会拿提示词首行兜底；
+- 等待确认时 `detail` 固定为「有 1 个问题待确认」，不把提问原文传到设备；
+- `pet.log` 的状态行默认只记 `session-<短号> · 状态词`，不记标题；加 `--verbose`
+  才会附带标题（可能含提示词首行，排查完记得关）；
+- `state.json` 里的提醒指纹只存 `sha256(key|状态)` 的前 16 位十六进制，不含标题或
+  提问正文；旧版本留下的长文案条目在加载时自动清空；
+- **显式 opt-in**：`dsh-pet set --title-source prompt` 后，才允许把提示词首行当标题、
+  把提问前 60 字当 detail。这会把相应文字写进 `state.json` 并显示在设备上，
+  默认 `session` 模式不会。升级前留下的旧标题可用 `dsh-pet forget --titles`
+  一次性替换为 `session-<短号>`（无会话 id 用 `task-<序号>`）并清空指纹；
 - 与设备只走局域网 UDP（32342），无云端、无账号。
 
 ## 从源码构建
 
 ```powershell
-cargo test                 # 54 lib + 15 bin = 69
+cargo test                 # 59 lib + 22 bin = 81
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```

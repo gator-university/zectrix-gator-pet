@@ -1,8 +1,13 @@
 //! 本机 DeepSeek Harness 跟随：只读 `~/.dsh/sessions/<项目>/<会话目录>/session.v4.jsonl.zstd`。
 //!
-//! 这是对本机会话日志格式的适配，不是 DSH 的稳定状态 API。只提取生命周期元数据
-//! （轮次开始/结束、结构化提问、权限确认、待办清单条目、标题、上下文占用），
-//! 不读取、不保存、不上传任何对话正文、推理内容、工具参数或代码。
+//! 这是对本机会话日志格式的适配，不是 DSH 的稳定状态 API。默认只提取生命周期
+//! 元数据（轮次开始/结束、结构化提问、权限确认、待办清单条目、会话标题、上下文
+//! 占用），不读取、不保存、不上传任何对话正文、推理内容、工具参数或代码。
+//!
+//! 唯一的例外是显式设置的 `title_source=prompt`：会话没有 `session/title` 时，
+//! 取首条用户消息的首行当作兜底标题（会写进 state.json 与设备），并在等待提问
+//! 时显示题干。两条路径都必须由用户显式开启；默认 `session` 模式下用户消息正文
+//! 与提问题干一律不读取、不上屏。
 //!
 //! 状态映射（全部来自明确记录，不做推测）：
 //! - `turn/start` → 正在工作（DSH 每轮开始都写一条，是唯一的轮次起点）
@@ -149,8 +154,10 @@ fn activity_label(name: &str) -> String {
     label.to_string()
 }
 
-/// `ask_user_question` 的参数：只取第一问的题干上屏（用户明确要求知道为什么要回电脑）。
-/// 这是唯一一处取用工具参数的地方，且只取题干并设长度上限；选项/描述/正文一律不读。
+/// `ask_user_question` 的参数：只取第一问的题干（用户明确要求知道为什么要回电脑）。
+/// **只在 `title_source=prompt` 时调用**；默认模式下提问题干根本不进内存，
+/// 等待画面固定显示「有 1 个问题待确认」。即便调用也只取题干并设长度上限，
+/// 选项/描述/正文一律不读。
 fn ask_text(args: &str) -> String {
     let Ok(v) = serde_json::from_str::<Value>(args) else {
         return String::new();
@@ -174,7 +181,7 @@ fn is_ask_tool(name: &str) -> bool {
 }
 
 /// 从一条用户消息里取「这一问问了什么」：第一行非空文本，限长。
-/// 只用作会话还没有生成标题时的兜底。
+/// **只在 `title_source=prompt` 时调用**，默认模式下用户消息正文不参与标题。
 fn user_title(data: &Value) -> Option<String> {
     let text = data["content"]
         .as_array()
@@ -233,12 +240,17 @@ struct Cursor {
     ctx_used: Option<u32>,
     ctx_window: Option<u32>,
     emitted: Option<(Status, String, Option<u8>, String)>,
+    /// 本会话第一条记录的时间（秒）：同一项目里按它排「第 N 轮」。
+    started_at: i64,
     seen_at: i64,
     seen_seq: u64,
 }
 
 impl Cursor {
-    fn feed(&mut self, v: &Value, at: i64, stem: &str) {
+    fn feed(&mut self, v: &Value, at: i64, stem: &str, allow_prompt: bool) {
+        if self.started_at == 0 && at > 0 {
+            self.started_at = at;
+        }
         let data = &v["data"];
         match v["type"].as_str().unwrap_or("") {
             "session" => {
@@ -313,13 +325,16 @@ impl Cursor {
                 let call_id = data["callId"].as_str().unwrap_or("");
                 self.last = Last::Working;
                 if is_ask_tool(name) {
-                    // 提问不是「活动」：它有自己的等待状态，题干上屏。
+                    // 提问不是「活动」：它有自己的等待状态。题干只在 prompt
+                    // 模式读取；默认模式连内存都不留。
                     if !call_id.is_empty() {
                         self.waiting.insert(call_id.to_string(), WaitKind::Question);
                     }
-                    let text = ask_text(data["arguments"].as_str().unwrap_or(""));
-                    if !text.is_empty() {
-                        self.asking = text;
+                    if allow_prompt {
+                        let text = ask_text(data["arguments"].as_str().unwrap_or(""));
+                        if !text.is_empty() {
+                            self.asking = text;
+                        }
                     }
                 } else {
                     self.activity = activity_label(name);
@@ -382,10 +397,10 @@ impl Cursor {
                 }
             }
             "user/message" => {
-                // 只有真人输入（source.kind=user）才配当兜底标题；
-                // 审批策略变更、任务通知这些是宿主注入的假 user，不算需求。
+                // 只有真人输入（source.kind=user）且显式开启 prompt 模式时才配当
+                // 兜底标题；审批策略变更、任务通知这些是宿主注入的假 user，不算需求。
                 let source_kind = data["source"]["kind"].as_str().unwrap_or("");
-                if source_kind == "user" && self.turn_title.is_none() {
+                if allow_prompt && source_kind == "user" && self.turn_title.is_none() {
                     self.turn_title = user_title(data);
                 }
                 // 定时提问的答复：这才是「提问已经有人答了」的权威信号。
@@ -489,24 +504,35 @@ impl Cursor {
         now_secs().saturating_sub(self.seen_at) >= DONE_SETTLE
     }
 
-    fn event(&mut self, at: i64, seq: u64, fallback: &str, stem: &str) -> Option<(Event, i64)> {
+    fn event(
+        &mut self,
+        at: i64,
+        seq: u64,
+        fallback: &str,
+        stem: &str,
+        allow_prompt: bool,
+    ) -> Option<(Event, i64)> {
         let status = self.status()?;
         let task = self.task.clone()?;
         let title = if !self.title.is_empty() {
             self.title.clone()
-        } else {
+        } else if allow_prompt {
             match self.turn_title.as_deref() {
                 Some(t) if !t.trim().is_empty() => t.to_string(),
                 _ => fallback.to_string(),
             }
+        } else {
+            // 默认模式：标题只来自 session/title，没有就用「项目名 + 第 N 轮」。
+            fallback.to_string()
         };
         let progress = self.progress();
         let detail = match status {
             Status::Waiting if self.permission_pending() => {
                 "有操作等你确认 · 请回电脑点允许".to_string()
             }
-            Status::Waiting if !self.asking.is_empty() => self.asking.clone(),
-            Status::Waiting => "DSH 等待你的选择".to_string(),
+            // 题干只在显式开启 prompt 模式时外传；默认固定文案，不带提问正文。
+            Status::Waiting if allow_prompt && !self.asking.is_empty() => self.asking.clone(),
+            Status::Waiting => "有 1 个问题待确认".to_string(),
             Status::Working => self.activity.clone(),
             _ => String::new(),
         };
@@ -657,6 +683,9 @@ pub struct Watcher {
     deleted: HashSet<String>,
     /// 只看指定会话（会话 id 或目录名）：调试与预览单会话状态用。
     only: Option<String>,
+    /// `title_source=prompt`：允许读用户消息首行与提问题干当标题/详情。
+    /// 默认 false，标题只来自 `session/title`。
+    allow_prompt: bool,
 }
 
 impl Watcher {
@@ -666,7 +695,19 @@ impl Watcher {
             cursors: HashMap::new(),
             deleted: HashSet::new(),
             only: None,
+            allow_prompt: false,
         }
+    }
+
+    /// 显式开启「提示词兜底标题」。由 `Settings::title_source` 决定，默认关闭。
+    pub fn prompt_titles(mut self, on: bool) -> Self {
+        self.allow_prompt = on;
+        self
+    }
+
+    /// 每拍同步设置（`set` 改设置后无需重启）。
+    pub fn use_prompt_titles(&mut self, on: bool) {
+        self.allow_prompt = on;
     }
 
     /// 测试注入：把某个会话标记成「已删除」。
@@ -714,9 +755,46 @@ impl Watcher {
             .filter(|(u, w)| *u > 0 && *w > 0)
     }
 
+    /// 同一项目目录下按会话第一条记录时间排第几轮（从 1 开始）。
+    /// 没有会话标题时的兜底就用它，比读用户消息正文安全得多。
+    fn rank_in_project(&self, path: &Path) -> u32 {
+        let Some(me) = self.cursors.get(path) else {
+            return 1;
+        };
+        if me.started_at <= 0 {
+            return 1;
+        }
+        let parent = path.parent();
+        let ahead = self
+            .cursors
+            .iter()
+            .filter(|(other, cursor)| {
+                other.as_path() != path
+                    && other.parent() == parent
+                    && cursor.started_at > 0
+                    && cursor.started_at < me.started_at
+            })
+            .count();
+        (ahead + 1) as u32
+    }
+
+    /// 默认模式的无标题占位：「项目目录名 第 N 轮」。
+    fn fallback_title(&self, path: &Path) -> String {
+        let Some(cursor) = self.cursors.get(path) else {
+            return "本机任务".to_string();
+        };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let name = project_name(&cursor.cwd, dir);
+        clean(
+            &format!("{name} 第{}轮", self.rank_in_project(path)),
+            TITLE_MAX,
+        )
+    }
+
     /// 扫全部会话，返回本轮新出现的状态事件。
     pub fn scan(&mut self) -> Result<Vec<(Event, i64)>> {
         let now = now_secs();
+        let allow_prompt = self.allow_prompt;
         // 侧边栏归档的会话整条忽略：日志还在，但人已经不跟这条任务了。
         // `<profile>/sessions` 的上级就是 profile 根（`~/.dsh`）。
         if let Some(profile) = self.root.parent() {
@@ -776,24 +854,25 @@ impl Watcher {
             buf.extend_from_slice(&chunk);
             let end = base + buf.len() as u64;
             let (decoded, consumed) = decode_frames(&buf);
-            let c = self.cursors.get_mut(&path).unwrap();
-            c.offset = end;
-            if consumed == 0 && !buf.is_empty() {
-                // 半帧还没写完：等下一拍；连续几拍都这样说明写进程崩在半帧上，
-                // 跳过这段坏尾巴，后面的帧才能接上。
-                c.stall += 1;
-                if c.stall >= STALL_SKIP {
-                    let skip_to = find_magic(&buf, 1).unwrap_or(buf.len());
-                    c.tail = buf[skip_to..].to_vec();
-                    c.stall = 0;
-                } else {
-                    c.tail = buf;
+            {
+                let c = self.cursors.get_mut(&path).unwrap();
+                c.offset = end;
+                if consumed == 0 && !buf.is_empty() {
+                    // 半帧还没写完：等下一拍；连续几拍都这样说明写进程崩在半帧上，
+                    // 跳过这段坏尾巴，后面的帧才能接上。
+                    c.stall += 1;
+                    if c.stall >= STALL_SKIP {
+                        let skip_to = find_magic(&buf, 1).unwrap_or(buf.len());
+                        c.tail = buf[skip_to..].to_vec();
+                        c.stall = 0;
+                    } else {
+                        c.tail = buf;
+                    }
+                    continue;
                 }
-                continue;
+                c.stall = 0;
+                c.tail = buf[consumed..].to_vec();
             }
-            c.stall = 0;
-            c.tail = buf[consumed..].to_vec();
-            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
             let text = String::from_utf8_lossy(&decoded);
             let stale_import = fresh && now.saturating_sub(modified) > IMPORT_WINDOW;
             let mut last_at = modified;
@@ -809,23 +888,26 @@ impl Watcher {
                 let seq = v["seq"].as_u64().unwrap_or(0);
                 last_at = at;
                 last_seq = seq.max(last_seq);
-                c.feed(&v, at, &stem);
-                c.seen_at = at;
-                c.seen_seq = seq;
+                {
+                    let c = self.cursors.get_mut(&path).unwrap();
+                    c.feed(&v, at, &stem, allow_prompt);
+                    c.seen_at = at;
+                    c.seen_seq = seq;
+                }
                 // 增量扫描必须逐条上报：同一批里可能先后出现「完成」和「下一轮开始」，
                 // 合并成一个事件会丢掉完成提示音。首次导入是历史回放，只报最终状态。
-                if !fresh && !stale_import && c.settled(false) {
-                    let fallback = project_name(&c.cwd, &dir);
-                    if let Some(ev) = c.event(at, seq.max(1), &fallback, &stem) {
-                        out.push(ev);
+                if !fresh && !stale_import {
+                    let fallback = self.fallback_title(&path);
+                    let c = self.cursors.get_mut(&path).unwrap();
+                    if c.settled(false) {
+                        if let Some(ev) = c.event(at, seq.max(1), &fallback, &stem, allow_prompt) {
+                            out.push(ev);
+                        }
                     }
                 }
             }
             if fresh {
-                let fallback = project_name(
-                    self.cursors[&path].cwd.as_str(),
-                    &path.parent().unwrap_or(Path::new(".")).to_path_buf(),
-                );
+                let fallback = self.fallback_title(&path);
                 if stale_import {
                     // 陈旧会话只建立游标，不上屏：避免把几天前的任务当成当前状态。
                     let c = self.cursors.get_mut(&path).unwrap();
@@ -844,7 +926,8 @@ impl Watcher {
                     .unwrap_or(false)
                 {
                     let c = self.cursors.get_mut(&path).unwrap();
-                    if let Some(ev) = c.event(last_at.max(modified), last_seq.max(1), &fallback, &stem)
+                    if let Some(ev) =
+                        c.event(last_at.max(modified), last_seq.max(1), &fallback, &stem, allow_prompt)
                     {
                         out.push(ev);
                     }
@@ -867,7 +950,7 @@ impl Watcher {
                 .and_then(|s| s.to_str())
                 .unwrap_or("session")
                 .to_string();
-            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let fallback = self.fallback_title(&path);
             let Some(c) = self.cursors.get_mut(&path) else {
                 continue;
             };
@@ -876,8 +959,7 @@ impl Watcher {
             }
             let at = c.seen_at;
             let seq = c.seen_seq;
-            let fallback = project_name(&c.cwd, &dir);
-            if let Some(ev) = c.event(at, seq, &fallback, &stem) {
+            if let Some(ev) = c.event(at, seq, &fallback, &stem, allow_prompt) {
                 out.push(ev);
             }
         }
@@ -1143,10 +1225,89 @@ mod tests {
         let waiting = w.scan().unwrap();
         let ev = &waiting.last().unwrap().0;
         assert_eq!(ev.status, Status::Waiting);
-        assert_eq!(ev.detail, "要部署到哪台机器？");
+        // 默认不把提问正文写到屏幕上。
+        assert_eq!(ev.detail, "有 1 个问题待确认");
 
         append(&root, &[tool_result("call-q", 1_700_000_010_000)]);
         assert_eq!(w.scan().unwrap().last().unwrap().0.status, Status::Working);
+    }
+
+    fn user_message(text: &str, ts: i64) -> Value {
+        json!({"type":"user/message","seq":40,"time":ts,
+               "data":{"role":"user","source":{"kind":"user"},
+                       "content":[{"type":"text","text":text}]}})
+    }
+
+    #[test]
+    fn user_message_never_becomes_title_by_default() {
+        let root = temp_root("no-prompt-title");
+        append(
+            &root,
+            &[
+                session_header(),
+                turn_start(1, 1_700_000_000_200),
+                user_message("机密需求：把客户数据库导出到 U 盘", 1_700_000_000_300),
+            ],
+        );
+        let mut w = Watcher::new(root.clone());
+        let events = w.scan().unwrap();
+        let ev = &events.last().unwrap().0;
+        assert_eq!(ev.title, "demo 第1轮", "无标题时只能用项目名 + 轮次");
+        assert!(!ev.title.contains("机密"));
+        assert!(!ev.title.contains("数据库"));
+    }
+
+    #[test]
+    fn prompt_mode_opt_in_only() {
+        let root = temp_root("prompt-title");
+        append(
+            &root,
+            &[
+                session_header(),
+                turn_start(1, 1_700_000_000_200),
+                user_message("机密需求：把客户数据库导出到 U 盘", 1_700_000_000_300),
+            ],
+        );
+        // 默认 Watcher 不读正文。
+        let mut tenant = Watcher::new(root.clone());
+        let default_title = tenant.scan().unwrap().last().unwrap().0.title.clone();
+        assert_eq!(default_title, "demo 第1轮");
+
+        // 显式 opt-in 后才退回首行。
+        let mut opted_in = Watcher::new(root.clone()).prompt_titles(true);
+        let ev = opted_in.scan().unwrap();
+        assert_eq!(
+            ev.last().unwrap().0.title,
+            "机密需求：把客户数据库导出到 U 盘"
+        );
+    }
+
+    #[test]
+    fn waiting_detail_has_no_question_text() {
+        let root = temp_root("question-detail");
+        let args = json!({"questions":[{"question":"密钥放在哪个目录？","options":[]}]}).to_string();
+        append(
+            &root,
+            &[
+                session_header(),
+                turn_start(1, 1_700_000_000_000),
+                json!({"type":"tool/call","seq":52,"time":1_700_000_001_000i64,
+                       "data":{"turn":1,"callId":"call-q","name":"ask_user_question",
+                               "arguments":args}}),
+            ],
+        );
+        let mut w = Watcher::new(root.clone());
+        let events = w.scan().unwrap();
+        let detail = &events.last().unwrap().0.detail;
+        assert_eq!(detail, "有 1 个问题待确认");
+        assert!(!detail.contains("密钥"));
+
+        // prompt 模式才保留题干（文档已标注会写到设备）。
+        let mut opted_in = Watcher::new(root).prompt_titles(true);
+        assert_eq!(
+            opted_in.scan().unwrap().last().unwrap().0.detail,
+            "密钥放在哪个目录？"
+        );
     }
 
     #[test]
