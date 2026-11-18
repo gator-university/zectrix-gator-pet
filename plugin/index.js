@@ -3,33 +3,19 @@
 // 生命周期：bundle apply 时 spawn 一次 `dsh-pet.exe watch --watch-pid <本进程 pid>`；
 // DSH 正常退出时 ctx.effect 的清理函数会 kill 子进程；DSH 被强杀时宿主进程消失，
 // exe 每 2 秒自检父进程，10 秒内自己退出并释放设备（见 FR-LIFE-02/03）。
-// 配置：插件设置页读写 %LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json，exe 每 2 秒热读。
-
+// 配置：HTTP 桥见 bridge.js（只监听 127.0.0.1 + token 鉴权）；这里只负责进程生命周期。
 import { spawn } from 'node:child_process'
-import { createServer } from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createBridge } from './bridge.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PORT = 4517
 const DATA_DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'zectrix-dsh-pet')
 const CONFIG_FILE = path.join(DATA_DIR, 'pet-config.json')
 const LOG_FILE = path.join(DATA_DIR, 'pet.log')
-
-/** 允许设置页写入的字段；未知字段直接丢弃，避免把任意 JSON 写进配置。 */
-const ALLOWED_KEYS = new Set([
-  'follow',
-  'sound',
-  'volume',
-  'target',
-  'format',
-  'mode',
-  'refresh_secs',
-  'animation',
-  'stale_minutes',
-])
 
 function ensureDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true })
@@ -52,57 +38,6 @@ function exePath() {
   const release = path.join(HERE, '..', 'target', 'release', exe)
   if (fs.existsSync(release)) return release
   return bundled
-}
-
-function readConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
-  } catch {
-    return {}
-  }
-}
-
-function writeConfig(patch) {
-  const next = { ...readConfig() }
-  for (const [k, v] of Object.entries(patch || {})) {
-    if (!ALLOWED_KEYS.has(k)) continue
-    if (v === undefined || v === null) continue
-    next[k] = v
-  }
-  ensureDir()
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8')
-  log(`配置已更新：${JSON.stringify(next)}`)
-  return next
-}
-
-function json(res, code, body) {
-  const text = JSON.stringify(body)
-  res.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'content-type',
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'cache-control': 'no-store',
-  })
-  res.end(text)
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = ''
-    req.on('data', chunk => {
-      raw += chunk
-      if (raw.length > 64 * 1024) reject(new Error('请求体过大'))
-    })
-    req.on('end', () => {
-      try {
-        resolve(raw ? JSON.parse(raw) : {})
-      } catch (e) {
-        reject(e)
-      }
-    })
-    req.on('error', reject)
-  })
 }
 
 /** 跑一次 CLI 并收集输出（设置页「测试连接」用）。 */
@@ -142,51 +77,6 @@ function runCli(args, timeoutMs = 8000) {
   })
 }
 
-function startBridge() {
-  const server = createServer(async (req, res) => {
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-headers': 'content-type',
-        'access-control-allow-methods': 'GET,POST,OPTIONS',
-      })
-      res.end()
-      return
-    }
-    const url = new URL(req.url || '/', `http://127.0.0.1:${PORT}`)
-    try {
-      if (req.method === 'GET' && url.pathname === '/health') {
-        json(res, 200, { ok: true, port: PORT, exe: exePath() })
-        return
-      }
-      if (req.method === 'GET' && url.pathname === '/config') {
-        json(res, 200, { ok: true, config: readConfig() })
-        return
-      }
-      if (req.method === 'POST' && url.pathname === '/config') {
-        const body = await readBody(req)
-        json(res, 200, { ok: true, config: writeConfig(body) })
-        return
-      }
-      if (req.method === 'POST' && url.pathname === '/test') {
-        const body = await readBody(req)
-        const target = typeof body.target === 'string' ? body.target.trim() : ''
-        const args = ['check']
-        if (target) args.push('--target', target)
-        const result = await runCli(args)
-        json(res, 200, result)
-        return
-      }
-      json(res, 404, { ok: false, error: 'not found' })
-    } catch (e) {
-      json(res, 400, { ok: false, error: String(e && e.message ? e.message : e) })
-    }
-  })
-  server.listen(PORT, '127.0.0.1')
-  server.on('error', e => log(`配置桥监听失败：${e}`))
-  return server
-}
-
 function spawnPet() {
   const exe = exePath()
   if (!fs.existsSync(exe)) {
@@ -217,18 +107,25 @@ export function apply(ctx) {
     } catch (e) {
       log(`启动宠物失败：${e}`)
     }
-    let server = null
-    try {
-      server = startBridge()
-    } catch (e) {
-      log(`配置桥启动失败：${e}`)
-    }
+    let bridge = null
+    let closing = false
+    createBridge({ port: PORT, petConfigPath: CONFIG_FILE, runCli, log })
+      .then(started => {
+        bridge = started
+        if (closing) {
+          started.close()
+        } else {
+          log(`配置桥已监听 127.0.0.1:${started.port}`)
+        }
+      })
+      .catch(e => log(`配置桥启动失败：${e}`))
     return () => {
+      closing = true
       try {
         child?.kill()
       } catch {}
       try {
-        server?.close()
+        bridge?.close()
       } catch {}
       log('DSH 退出：已停止宠物进程与配置桥。')
     }

@@ -7,9 +7,13 @@
   "license": "MIT",
   "author": "gator-university",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./bridge": "./bridge.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.png",
     "./package.json": "./package.json"
@@ -29,6 +33,7 @@
   },
   "files": [
     "index.js",
+    "bridge.js",
     "client.js",
     "dsh.bundle.patch",
     "icon.png",
