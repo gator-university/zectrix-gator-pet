@@ -83,6 +83,40 @@ fn dsh_running() -> bool {
     }
 }
 
+/// 探测结果缓存时长。`tasklist` 每次都要起一个进程（几十毫秒），而主循环里
+/// 有很多「顺手确认 DSH 还在不在」的判断；5 秒的延迟对退出检测完全够用。
+const DSH_PROBE_TTL: Duration = Duration::from_secs(5);
+
+struct ProbeCache {
+    at: Instant,
+    running: bool,
+}
+
+static DSH_PROBE: OnceLock<Mutex<Option<ProbeCache>>> = OnceLock::new();
+
+/// 带 TTL 的 `dsh_running()`：只在缓存过期时真的去查进程表。
+fn dsh_running_cached() -> bool {
+    let cell = DSH_PROBE.get_or_init(|| Mutex::new(None));
+    let mut guard = match cell.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(probe) = guard.as_ref() {
+        if probe.at.elapsed() < DSH_PROBE_TTL {
+            return probe.running;
+        }
+    }
+    let running = dsh_running();
+    match guard.as_mut() {
+        Some(probe) => {
+            probe.at = Instant::now();
+            probe.running = running;
+        }
+        None => *guard = Some(ProbeCache { at: Instant::now(), running }),
+    }
+    running
+}
+
 fn heartbeat_path() -> PathBuf {
     data_dir().join("daemon.hb")
 }
@@ -293,30 +327,70 @@ struct Store {
 /// 两个子智能体（`origin: subagent`、header 里有 `parentSession`）还有未结束的
 /// 回合——DSH 侧边栏显示「1 个子智能体运行中」，设备却显示「任务完成」。
 /// 这里扫同项目目录下的子会话日志，把「有未结束回合」的父会话标出来。
+
+/// 全量扫描会话目录的间隔：目录遍历 + 每个子会话 stat。原来是每 2 秒一次，
+/// 但子会话只会在 agent team 启动/结束时增删，10 秒足够；两次全扫之间只对
+/// 已知文件做 `metadata()` 快查（长度/mtime 变了才解压）。
+const TEAM_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+/// 子会话日志超过这个年龄就不再跟踪（解压很贵，历史记录也没有意义）。
+const TEAM_STALE_SECS: i64 = 12 * 3600;
+/// busy 溯源的最大层数（agent team 可能多层嵌套）。
+const TEAM_MAX_DEPTH: usize = 8;
+
 #[derive(Default)]
 struct TeamScan {
     /// 子日志路径 → (文件长度, mtime 秒, parentSession, 是否还有未结束回合)
     files: std::collections::HashMap<std::path::PathBuf, (u64, i64, Option<String>, bool)>,
-    last_run: Option<std::time::Instant>,
+    last_full_scan: Option<std::time::Instant>,
     busy: std::collections::HashMap<String, i64>,
 }
 
 impl TeamScan {
-    /// 最多每 2 秒走一遍；结果写进 `model.team_busy`。
-    /// 返回 busy 集合是否变化（调用方据此决定要不要落盘给面板看）。
-    fn sync(&mut self, model: &mut dsh_pet::model::Model, root: &std::path::Path) -> bool {
-        if let Some(t) = self.last_run {
-            if t.elapsed() < std::time::Duration::from_secs(2) {
-                model.team_busy = self.busy.clone();
+    /// 该不该走一遍全目录扫描。默认是「第一次一定扫，之后每 10 秒一次」。
+    fn should_full_scan(&self, at: std::time::Instant) -> bool {
+        match self.last_full_scan {
+            Some(last) => at.saturating_duration_since(last) >= TEAM_FULL_SCAN_INTERVAL,
+            None => true,
+        }
+    }
+
+    /// 丢掉过期（>12h）或已经不存在的子会话日志，避免 `files` 无限增长。
+    /// 用 `metadata` 而不是 `is_file`：一次 stat 就能同时确认存在并刷新
+    /// 长度/mtime，文件被截断时下一轮 `touch` 会重新解码。
+    fn prune(
+        files: &mut std::collections::HashMap<
+            std::path::PathBuf,
+            (u64, i64, Option<String>, bool),
+        >,
+        at: i64,
+    ) {
+        files.retain(|path, entry| {
+            if at.saturating_sub(entry.1) > TEAM_STALE_SECS {
                 return false;
             }
+            std::fs::metadata(path).is_ok()
+        });
+    }
+
+    /// 记录一个子会话日志的当前状态；长度/mtime 变了才解压。读失败保持旧值，
+    /// 下一轮再试（文件可能正被写进程 rename，读到半份不值得缓存）。
+    fn touch(&mut self, path: &Path, len: u64, mtime: i64) {
+        let entry = self
+            .files
+            .entry(path.to_path_buf())
+            .or_insert((0, 0, None, false));
+        if (entry.0, entry.1) == (len, mtime) {
+            return;
         }
-        self.last_run = Some(std::time::Instant::now());
-        let at = now();
-        // 父会话 → 父会话的父（用于把多层子会话一路溯到最上层的任务）
-        let mut parents: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut raw_busy: Vec<String> = Vec::new();
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let (parent, open) = decode_team_log(&bytes);
+        *entry = (len, mtime, parent, open);
+    }
+
+    /// 全目录扫描：找出所有子智能体会话日志，再 prune 掉消失/过期的。
+    fn full_scan(&mut self, root: &Path, at: i64) {
         if let Ok(projects) = std::fs::read_dir(root) {
             for project in projects.flatten() {
                 if !project.path().is_dir() {
@@ -331,9 +405,13 @@ impl TeamScan {
                     if name.starts_with("session-") {
                         continue;
                     }
-                    let mut log = child.path().join("session.v4.jsonl.zstd");
+                    let dir = child.path();
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    let mut log = dir.join("session.v4.jsonl.zstd");
                     if !log.is_file() {
-                        log = child.path().join("session.v3.jsonl.zstd");
+                        log = dir.join("session.v3.jsonl.zstd");
                     }
                     if !log.is_file() {
                         continue;
@@ -341,59 +419,57 @@ impl TeamScan {
                     let Ok(meta) = std::fs::metadata(&log) else {
                         continue;
                     };
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    // 很旧的子会话不值得每次解压。
-                    if at.saturating_sub(mtime) > 12 * 3600 {
+                    let mtime = mtime_secs(&meta);
+                    // 很旧的子会话不值得解码。
+                    if at.saturating_sub(mtime) > TEAM_STALE_SECS {
                         continue;
                     }
-                    let stamp = (meta.len(), mtime);
-                    let entry = self
-                        .files
-                        .entry(log.clone())
-                        .or_insert((0, 0, None, false));
-                    if (entry.0, entry.1) != stamp {
-                        let Ok(bytes) = std::fs::read(&log) else {
-                            continue;
-                        };
-                        let text = dsh_pet::dsh::decode_all_frames(&bytes);
-                        let text = String::from_utf8_lossy(&text);
-                        let mut parent = None;
-                        let mut open_turns = 0i64;
-                        for line in text.lines() {
-                            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                                continue;
-                            };
-                            match v["type"].as_str() {
-                                Some("session") => {
-                                    parent = v["parentSession"].as_str().map(str::to_string);
-                                }
-                                Some("turn/start") => open_turns += 1,
-                                Some("turn/end") => open_turns -= 1,
-                                _ => {}
-                            }
-                        }
-                        *entry = (stamp.0, stamp.1, parent, open_turns > 0);
-                    }
-                    if let Some(parent) = &entry.2 {
-                        parents.insert(
-                            log.parent()
-                                .and_then(|p| p.file_name())
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default(),
-                            parent.clone(),
-                        );
-                    }
-                    if entry.3 {
-                        if let Some(parent) = &entry.2 {
-                            raw_busy.push(parent.clone());
-                        }
-                    }
+                    self.touch(&log, meta.len(), mtime);
                 }
+            }
+        }
+        Self::prune(&mut self.files, at);
+    }
+
+    /// 快查：只 stat 已知文件，变了才重新解码；不遍历目录。
+    fn quick_scan(&mut self, at: i64) {
+        let known: Vec<PathBuf> = self.files.keys().cloned().collect();
+        for path in known {
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let mtime = mtime_secs(&meta);
+                    if at.saturating_sub(mtime) > TEAM_STALE_SECS {
+                        self.files.remove(&path);
+                        continue;
+                    }
+                    self.touch(&path, meta.len(), mtime);
+                }
+                // 目录被删/改名：不再跟踪。
+                Err(_) => {
+                    self.files.remove(&path);
+                }
+            }
+        }
+    }
+
+    /// 由 `files` 重建 busy 集合，返回是否变化（调用方据此落盘给面板看）。
+    fn refresh_busy(&mut self, model: &mut dsh_pet::model::Model, at: i64) -> bool {
+        // 父会话 → 父会话的父（用于把多层子会话一路溯到最上层的任务）
+        let mut parents: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut raw_busy: Vec<String> = Vec::new();
+        for (log, entry) in &self.files {
+            let Some(parent) = &entry.2 else {
+                continue;
+            };
+            let session = log
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            parents.insert(session, parent.clone());
+            if entry.3 {
+                raw_busy.push(parent.clone());
             }
         }
         // 已知任务（主会话 id）集合：把子会话的 parentSession 一路往上溯，
@@ -407,7 +483,7 @@ impl TeamScan {
         let mut busy = std::collections::HashMap::new();
         for parent in raw_busy {
             let mut cur = parent;
-            for _ in 0..8 {
+            for _ in 0..TEAM_MAX_DEPTH {
                 if known.contains(&cur) {
                     busy.insert(cur, at);
                     break;
@@ -423,6 +499,49 @@ impl TeamScan {
         model.team_busy = self.busy.clone();
         changed
     }
+
+    /// 每拍调用：10 秒一次全目录扫描，其余拍只做已知文件的 metadata 快查；
+    /// 结果写进 `model.team_busy`。返回 busy 集合是否变化。
+    fn sync(&mut self, model: &mut dsh_pet::model::Model, root: &std::path::Path) -> bool {
+        let now_instant = std::time::Instant::now();
+        let at = now();
+        if self.should_full_scan(now_instant) {
+            self.last_full_scan = Some(now_instant);
+            self.full_scan(root, at);
+        } else {
+            self.quick_scan(at);
+        }
+        self.refresh_busy(model, at)
+    }
+}
+
+/// 解出「子会话的 parentSession + 是否还有未结束回合」。只读 session/turn 记录。
+fn decode_team_log(bytes: &[u8]) -> (Option<String>, bool) {
+    let text = dsh_pet::dsh::decode_all_frames(bytes);
+    let text = String::from_utf8_lossy(&text);
+    let mut parent = None;
+    let mut open_turns = 0i64;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("session") => parent = v["parentSession"].as_str().map(str::to_string),
+            Some("turn/start") => open_turns += 1,
+            Some("turn/end") => open_turns -= 1,
+            _ => {}
+        }
+    }
+    (parent, open_turns > 0)
+}
+
+/// 文件的 mtime（秒）。拿不到时间戳时返回 0：会被当成很旧而跳过。
+fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// 由 DSH 插件读写、宠物进程热读的唯一用户配置源：
@@ -998,8 +1117,87 @@ impl Store {
     }
 }
 
+/// 读 `state.json` 的 stamp：mtime（秒 + 纳秒）+ 长度。三者任一变化都算「换了
+/// 内容」；文件不存在/读不了 metadata 时返回 `(None, 0)`。
+fn state_stamp(path: &Path) -> (Option<(u64, u32)>, u64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (
+            meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| (d.as_secs(), d.subsec_nanos())),
+            meta.len(),
+        ),
+        Err(_) => (None, 0),
+    }
+}
+
+/// 上一次读过/写过的 `state.json` 快照。主循环每秒都要看「磁盘上别人刚写的
+/// 运行字段」（announced / released_at / idle_grace / format_set_at），但每秒
+/// 重读 + 解析整份 JSON 纯属浪费：mtime+长度没变就直接克隆这份内存快照。
+struct DiskStateCache {
+    path: PathBuf,
+    mtime: Option<(u64, u32)>,
+    len: u64,
+    store: Store,
+}
+
+static DISK_STATE_CACHE: Mutex<Option<DiskStateCache>> = Mutex::new(None);
+
+fn disk_state_cache_lock() -> std::sync::MutexGuard<'static, Option<DiskStateCache>> {
+    match DISK_STATE_CACHE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn load_store() -> Store {
-    load_store_at(&state_path())
+    cached_load_store()
+}
+
+/// 命中缓存时零解析；返回的是快照克隆，调用方随便改。
+fn cached_load_store() -> Store {
+    cached_load_store_at(&state_path())
+}
+
+fn cached_load_store_at(path: &Path) -> Store {
+    let before = state_stamp(path);
+    {
+        let cache = disk_state_cache_lock();
+        if let Some(entry) = cache.as_ref() {
+            if entry.path == path && entry.mtime == before.0 && entry.len == before.1 {
+                return entry.store.clone();
+            }
+        }
+    }
+    let store = load_store_at(path);
+    // 读的这段时间文件可能被别的进程改写：只有前后 stamp 一致才敢缓存，
+    // 否则会缓存下「旧内容 + 新 stamp」，之后永远读不到再次更新。
+    let after = state_stamp(path);
+    if after == before {
+        let mut cache = disk_state_cache_lock();
+        *cache = Some(DiskStateCache {
+            path: path.to_path_buf(),
+            mtime: after.0,
+            len: after.1,
+            store: store.clone(),
+        });
+    }
+    store
+}
+
+/// 保存成功后把刚写下去的内容同步进读缓存：下一拍 `cached_load_store`
+/// 不会因为「mtime 变了但内存快照还是旧的」而白解析一次。写盘期间持有
+/// `state.lock`，别的进程写不进来，所以这里存 `out` 是安全的。
+fn refresh_disk_state_cache(path: &Path, store: &Store) {
+    let stamp = state_stamp(path);
+    let mut cache = disk_state_cache_lock();
+    *cache = Some(DiskStateCache {
+        path: path.to_path_buf(),
+        mtime: stamp.0,
+        len: stamp.1,
+        store: store.clone(),
+    });
 }
 
 /// 损坏文件改名用的路径：`state.corrupt-<unix>.json`。拷贝/改名都发生在同目录，
@@ -1114,10 +1312,6 @@ fn load_store_at(path: &Path) -> Store {
     store
 }
 
-fn save_store(store: &Store) -> Result<()> {
-    save_store_at(&state_path(), store)
-}
-
 /// 保存到指定路径，供测试注入临时目录。
 ///
 /// - 正常：上一版先滚成 `state.bak.json`（单份，失败不阻塞），再 tmp+fsync+rename。
@@ -1206,7 +1400,100 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
         }
     }
 
-    write_json_atomic(path, &bytes)
+    write_json_atomic(path, &bytes)?;
+    // 刚写下去的内容就是磁盘现状：同步进读缓存，下一拍不必重新解析。
+    refresh_disk_state_cache(path, &out);
+    Ok(())
+}
+
+/// 非强制保存的最小间隔：守护每拍都会保存模型（换任务、team 状态、花絮），
+/// 但一秒内把整份 state.json 重写多次没有意义，只是多出 fsync + bak 拷贝。
+const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 纯函数：距上次落盘是否已经过了节流窗口（测试直接对着它断言）。
+fn save_window_open(last_flush: Instant, at: Instant) -> bool {
+    at.saturating_duration_since(last_flush) >= SAVE_MIN_INTERVAL
+}
+
+struct SaveThrottle {
+    last_flush: Instant,
+    dirty: bool,
+    /// 窗口内被压下的最新一份快照。后到的那份覆盖前一份：store 是累积的，
+    /// 丢中间几份没事，丢了最后一份才会丢字段。
+    pending: Option<Store>,
+}
+
+impl SaveThrottle {
+    fn new() -> Self {
+        // 初始 last_flush 回拨一个窗口：进程内第一次保存立刻落盘。
+        Self {
+            last_flush: Instant::now()
+                .checked_sub(SAVE_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            dirty: false,
+            pending: None,
+        }
+    }
+}
+
+static SAVE_THROTTLE: OnceLock<Mutex<SaveThrottle>> = OnceLock::new();
+
+fn save_throttle_lock() -> std::sync::MutexGuard<'static, SaveThrottle> {
+    let cell = SAVE_THROTTLE.get_or_init(|| Mutex::new(SaveThrottle::new()));
+    match cell.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// 保存（节流）：1 秒内至多真正写一次盘。窗口内的请求压进 `pending`，由
+/// 下一拍的 `flush_pending_store` 或退出时的强制保存落盘。写入本身仍是
+/// tmp + `sync_all` + rename，不会为了省 IO 牺牲掉掉电安全。
+fn save_store(store: &Store) -> Result<()> {
+    let at = Instant::now();
+    let mut throttle = save_throttle_lock();
+    if !save_window_open(throttle.last_flush, at) {
+        throttle.pending = Some(store.clone());
+        throttle.dirty = true;
+        return Ok(());
+    }
+    throttle.pending = None;
+    throttle.dirty = false;
+    throttle.last_flush = at;
+    let result = save_store_at(&state_path(), store);
+    drop(throttle);
+    result
+}
+
+/// 强制保存：立刻落盘（用户动作、显式持久化、断线、退出）。攒着的 pending
+/// 比这份旧，直接丢掉。
+fn save_store_now(store: &Store) -> Result<()> {
+    let mut throttle = save_throttle_lock();
+    throttle.pending = None;
+    throttle.dirty = false;
+    throttle.last_flush = Instant::now();
+    let result = save_store_at(&state_path(), store);
+    drop(throttle);
+    result
+}
+
+/// 窗口一到就把攒着的最后一份保存写下去：保证「1 秒内最多写一次」的同时
+/// 「最多晚 1 秒落盘」。主循环每拍调一次，退出路径也会调。
+fn flush_pending_store() -> Result<()> {
+    let at = Instant::now();
+    let mut throttle = save_throttle_lock();
+    if !throttle.dirty || !save_window_open(throttle.last_flush, at) {
+        return Ok(());
+    }
+    let Some(store) = throttle.pending.take() else {
+        throttle.dirty = false;
+        return Ok(());
+    };
+    throttle.dirty = false;
+    throttle.last_flush = at;
+    let result = save_store_at(&state_path(), &store);
+    drop(throttle);
+    result
 }
 
 /// 跨进程写锁的句柄：Drop 时删掉 `state.lock`（只删自己建的那份）。
@@ -1797,6 +2084,140 @@ impl QuipSampler {
     }
 }
 
+/// 场景签名：按元素逐个哈希字段（类型 / 坐标 / 文本 / 颜色…），不分配字符串。
+///
+/// 原来是 `scene.to_string()` 再比字符串：每拍都要把整棵场景树序列化一遍
+/// （几十 KB、几十次分配），而这里其实只需要一个「变没变」的布尔。
+fn scene_signature(elements: &[serde_json::Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    elements.len().hash(&mut hasher);
+    for element in elements {
+        hash_value(element, &mut hasher);
+    }
+    hasher.finish()
+}
+
+/// 整个场景（`{"elements": [...]}`）的签名：取元素数组交给 `scene_signature`。
+fn scene_value_signature(scene: &serde_json::Value) -> u64 {
+    let empty: &[serde_json::Value] = &[];
+    let elements = scene
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(empty);
+    scene_signature(elements)
+}
+
+/// 递归哈希一个 JSON 值。每层先写一个类型判别字节：否则 `{"1":2}` 与
+/// `{"1":"2"}` 这类结构不同但拼接相同的值会撞在一起。
+fn hash_value(value: &serde_json::Value, hasher: &mut impl std::hash::Hasher) {
+    use serde_json::Value;
+    use std::hash::Hash;
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Number(n) => {
+            2u8.hash(hasher);
+            // 整数与浮点分开喂：布局里不会混用，但区分开更保险。
+            if let Some(i) = n.as_i64() {
+                0u8.hash(hasher);
+                i.hash(hasher);
+            } else if let Some(u) = n.as_u64() {
+                1u8.hash(hasher);
+                u.hash(hasher);
+            } else if let Some(f) = n.as_f64() {
+                2u8.hash(hasher);
+                f.to_bits().hash(hasher);
+            }
+        }
+        Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_value(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            // serde_json 默认用 BTreeMap，键有序，遍历顺序稳定。
+            for (key, item) in map {
+                key.hash(hasher);
+                hash_value(item, hasher);
+            }
+        }
+    }
+}
+
+/// 当前模型渲染出的场景元素数：`--trace-tick` 打印用，只在真要打印时才调。
+fn scene_element_count(model: &Model) -> usize {
+    layout::draw(model, now(), 0)
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
+}
+
+/// `--trace-tick` 的采样器：只在开启时记录每拍耗时（毫秒），每 10 拍打印一行，
+/// 退出时给出平均 / P95 / 峰值。默认关闭时 `record` 直接返回，等于零开销。
+struct TickTrace {
+    enabled: bool,
+    ticks: u64,
+    /// 只留最近 600 拍（1 秒一拍 = 10 分钟）：报告要的是分布，不是全量历史。
+    samples: std::collections::VecDeque<u64>,
+}
+
+impl TickTrace {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            enabled: args.has("trace-tick"),
+            ticks: 0,
+            samples: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// 记录一拍。`elements` 是惰性求值的：每 10 拍才真的渲染一次数元素，
+    /// 关闭追踪时连这个闭包都不会被调用。
+    fn record(&mut self, started: Instant, elements: impl FnOnce() -> usize) {
+        if !self.enabled {
+            return;
+        }
+        let ms = started.elapsed().as_millis() as u64;
+        self.samples.push_back(ms);
+        if self.samples.len() > 600 {
+            self.samples.pop_front();
+        }
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % 10 == 0 {
+            println!("[tick] {ms}ms elements={}", elements());
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        if !self.enabled || self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let sum: u64 = sorted.iter().sum();
+        let avg = sum as f64 / sorted.len() as f64;
+        let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+        Some(format!(
+            "[tick] 共 {} 拍，平均 {avg:.1} ms，P95 {p95} ms，最大 {} ms",
+            sorted.len(),
+            sorted[sorted.len() - 1]
+        ))
+    }
+}
+
 /// 只在画面签名变化时推送。签名涵盖状态、标题、进度与当前选中项，
 /// 没有真实变化就一个字节都不发——电子墨水屏刷新很贵，也不该无谓闪烁。
 /// 把当前模型渲染上屏；画面没变就不重刷。
@@ -1812,7 +2233,7 @@ async fn push_if_changed(
     fonts: &Fonts,
     fmt: ImageFormat,
     frame: usize,
-    last_sig: &mut Option<String>,
+    last_sig: &mut Option<u64>,
 ) -> bool {
     // 造型的真源是 pet-config.json，`apply_user_config` 每拍已经把它套进 store；
     // 这里只把 store 的快照同步给 model（`skin set` 之后下一帧就换）。放在签名
@@ -1822,7 +2243,8 @@ async fn push_if_changed(
     }
     let phase = if model.settings.animation { frame } else { 0 };
     let mut scene = layout::draw(model, now(), phase);
-    let sig = scene.to_string();
+    // 只比哈希，不序列化整棵树：空闲时这一句省下每秒几十 KB 的分配。
+    let mut sig = scene_value_signature(&scene);
     if last_sig.as_ref() == Some(&sig) {
         // 主画面没变：连花絮缓存都不读，安静地返回。
         return false;
@@ -1837,6 +2259,8 @@ async fn push_if_changed(
                 eprintln!("配置保存失败: {e}");
             }
             scene = layout::draw(model, now(), phase);
+            // 花絮上了屏，签名要跟着这一帧走，否则下次同样的画面会被当成没变。
+            sig = scene_value_signature(&scene);
         }
     }
     let png = match raster::to_png(&scene, fonts) {
@@ -1881,9 +2305,9 @@ async fn push_scene(
     scene: serde_json::Value,
     fonts: &Fonts,
     fmt: ImageFormat,
-    last_sig: &mut Option<String>,
+    last_sig: &mut Option<u64>,
 ) -> bool {
-    let sig = scene.to_string();
+    let sig = scene_value_signature(&scene);
     if last_sig.as_ref() == Some(&sig) {
         return false;
     }
@@ -2119,7 +2543,7 @@ fn with_model_inner(args: &Args, store: &mut Store) -> Model {
             // 单会话预览不落盘：避免把其它会话的任务从状态缓存里抹掉。
             if args.get("session").is_none() {
                 store.model = model.clone();
-                let _ = save_store(store);
+                let _ = save_store_now(store);
             }
             model
         }
@@ -2188,7 +2612,7 @@ fn set_skin(value: &str) -> Result<()> {
         },
     )?;
     let _ = apply_user_config(&mut store);
-    save_store(&store)?;
+    save_store_now(&store)?;
     println!("已切换造型：{}（{}）", skin.name(), skin.id());
     println!("守护下一帧自动生效；想立刻看一次：dsh-pet push --demo working");
     Ok(())
@@ -2311,7 +2735,7 @@ fn cmd_set(args: &Args) -> Result<()> {
     write_pet_config_at(&pet_config_path(), &patch)?;
     // 立刻套回来：打印的是真生效值，state.json 里的快照也跟着对齐。
     let _ = apply_user_config(&mut store);
-    save_store(&store)?;
+    save_store_now(&store)?;
     let s = &store.model.settings;
     println!(
         "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}｜造型 {}",
@@ -2461,7 +2885,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
         } else {
             "未找到（先启动一次 DeepSeek Harness）"
         },
-        if dsh_running() {
+        if dsh_running_cached() {
             "正在运行"
         } else {
             "未运行"
@@ -2510,7 +2934,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
                 },
             )?;
             let _ = apply_user_config(&mut store);
-            save_store(&store)?;
+            save_store_now(&store)?;
             println!(
                 "  已保存设备地址：{}",
                 store.target.as_deref().unwrap_or_default()
@@ -2544,7 +2968,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
                     },
                 )?;
                 let _ = apply_user_config(&mut store);
-                save_store(&store)?;
+                save_store_now(&store)?;
                 println!("  已保存设备地址：{}", d.summary.address);
             }
             target = store.target.clone();
@@ -2685,7 +3109,7 @@ async fn announce(dev: &Device, model: &Model, store: &mut Store, task: &Task) {
                 store.announced.drain(..len - ANNOUNCED_KEEP);
             }
             store.announced_at = now();
-            if let Err(e) = save_store(store) {
+            if let Err(e) = save_store_now(store) {
                 eprintln!("配置保存失败: {e}");
             }
         }
@@ -2738,6 +3162,9 @@ async fn reconnect_in_place(target: Option<&str>) -> Option<Device> {
 }
 
 async fn cmd_run(args: &Args) -> Result<()> {
+    // 进会话前先把上一段（wait_for_task）欠下的节流写入落盘，否则下面读到的
+    // 磁盘快照可能缺最近一次 announced/format 变化。
+    let _ = flush_pending_store();
     let mut store = load_store();
     // 用户配置的唯一来源是 pet-config.json（插件面板与 CLI 都写它）。
     // state.json 里的 `model.settings` 只是快照，只在首次迁移时被读一次。
@@ -2763,7 +3190,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                 },
             )?;
             let _ = apply_user_config(&mut store);
-            save_store(&store)?;
+            save_store_now(&store)?;
         }
     }
     let target = args
@@ -2819,7 +3246,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
         .map(|v| v as i64)
         .unwrap_or_else(|| store.idle_grace());
     let mut frame = 0usize;
-    let mut last_sig: Option<String> = None;
+    let mut last_sig: Option<u64> = None;
     // 语音输入按新版规格从设备手势里移除：确认键长按不再触发录音转写。
     // `voice` 诊断命令仍在（`dsh-pet voice ...`），设备侧只保留单击/双击/三击。
     // 设备正在录音时固件占着采集，推送和响铃都会拿到 Busy——这一拍直接跳过，
@@ -2884,9 +3311,14 @@ async fn cmd_run(args: &Args) -> Result<()> {
         }
     }
 
+    // `--trace-tick`：只在开启时记录每拍耗时，每 10 拍打印一行；默认零开销。
+    let mut trace = TickTrace::from_args(args);
     let outcome = loop {
         tokio::select! {
             _ = scan_tick.tick() => {
+                let tick_started = Instant::now();
+                // 上一拍在节流窗口里攒下的状态，到点就落盘（1 秒内最多写一次）。
+                let _ = flush_pending_store();
                 // DSH 插件/面板退出或被结束：子进程自己收尾，别留下孤儿占着设备。
                 if args
                     .get("watch-pid")
@@ -2897,7 +3329,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     println!("DSH 已退出：释放设备，宠物退出。");
                     break Ok(());
                 }
-                if watch && !dsh_running() {
+                if watch && !dsh_running_cached() {
                     println!("DeepSeek Harness 已退出：正常断开设备，回到待命。");
                     break Ok(());
                 }
@@ -2910,7 +3342,16 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     println!("[手势] 录音事件超时，已复位（10 秒内没有收到 RecordingFinished）");
                 }
                 if recording {
+                    trace.record(tick_started, || scene_element_count(&model));
                     continue;
+                }
+                // 磁盘上的提醒指纹可能被别的进程（插件面板 / 守护父进程）刚更新：
+                // 按时间取新，避免本进程把同一条等待再响一遍。缓存按 mtime+长度
+                // 命中，文件没变时零解析。
+                let disk = cached_load_store();
+                if disk.announced_at > store.announced_at {
+                    store.announced = disk.announced;
+                    store.announced_at = disk.announced_at;
                 }
                 // 用户配置每拍重读一次（pet-config.json；mtime 没变时直接复用上次
                 // 解析结果）：插件面板或 `dsh-pet set` 改完 2 秒内生效，不用重启守护。
@@ -2959,7 +3400,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     if let Err(e) = write_pet_config_at(&pet_config_path(), &patch) {
                         eprintln!("设置保存失败: {e}");
                     }
-                    if let Err(e) = save_store(&store) {
+                    if let Err(e) = save_store_now(&store) {
                         eprintln!("设置保存失败: {e}");
                     }
                     model.quip = if model.settings.sound_enabled {
@@ -2999,10 +3440,11 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     }
                     // 记下交还时刻：外层重新待命后，冷却期内不再立刻抢回来。
                     store.released_at = Some(now());
-                    let _ = save_store(&store);
+                    let _ = save_store_now(&store);
                     break Ok(());
                 }
                 if !model.settings.follow_enabled {
+                    trace.record(tick_started, || scene_element_count(&model));
                     continue;
                 }
                 // 扫描到变化：先只标记「想刷新」，真正的推送统一走下面的冷却闸门。
@@ -3046,6 +3488,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                         pending_push = false;
                     }
                 }
+                trace.record(tick_started, || scene_element_count(&model));
             }
             event = dev.next_event() => {
                 match event {
@@ -3082,7 +3525,7 @@ async fn cmd_run(args: &Args) -> Result<()> {
                                 {
                                     eprintln!("设置保存失败: {e}");
                                 }
-                                if let Err(e) = save_store(&store) {
+                                if let Err(e) = save_store_now(&store) {
                                     eprintln!("设置保存失败: {e}");
                                 }
                                 println!(
@@ -3166,7 +3609,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
                         // 断线先原地重连：1s/2s/4s 共 3 次，成功就留在这一轮会话里；
                         // 3 次都失败才返回外层，由 `cmd_watch` 用 15s/30s/60s 的长窗口兜底。
                         println!("[连接] 设备连接已结束（{reason:?}）");
-                        if watch && !dsh_running() {
+                        // 断线是持久化边界：节流窗口里攒着的状态立刻落盘，
+                        // 免得接下来的重连/退出把最后一笔改动丢了。
+                        let _ = flush_pending_store();
+                        if watch && !dsh_running_cached() {
                             println!("DeepSeek Harness 已退出：不再重连。");
                             break Ok(());
                         }
@@ -3216,9 +3662,12 @@ async fn cmd_run(args: &Args) -> Result<()> {
         }
     };
 
+    if let Some(summary) = trace.summary() {
+        println!("{summary}");
+    }
     let closed = dev.close().await;
     store.model = model;
-    let _ = save_store(&store);
+    let _ = save_store_now(&store);
     println!("已断开并保存状态。");
     closed?;
     outcome
@@ -3231,6 +3680,7 @@ async fn wait_for_task(
     store: &mut Store,
     watcher: &mut Watcher,
     parent: Option<u32>,
+    trace: &mut TickTrace,
 ) -> Result<bool> {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3239,6 +3689,8 @@ async fn wait_for_task(
     let mut team = TeamScan::default();
     loop {
         tick.tick().await;
+        let tick_started = Instant::now();
+        let _ = flush_pending_store();
         if parent.is_some_and(|p| !pid_alive(p)) {
             println!("控制面板已退出：结束待命。");
             return Ok(false);
@@ -3249,11 +3701,24 @@ async fn wait_for_task(
         if apply_user_config(store) {
             let _ = save_store(store);
         }
-        if !dsh_running() {
+        // 外层手上这份 store 是启动时的快照：上一轮会话在 `cmd_run` 里写下的
+        // `released_at` 只有从磁盘取回才知道，否则冷却期内会立刻把设备抢回来。
+        // 命中磁盘缓存时零解析；文件没被改过就只克隆一次内存快照。
+        let disk = cached_load_store();
+        if let Some(released) = disk.released_at {
+            if store.released_at.is_none_or(|mine| released > mine) {
+                store.released_at = Some(released);
+            }
+        }
+        if store.idle_grace.is_none() {
+            store.idle_grace = disk.idle_grace;
+        }
+        if !dsh_running_cached() {
             println!("DeepSeek Harness 已退出：结束待命。");
             return Ok(false);
         }
         if !store.model.settings.follow_enabled {
+            trace.record(tick_started, || scene_element_count(&store.model));
             continue;
         }
         let (events, changed) = scan_into(&mut store.model, watcher);
@@ -3302,9 +3767,12 @@ async fn wait_for_task(
                 .iter()
                 .any(|t| t.status() == Status::Working);
             if ready && (working || fresh) {
+                // 马上要进 cmd_run：把欠下的节流写入落盘，避免它读到旧快照。
+                let _ = flush_pending_store();
                 return Ok(true);
             }
         }
+        trace.record(tick_started, || scene_element_count(&store.model));
     }
 }
 
@@ -3426,14 +3894,14 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                 },
             )?;
             let _ = apply_user_config(&mut store);
-            save_store(&store)?;
+            save_store_now(&store)?;
         }
     }
     // 显式给的宽限要记下来（`Some` 才代表用户设过），下次不带参数也照旧。
     if let Some(g) = args.get("idle-grace").and_then(|v| v.parse::<u32>().ok()) {
         if store.idle_grace != Some(g) {
             store.idle_grace = Some(g);
-            save_store(&store)?;
+            save_store_now(&store)?;
         }
     }
     let target = args
@@ -3467,6 +3935,9 @@ async fn cmd_watch(args: &Args) -> Result<()> {
         .get("watch-pid")
         .or_else(|| args.get("parent"))
         .and_then(|v| v.parse::<u32>().ok());
+    // `--trace-tick` 在 watch 里也生效：待命 tick 与之后每次会话（session 继承
+    // 同一批 flags）都会采样；关闭时 record 是空操作。
+    let mut trace = TickTrace::from_args(args);
     loop {
         if let Some(p) = parent {
             if !pid_alive(p) {
@@ -3474,12 +3945,12 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                 return Ok(());
             }
         }
-        if !dsh_running() {
+        if !dsh_running_cached() {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
         println!("检测到 DeepSeek Harness，进入待命（只读会话，不占用设备）。");
-        if !wait_for_task(&mut store, &mut watcher, parent).await? {
+        if !wait_for_task(&mut store, &mut watcher, parent, &mut trace).await? {
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -3507,7 +3978,8 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                         }
                     }
                     // 拿不到设备时别硬抢：已经没有活跃任务就把设备让出来。
-                    let disk = load_store();
+                    // 走缓存：这里每 15/30/60 秒才跑一次，但文件没变时不必重解析。
+                    let disk = cached_load_store();
                     if !should_hold(&disk.model, now(), grace) {
                         println!("已无活跃任务，不再重连。");
                         break;
@@ -3518,7 +3990,7 @@ async fn cmd_watch(args: &Args) -> Result<()> {
                         exhausted = true;
                         break;
                     }
-                    if !dsh_running() {
+                    if !dsh_running_cached() {
                         break;
                     }
                     // 外层兜底：15s → 30s → 60s 封顶。原地重连已经试过 3 次，
@@ -3599,8 +4071,9 @@ fn usage() {
                                            只播放一次提示音
   dsh-pet push    [--demo <状态>] [--target IP|ID] [--format mute]
                                            单次推送后立即断开
-  dsh-pet watch   [--watch-pid PID] [--idle-grace 秒] [--verbose]
+  dsh-pet watch   [--watch-pid PID] [--idle-grace 秒] [--verbose] [--trace-tick]
                                            守护：有任务才占用设备，任务结束 5 分钟无新任务即交还
+                                           --trace-tick：每 10 拍打印 [tick] 耗时与元素数（默认关闭）
   dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
                                            语音链路诊断
   dsh-pet where                            显示数据与配置路径（配置 = pet-config.json）
@@ -3659,6 +4132,14 @@ fn main() {
 }
 
 async fn async_main(args: Args) -> Result<()> {
+    let result = dispatch(args).await;
+    // 节流窗口里可能还攒着最后一笔保存（例如 `set` 之前的一次自动同步）：
+    // 进程退出前统一落盘，保证「命令返回 = 已经写进 state.json」。
+    let _ = flush_pending_store();
+    result
+}
+
+async fn dispatch(args: Args) -> Result<()> {
     let cmd = args.cmd.clone();
     let result = match cmd.as_str() {
         "preview" | "scene" => {
@@ -4571,5 +5052,249 @@ mod tests {
         assert_eq!(outer_reconnect_wait(2), 30);
         assert_eq!(outer_reconnect_wait(3), 60);
         assert_eq!(outer_reconnect_wait(9), 60, "封顶 60 秒，不再线性增长");
+    }
+
+    /// 全目录扫描要真的降到 10 秒一次：中间那些拍只做已知文件的 metadata 快查。
+    #[test]
+    fn team_scan_full_scan_interval() {
+        let mut scan = TeamScan::default();
+        let t0 = Instant::now();
+        assert!(scan.should_full_scan(t0), "首次必须走全扫，否则发现不了已有子会话");
+        scan.last_full_scan = Some(t0);
+        assert!(!scan.should_full_scan(t0 + Duration::from_secs(1)));
+        assert!(
+            !scan.should_full_scan(t0 + Duration::from_secs(9)),
+            "10 秒内只做快查，不再遍历目录"
+        );
+        assert!(scan.should_full_scan(t0 + Duration::from_secs(10)));
+    }
+
+    /// `files` 不能无限增长：过期的子会话和已经删掉的目录都要清出去。
+    #[test]
+    fn team_scan_prune_drops_stale_and_missing() {
+        let dir = TempDir::new("team-prune");
+        let keep = dir.path().join("keep.zstd");
+        let old = dir.path().join("old.zstd");
+        let gone = dir.path().join("gone.zstd");
+        std::fs::write(&keep, b"x").unwrap();
+        std::fs::write(&old, b"x").unwrap();
+        let at = now();
+        let mut files: std::collections::HashMap<_, _> = std::collections::HashMap::new();
+        files.insert(keep.clone(), (1u64, at, None, false));
+        files.insert(old.clone(), (1u64, at - TEAM_STALE_SECS - 1, None, false));
+        files.insert(gone.clone(), (1u64, at, None, false));
+
+        TeamScan::prune(&mut files, at);
+
+        assert!(files.contains_key(&keep), "新鲜且存在的文件要保留");
+        assert!(!files.contains_key(&old), "超过 12 小时的子会话要丢掉");
+        assert!(
+            !files.contains_key(&gone),
+            "已经不存在（目录被删）的路径要丢掉"
+        );
+    }
+
+    /// 签名只依赖内容：同样内容同签名，坐标/文本/元素数量变了都要换签名，
+    /// 否则「没变就不推」会把真实变化吞掉。
+    #[test]
+    fn scene_signature_is_stable_and_sensitive() {
+        let base = serde_json::json!([
+            {"type": "text", "x": 1, "y": 2, "text": "正在思考"},
+            {"type": "rect", "x": 3, "y": 4, "w": 5, "h": 6}
+        ]);
+        let a: Vec<serde_json::Value> = serde_json::from_value(base.clone()).unwrap();
+        let b: Vec<serde_json::Value> = serde_json::from_value(base).unwrap();
+        assert_eq!(
+            scene_signature(&a),
+            scene_signature(&b),
+            "内容相同必须同签名，否则每拍都白推一帧"
+        );
+
+        let mut moved = a.clone();
+        moved[1]["x"] = serde_json::json!(31);
+        assert_ne!(
+            scene_signature(&a),
+            scene_signature(&moved),
+            "坐标变了签名必须变"
+        );
+
+        let mut retext = a.clone();
+        retext[0]["text"] = serde_json::json!("正在等待");
+        assert_ne!(
+            scene_signature(&a),
+            scene_signature(&retext),
+            "文本变了签名必须变"
+        );
+
+        let mut added = a.clone();
+        added.push(serde_json::json!({"type": "text", "text": ""}));
+        assert_ne!(
+            scene_signature(&a),
+            scene_signature(&added),
+            "元素数量变了签名必须变"
+        );
+    }
+
+    /// 节流窗口：1 秒内只允许一次落盘，到了 1 秒立刻放行。
+    #[test]
+    fn save_window_allows_one_flush_per_second() {
+        let t0 = Instant::now();
+        assert!(!save_window_open(t0, t0), "同一时刻只允许一次写盘");
+        assert!(!save_window_open(t0, t0 + Duration::from_millis(999)));
+        assert!(save_window_open(t0, t0 + Duration::from_secs(1)));
+        assert!(save_window_open(t0, t0 + Duration::from_secs(30)));
+        assert!(
+            !save_window_open(t0, t0 - Duration::from_secs(1)),
+            "Instant 单调，回拨不会发生；饱和到 0 视为窗口未开"
+        );
+    }
+
+    /// 磁盘缓存必须跟着文件走：外部进程改写 state.json 后不能返回旧快照。
+    #[test]
+    fn cached_load_store_follows_disk_rewrites() {
+        let dir = TempDir::new("disk-cache");
+        let path = dir.path().join("state.json");
+        let mut first = Store::default();
+        first.model.cache_version = 3;
+        first.format = "gif".into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&first).unwrap()).unwrap();
+        assert_eq!(cached_load_store_at(&path).format, "gif");
+
+        let mut second = first.clone();
+        second.format = "png-外部写入".into();
+        second.target = Some("外部写入".into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&second).unwrap()).unwrap();
+
+        let got = cached_load_store_at(&path);
+        assert_eq!(got.format, "png-外部写入", "文件变了必须重新读取");
+        assert_eq!(got.target.as_deref(), Some("外部写入"));
+    }
+
+    /// 签名比 `to_string()` 便宜多少：空闲时每拍都要比一次，报告里要引用这个数。
+    /// 只打印数字 + 一个宽松上界（慢于序列化两倍才算失败），避免并行跑测试时
+    /// 被调度噪声卡住。
+    #[test]
+    fn scene_signature_is_cheaper_than_serializing_the_scene() {
+        let elements: Vec<serde_json::Value> = (0..200)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "text",
+                    "x": i * 3,
+                    "y": i * 5,
+                    "w": 120,
+                    "h": 18,
+                    "size": 14,
+                    "text": format!("第 {i} 行状态"),
+                })
+            })
+            .collect();
+        let rounds = 2000;
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(scene_signature(std::hint::black_box(&elements)));
+        }
+        let hash_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let text = serde_json::to_string(std::hint::black_box(&elements)).unwrap();
+            std::hint::black_box(&text);
+        }
+        let string_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        println!("[bench] 签名 {hash_ms:.1}ms / to_string {string_ms:.1}ms（{rounds} 次 × 200 元素）");
+        assert!(
+            hash_ms <= string_ms * 2.0,
+            "hash 路径不应比序列化还慢：{hash_ms:.1}ms vs {string_ms:.1}ms"
+        );
+    }
+
+    /// 一拍空闲 tick 的成本分解：会话扫描 + 团队快查 + 读缓存 + 布局+签名。
+    /// 用于报告里的「tick 平均耗时」；上界放得很宽（单拍 >50ms 才算回归）。
+    #[test]
+    fn idle_tick_components_stay_cheap() {
+        let dir = TempDir::new("tick-bench");
+        let mut team = TeamScan::default();
+        // 5 个已知子会话：快查模式每拍只 stat，不再重新解压。
+        for i in 0..5 {
+            let path = dir.path().join(format!("child-{i}.jsonl.zstd"));
+            std::fs::write(&path, b"fake").unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            team.touch(&path, meta.len(), mtime_secs(&meta));
+        }
+        // 一份落盘的 state.json：量「读缓存命中」这一条路的克隆成本。
+        let state = dir.path().join("state.json");
+        let mut seeded = Store::default();
+        seeded.model.cache_version = 3;
+        std::fs::write(&state, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+        assert_eq!(cached_load_store_at(&state).format, seeded.format);
+
+        let mut model = Model::default();
+        let mut watcher = Watcher::new(dir.path().to_path_buf());
+        let rounds = 200;
+        let per = |started: Instant| started.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let _ = watcher.scan();
+        }
+        let scan_ms = per(started);
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let _ = team.sync(&mut model, dir.path());
+        }
+        let team_ms = per(started);
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(cached_load_store_at(&state));
+        }
+        let cache_ms = per(started);
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let scene = layout::draw(&model, now(), 0);
+            std::hint::black_box(scene_value_signature(std::hint::black_box(&scene)));
+        }
+        let draw_ms = per(started);
+
+        let idle_ms = scan_ms + team_ms + cache_ms;
+        println!(
+            "[bench] 空闲一拍 {idle_ms:.2}ms = 扫描 {scan_ms:.4} + 团队快查 {team_ms:.4} + 读缓存 {cache_ms:.4}；布局+签名 {draw_ms:.2}（{rounds} 次平均）"
+        );
+        assert!(
+            idle_ms + draw_ms < 50.0,
+            "单拍成本异常：{:.2}ms（>50ms 说明又回到了每拍重活）",
+            idle_ms + draw_ms
+        );
+    }
+
+    /// `--trace-tick` 默认关闭时零成本（连样本都不记）；开启后累计样本并给出汇总。
+    #[test]
+    fn tick_trace_samples_only_when_enabled() {
+        let mut off = TickTrace::from_args(&Args {
+            cmd: "run".to_string(),
+            flags: Vec::new(),
+        });
+        assert!(!off.enabled);
+        assert!(off.summary().is_none());
+        off.record(Instant::now(), || 1);
+        assert_eq!(off.ticks, 0, "关闭时不该累计拍数");
+
+        let mut on = TickTrace::from_args(&Args {
+            cmd: "run".to_string(),
+            flags: vec![("trace-tick".to_string(), "true".to_string())],
+        });
+        assert!(on.enabled);
+        for _ in 0..12 {
+            on.record(Instant::now(), || 7);
+        }
+        assert_eq!(on.ticks, 12);
+        assert_eq!(on.samples.len(), 12);
+        let summary = on.summary().expect("开启后应给出汇总");
+        assert!(summary.contains("共 12 拍"), "{summary}");
+        assert!(summary.contains("最大"), "{summary}");
     }
 }

@@ -833,6 +833,12 @@ impl Watcher {
                     };
                 }
             }
+            // 文件没长大的话这一拍无事可做：不必 open/seek/read（每个会话每秒
+            // 一次全量读取是空闲时的主要 syscall 开销）。`tail` 里的半帧留着，
+            // 等下次真的追加字节时再一起解。
+            if !fresh && size == self.cursors[&path].offset {
+                continue;
+            }
             let mut chunk = vec![];
             {
                 let offset = self.cursors[&path].offset;
