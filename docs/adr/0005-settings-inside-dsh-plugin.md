@@ -19,3 +19,10 @@
 - DSH 未启动时无法改设置、也无法手动启动宠物（这是用户明确要的低侵入行为）。
 - 插件 client 页面需要写 UI（纯 JS React + 主题 token），不是零成本。
 - 开发/验收仍保留 CLI 诊断命令，但不面向用户文档。
+
+## 修订（2026-11-18，v0.7.3）
+
+- 现象：插件卡片在「设置 → 内置插件」可见，但设置表单不出现。
+- 根因：`plugin/package.json` 的 `dsh.client.inject: ["slots"]`。该字段声明的是「先加载哪些客户端模块包」（如 `@deepseek-ai/dsh-client-ui-settings`），写服务名 `slots` 不是可解析的模块 id，client bundle 因此没被加载，`plugins.bundle.config` 的注册从未执行。
+- 修复：移除 `dsh.client.inject`（本页只依赖核心提供的 `slots` 服务，用工厂里的 `inject: ['slots']` 即可），注册包在 `ctx.effect(...)` 里以便 HMR/停用时释放。
+- 教训：配置页位置在侧栏「插件」页的组合包详情（描述与行之间），不是「设置 → 内置插件」（那里只读列表）。

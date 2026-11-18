@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.7.2 · 2026-11-18
+> 版本：0.7.3 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -184,8 +184,8 @@
 
 **FR-SET-01 位置**
 - 期望：DSH 的 Plugins 页 → 本插件详情（与官方插件一致）；无独立面板/托盘。
-- 状态：待验证（代码完成，需重启 DSH 在界面确认；本机已装 bundle，`plugins.bundle.config` slot 注册 key `zectrix-croc-pet`）。
-- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.slots.inject('plugins.bundle.config', …)`；`package.json` `dsh.client{platform:web,immediately:true}`；Node 沙箱 harness 实测注册 `{name:'plugins.bundle.config', key:'zectrix-croc-pet'}` 且组件为函数（`CLIENT OK`）；展示元信息 `plugin/locale/{en,zh}.json`（meta.title/description）与 `./icon` 已导出并通过 `files` 打包，插件启用/停用重载无警告、宠物进程正常拉起。页面渲染需刷新 DSH GUI 后确认。
+- 状态：待验证（代码完成；0.7.3 修掉 `dsh.client.inject: ["slots"]` —— 该字段要的是「先加载哪些客户端模块包」，写成服务名会让 client bundle 加载失败；移除后需刷新 DSH 界面确认）。
+- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.effect(() => ctx.slots.inject('plugins.bundle.config', …))`；`package.json` `dsh.client{platform:web,immediately:true}`（无 inject）；Node 沙箱 harness 实测注册 `{name:'plugins.bundle.config', key:'zectrix-croc-pet'}` 且组件为函数（`CLIENT OK`）；展示元信息 `plugin/locale/{en,zh}.json`（meta.title/description）与 `./icon` 已导出并通过 `files` 打包，插件启用/停用重载无警告、宠物进程正常拉起。页面渲染需刷新 DSH GUI 后确认。
 
 **FR-SET-02 字段**
 - 术语说明：见 GLOSSARY「配置桥」「宿主插件」「client bundle」。
@@ -210,9 +210,9 @@
 
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-croc-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
 - 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-croc-pet （`main` 已推送；tag `v0.7.2`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
-- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装出 0.7.2 到 profile `node_modules`；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
+- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.2）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.3）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
 ## 10. 可验证性（FR-VER）
