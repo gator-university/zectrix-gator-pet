@@ -12,8 +12,10 @@
        is mandatory and this script creates it for you)
     3. builds and tests with CMAKE_POLICY_VERSION_MINIMUM=3.5
     4. verifies the produced exe
-    5. optional: with -DeviceIp, checks the device, pushes one frame and
-       enables autostart
+    5. optional: with -DeviceIp, checks the device and pushes one frame
+
+  It never writes startup entries or shortcuts: as a DSH plugin the pet starts
+  and stops with DeepSeek Harness (see the note printed at the end).
 
   Exit codes: 0 ok | 1 prerequisites | 2 sdk | 3 build | 4 test | 5 verify | 6 device
 #>
@@ -142,19 +144,16 @@ if ($DeviceIp -ne '') {
         & $exe push --target $DeviceIp
         if ($LASTEXITCODE -ne 0) { Fail 6 'push failed twice: device busy or unreachable' }
     }
-    Info 'enabling autostart'
-    & $exe autostart on --target $DeviceIp
-    if ($LASTEXITCODE -ne 0) { Fail 6 'autostart failed' }
 }
 
 Write-Host ''
 Write-Host 'DONE' -ForegroundColor Green
 Info "exe     : $exe"
-Info 'next    : start DeepSeek Harness, then run one of these:'
-Info "            & `"$exe`" watch                          # follow tasks until you press Ctrl+C"
-Info "            & `"$exe`" autostart on --target <IP>      # run in background at login"
+Info 'next    : install the plugin (DSH > Settings > Plugins) from this repo, then restart DSH.'
+Info '          the pet starts and stops with DSH - no autostart entry or shortcut is needed.'
+Info "          to watch tasks by hand: & `"$exe`" watch"
 Info '          (PowerShell needs the & before a quoted path; cmd does not)'
 if ($DeviceIp -eq '') {
-    Info 'device  : not touched. Re-run with -DeviceIp <IP> to check, push and enable autostart.'
+    Info 'device  : not touched. Re-run with -DeviceIp <IP> to check and push one frame.'
 }
 exit 0
