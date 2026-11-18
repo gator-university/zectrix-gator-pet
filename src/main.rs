@@ -1032,7 +1032,13 @@ fn sibling_json(path: &Path, role: &str) -> PathBuf {
 /// 同目录 tmp → `sync_all` → rename 覆盖。Windows 下目标被杀软/索引/别的进程
 /// 短暂占用时 rename 会失败，此时回退 copy + remove，保证内容仍然落盘。
 fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // tmp 名必须唯一：多个进程/线程同时保存时共用一个 `state.json.tmp` 会让
+    // 先完成的 rename 把文件挪走，另一个 rename 拿到 ENOENT（或写进半份内容）。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{stamp}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)
             .with_context(|| format!("创建临时文件 {} 失败", tmp.display()))?;
