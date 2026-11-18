@@ -20,7 +20,7 @@
 - 步骤：退出宠物 → 在 DSH 中启用本插件 → 关闭并重新打开 DSH。
 - 期望：DSH 启动后 ≤5 秒内 `dsh-pet.exe watch` 出现，`pet.log` 有启动行。
 - 状态：已验收。
-- 证据：`plugin/index.js` `apply()` spawn `bin/dsh-pet.exe watch --watch-pid <host pid>`；2026-11-18 02:10 禁用/启用插件触发重载，宿主自动拉起 pid 41048（父进程为 DSH Host），`pet.log` 记录「已启动宠物」与推送。
+- 证据：`plugin/index.js` `apply()` spawn `bin/dsh-pet.exe watch --watch-pid <host pid>`；2026-11-18 02:10 禁用/启用插件触发重载，宿主自动拉起 pid 41048（父进程为 DSH Host），`pet.log` 记录「已启动宠物」与推送；**2026-11-18 18:03 重启 DSH 后从 Git 安装副本拉起** `C:\Users\liujj\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe watch --watch-pid 52488`（pid 49176，父进程为 DSH Host），配置桥 4517 的 `/health` 返回该安装路径，18:03:31 推送成功（1.70s）。
 
 **FR-LIFE-02 DSH 退出即退出宠物进程**
 - 步骤：DSH 托盘 Quit（正常退出）。
@@ -209,7 +209,8 @@
 - 状态：已验收。
 
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-croc-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
-- 状态：待验证（仓库已创建并推送 `main`：https://github.com/gator-university/zectrix-croc-pet ；`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 实测安装成功、profile `node_modules/zectrix-croc-pet` 含 exe 与配置桥；**运行态需重启 DSH 后复核**，见 FR-LIFE-01）。
+- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-croc-pet （`main` 已推送；tag `v0.7.2`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
+- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装出 0.7.2 到 profile `node_modules`；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
 
 **FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.2）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
