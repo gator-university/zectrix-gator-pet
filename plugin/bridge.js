@@ -13,6 +13,7 @@ import { isIPv4 } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { hardenDataDir } from './winacl.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8')).version
@@ -236,6 +237,15 @@ export async function createBridge({ port = 4517, petConfigPath, runCli, log, to
   if (!petConfigPath) throw new Error('createBridge 需要 petConfigPath')
   const cli = typeof runCli === 'function' ? runCli : async () => ({ ok: false, output: 'runCli 未注入' })
   const logLine = typeof log === 'function' ? log : () => {}
+  // 先建目录并收紧 ACL，再生成/复用令牌：令牌落盘时目录已经只对
+  // 当前用户 + SYSTEM 开放。icacls 失败只警告，不阻塞配置桥。
+  const dataDir = path.dirname(tokenFilePath())
+  try {
+    fs.mkdirSync(dataDir, { recursive: true })
+  } catch {
+    // 目录建不出来时 loadOrCreateToken 会自己再试一次并报错。
+  }
+  await hardenDataDir(dataDir, tokenFilePath(), { log: logLine })
   let token = loadOrCreateToken()
   // 有效期从「最近一次签发」算起：/token 每次调用都换新令牌，旧令牌立即作废。
   let tokenIssuedAt = Date.now()
