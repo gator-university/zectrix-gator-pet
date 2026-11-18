@@ -32,6 +32,16 @@ window.__ModuleLoader__.load({
       { value: 'gray4', label: 'gray4（4 级灰，约 3.5 秒/帧）' },
       { value: 'gray16', label: 'gray16（16 级灰，约 5 秒/帧）' },
     ]
+    // 标题来源：session 是默认值，prompt 是显式 opt-in（会把提示词首行写进
+    // state.json 并显示在设备上）。文案必须把这个代价说清楚。
+    const TITLE_SOURCES = [
+      { value: 'session', label: '会话标题（默认）', hint: '只读 DSH 的会话标题，不读正文' },
+      { value: 'prompt', label: '提示词首行', hint: '会把提示词首行写入 state.json 与设备' },
+    ]
+    // 默认值以 Rust 侧为准（src/main.rs 的 Settings::default）：
+    // pet-config.json 没写这些键时，宠物就是这么跑的，面板不能另立一套默认。
+    const DEFAULT_VOLUME = 90
+    const DEFAULT_MODE = 'realtime'
 
     const row = { display: 'flex', alignItems: 'center', gap: 12, margin: '14px 0' }
     const label = { width: 132, flex: 'none', opacity: 0.72, fontSize: 13 }
@@ -110,14 +120,27 @@ window.__ModuleLoader__.load({
       const save = () => {
         setBusy(true)
         setNote('')
+        const body = { ...(cfg || {}) }
+        const wantTitle = body.title_source
         api('/config', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(cfg || {}),
+          body: JSON.stringify(body),
         })
-          .then(() => {
-            setNote('已保存，宠物 2 秒内生效')
-            load()
+          .then(async () => {
+            // 回读一次：设置桥对不认识的键会静默丢弃，这里说清楚哪一项没落盘，
+            // 而不是让用户以为「已保存」。
+            const next = await api('/config')
+            const got = next.config || {}
+            setCfg(got)
+            if (wantTitle && got.title_source !== wantTitle) {
+              setNote(
+                `已保存其余项；标题来源没能写入 pet-config（设置桥暂不支持该字段），` +
+                  `请在终端执行：dsh-pet set --title-source ${wantTitle}`,
+              )
+            } else {
+              setNote('已保存，宠物 2 秒内生效')
+            }
           })
           .catch(e => setErr(String(e.message || e)))
           .finally(() => setBusy(false))
@@ -179,7 +202,7 @@ window.__ModuleLoader__.load({
           { label: '模式' },
           h(
             'select',
-            { style: input, value: cfg.mode || 'calm', onChange: e => set('mode', e.target.value) },
+            { style: input, value: cfg.mode || DEFAULT_MODE, onChange: e => set('mode', e.target.value) },
             MODES.map(m => h('option', { key: m.value, value: m.value }, `${m.label} · ${m.hint}`)),
           ),
         ),
@@ -196,11 +219,11 @@ window.__ModuleLoader__.load({
             type: 'range',
             min: 0,
             max: 100,
-            value: Number(cfg.volume ?? 40),
+            value: Number(cfg.volume ?? DEFAULT_VOLUME),
             onChange: e => set('volume', Number(e.target.value)),
             style: { flex: 1, maxWidth: 180 },
           }),
-          h('span', { style: { opacity: 0.6 } }, `${cfg.volume ?? 40}`),
+          h('span', { style: { opacity: 0.6 } }, `${cfg.volume ?? DEFAULT_VOLUME}`),
         ),
 
         h(
@@ -242,6 +265,27 @@ window.__ModuleLoader__.load({
             { style: input, value: cfg.format || 'mono', onChange: e => set('format', e.target.value) },
             FORMATS.map(f => h('option', { key: f.value, value: f.value }, f.label)),
           ),
+        ),
+
+        h(
+          Field,
+          { label: '标题来源' },
+          h(
+            'select',
+            {
+              style: input,
+              value: cfg.title_source || 'session',
+              onChange: e => set('title_source', e.target.value),
+            },
+            TITLE_SOURCES.map(t =>
+              h('option', { key: t.value, value: t.value }, `${t.label} · ${t.hint}`),
+            ),
+          ),
+        ),
+        h(
+          'p',
+          { style: { margin: '-8px 0 12px 144px', opacity: 0.6, fontSize: 12 } },
+          '默认只读 DSH 的会话标题；选「提示词首行」是显式 opt-in，会把提示词首行写入 state.json 并显示在设备上。',
         ),
 
         h(

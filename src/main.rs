@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 use dsh_pet::{
     device, layout,
-    model::{Event as TaskEvent, Model, Status, Task, TitleSource},
+    model::{Event as TaskEvent, Model, Settings, Status, Task, TitleSource},
     raster::{self, Fonts},
     sound,
     sprite::Skin,
@@ -234,7 +234,12 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// 本机持久化：只存状态缓存、设置与设备目标，不含任何会话正文。
+/// 本机持久化：只存运行时状态缓存，不含任何会话正文。
+///
+/// 用户设置（跟随/提示音/音量/动画/刷新/标题来源/造型/设备地址/屏幕格式）
+/// 的唯一真源是 `pet-config.json`；这里的 `model.settings` / `target` / `format`
+/// 只是**快照**（面板与预览读它，不必去解析配置），写入时不再参与「谁更权威」
+/// 的合并——每拍 `apply_user_config` 会从配置重新生成。
 #[derive(Clone, Serialize, Deserialize)]
 struct Store {
     #[serde(default)]
@@ -273,49 +278,12 @@ struct Store {
     /// 否则写入合并时会把它当成默认值又让磁盘旧值盖回去。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_grace: Option<u32>,
-    /// 本次 save 是否要**显式**写入造型。守护内存里的 store 是启动时快照，
-    /// 若整份回写会把 `skin set` 刚改的造型盖回去；只有 `skin set` 自己置 true。
-    #[serde(skip)]
-    skin_explicit: bool,
-    /// 本次 save 是否要**显式**写入跟随/提示音设置。理由同上：守护回写时
-    /// 不能让几分钟前的内存快照盖掉 `dsh-pet set` 刚写进磁盘的值。
-    #[serde(skip)]
-    settings_explicit: bool,
     /// 本次加载是否读到了损坏的 state.json。只存在内存里（不落盘）：
     /// 真时 `save_store` 拒绝覆盖磁盘上的 state.json，只写 `state.recovered.json`，
     /// 直到下一次成功解析干净文件才清除——否则一份坏文件会让默认值把
     /// 42KB 的任务/提醒/设置整份冲掉。
     #[serde(skip)]
     degraded: bool,
-}
-
-/// 从磁盘读当前造型：守护每帧刷新一次，换肤后最多 2 秒就能上屏，
-/// 不必重启守护，也不会被它内存里的旧快照覆盖。
-fn disk_pet_skin() -> Option<String> {
-    let bytes = std::fs::read(state_path()).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v["model"]["settings"]["pet_skin"]
-        .as_str()
-        .map(str::to_string)
-}
-
-/// 从磁盘读设置（跟随/提示音/音量/动画/陈旧分钟）。`dsh-pet set` 写的就是这里，
-/// 守护每一拍重新读一次，所以改完 2 秒内生效，不需要重启守护。
-fn disk_settings() -> Option<dsh_pet::model::Settings> {
-    let bytes = std::fs::read(state_path()).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    serde_json::from_value(v["model"]["settings"].clone()).ok()
-}
-
-/// 从磁盘只读「屏幕格式」（mono / gray4 / gray16）。守护每拍同步一次，
-/// 避免它内存里的启动值（比如 gray16）在保存状态时把用户在面板里改的格式盖回去。
-fn disk_format() -> Option<(String, u64)> {
-    let bytes = std::fs::read(state_path()).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    Some((
-        v["format"].as_str()?.to_string(),
-        v["format_set_at"].as_u64().unwrap_or(0),
-    ))
 }
 
 /// 子智能体（agent team / subagent）是否还在跑。
@@ -456,8 +424,13 @@ impl TeamScan {
     }
 }
 
-/// 由 DSH 插件写、宠物进程只读的配置：%LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json。
-/// 插件设置页保存后写这个文件；守护每拍比较 mtime，改完 ≤2 秒生效，不用重启。
+/// 由 DSH 插件读写、宠物进程热读的唯一用户配置源：
+/// %LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json。
+///
+/// 插件设置页、`dsh-pet set`、`dsh-pet skin set`、设备手势改的都是这一个文件；
+/// 守护每拍比较 mtime，改完 ≤2 秒生效，不用重启。`state.json` 里那份
+/// `model.settings` 只是快照，读设置时不再参考它（旧版本的值会在首次启动时
+/// 一次性迁移过来）。
 fn pet_config_path() -> PathBuf {
     data_dir().join("pet-config.json")
 }
@@ -476,6 +449,75 @@ struct PetConfig {
     stale_minutes: Option<u32>,
     /// 标题来源：session（默认，只读 session/title）/ prompt（显式 opt-in）。
     title_source: Option<TitleSource>,
+    /// Buddy 造型（sprite::Skin 的 id）。放在配置里而不是 state.json，
+    /// 否则守护回写快照会把 `skin set` 刚改的造型盖回去。
+    pet_skin: Option<String>,
+}
+
+/// 一次写入 `pet-config.json` 的字段集合：只有这里声明的键能被写进文件，
+/// 这份结构体本身就是**写盘白名单**（值类型连同范围校验一起约束住了）。
+#[derive(Debug, Default, Clone)]
+struct PetConfigPatch {
+    follow: Option<bool>,
+    sound: Option<bool>,
+    volume: Option<u8>,
+    target: Option<String>,
+    format: Option<String>,
+    mode: Option<String>,
+    refresh_secs: Option<u32>,
+    animation: Option<bool>,
+    stale_minutes: Option<u32>,
+    title_source: Option<TitleSource>,
+    pet_skin: Option<String>,
+    /// 显式删掉 `mode`。CLI 单独改 animation/refresh 时必须清掉它，
+    /// 否则面板写下的模式会在下一拍把这两项又盖回去。
+    clear_mode: bool,
+}
+
+impl PetConfigPatch {
+    /// 只产出这次真正要改的键；没设的键保持文件里的原值。
+    fn to_map(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::Value;
+        let mut map = serde_json::Map::new();
+        if let Some(v) = self.follow {
+            map.insert("follow".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.sound {
+            map.insert("sound".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.volume {
+            map.insert("volume".into(), Value::from(v));
+        }
+        if let Some(v) = self.target.as_deref() {
+            map.insert("target".into(), Value::String(v.to_string()));
+        }
+        if let Some(v) = self.format.as_deref() {
+            map.insert("format".into(), Value::String(v.to_string()));
+        }
+        if let Some(v) = self.mode.as_deref() {
+            map.insert("mode".into(), Value::String(v.to_string()));
+        }
+        if let Some(v) = self.refresh_secs {
+            map.insert("refresh_secs".into(), Value::from(v));
+        }
+        if let Some(v) = self.animation {
+            map.insert("animation".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.stale_minutes {
+            map.insert("stale_minutes".into(), Value::from(v));
+        }
+        if let Some(v) = self.title_source {
+            map.insert("title_source".into(), Value::String(v.as_str().into()));
+        }
+        if let Some(v) = self.pet_skin.as_deref() {
+            map.insert("pet_skin".into(), Value::String(v.to_string()));
+        }
+        map
+    }
+
+    fn is_empty(&self) -> bool {
+        self.to_map().is_empty() && !self.clear_mode
+    }
 }
 
 /// 插件设置页可选的四种模式（含中文别名）。
@@ -571,8 +613,41 @@ fn quarantine_pet_config(path: &Path, why: &str) {
     }
 }
 
-fn load_pet_config() -> Option<PetConfig> {
-    load_pet_config_at(&pet_config_path())
+/// 逐字段校验：类型/范围不对就记一条警告并丢弃该字段，
+/// 其余字段照常生效——不再因为一个坏 volume 把整份配置丢掉。
+fn pet_config_from_obj(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> PetConfig {
+    let mut cfg = PetConfig {
+        follow: pet_bool_field(obj, "follow", warnings),
+        sound: pet_bool_field(obj, "sound", warnings),
+        volume: pet_u32_field(obj, "volume", 0, 100, warnings).map(|v| v as u8),
+        target: None,
+        format: pet_str_field(obj, "format", warnings, |s| {
+            !s.is_empty() && device::format(s).is_ok()
+        })
+        .and_then(|s| device::format(&s).ok().map(|f| device::format_name(f).to_string())),
+        mode: pet_str_field(obj, "mode", warnings, |s| PET_CONFIG_MODES.contains(&s)),
+        refresh_secs: pet_u32_field(obj, "refresh_secs", 0, 3600, warnings),
+        animation: pet_bool_field(obj, "animation", warnings),
+        stale_minutes: pet_u32_field(obj, "stale_minutes", 1, 1440, warnings),
+        title_source: pet_str_field(obj, "title_source", warnings, |s| {
+            TitleSource::parse(s).is_some()
+        })
+        .and_then(|s| TitleSource::parse(&s)),
+        pet_skin: pet_str_field(obj, "pet_skin", warnings, |s| Skin::parse(s).is_some())
+            .and_then(|s| Skin::parse(&s).map(|k| k.id().to_string())),
+    };
+    // 空字符串 = 没设过，静默忽略；非字符串才算非法。
+    if let Some(value) = obj.get("target") {
+        match value.as_str() {
+            Some(s) if !s.trim().is_empty() => cfg.target = Some(s.trim().to_string()),
+            Some(_) => {}
+            None => warnings.push(format!("[配置] 忽略非法字段 target={value}")),
+        }
+    }
+    cfg
 }
 
 /// 读取插件配置：先整体解析成 `Value`，语法错就整份隔离；
@@ -590,36 +665,8 @@ fn load_pet_config_at(path: &Path) -> Option<PetConfig> {
         quarantine_pet_config(path, "顶层不是 JSON 对象");
         return None;
     };
-
     let mut warnings = Vec::new();
-    let mut cfg = PetConfig {
-        follow: pet_bool_field(obj, "follow", &mut warnings),
-        sound: pet_bool_field(obj, "sound", &mut warnings),
-        volume: pet_u32_field(obj, "volume", 0, 100, &mut warnings).map(|v| v as u8),
-        target: None,
-        format: pet_str_field(obj, "format", &mut warnings, |s| {
-            !s.is_empty() && device::format(s).is_ok()
-        })
-        .and_then(|s| device::format(&s).ok().map(|f| device::format_name(f).to_string())),
-        mode: pet_str_field(obj, "mode", &mut warnings, |s| {
-            PET_CONFIG_MODES.contains(&s)
-        }),
-        refresh_secs: pet_u32_field(obj, "refresh_secs", 0, 3600, &mut warnings),
-        animation: pet_bool_field(obj, "animation", &mut warnings),
-        stale_minutes: pet_u32_field(obj, "stale_minutes", 1, 1440, &mut warnings),
-        title_source: pet_str_field(obj, "title_source", &mut warnings, |s| {
-            TitleSource::parse(s).is_some()
-        })
-        .and_then(|s| TitleSource::parse(&s)),
-    };
-    // 空字符串 = 没设过，静默忽略；非字符串才算非法。
-    if let Some(value) = obj.get("target") {
-        match value.as_str() {
-            Some(s) if !s.trim().is_empty() => cfg.target = Some(s.trim().to_string()),
-            Some(_) => {}
-            None => warnings.push(format!("[配置] 忽略非法字段 target={value}")),
-        }
-    }
+    let cfg = pet_config_from_obj(obj, &mut warnings);
     if !warnings.is_empty() && pet_config_warn_changed(path, &bytes) {
         for warning in warnings {
             eprintln!("{warning}");
@@ -628,77 +675,159 @@ fn load_pet_config_at(path: &Path) -> Option<PetConfig> {
     Some(cfg)
 }
 
-/// 把插件配置套进 store（设置 + 设备地址 + 屏幕格式）。返回是否生效了变化。
-fn apply_pet_config(store: &mut Store) -> bool {
-    let Some(c) = load_pet_config() else {
-        return false;
-    };
-    apply_pet_config_value(store, &c)
+/// pet-config.json 的 mtime 缓存：插件可能每 2 秒写一次、守护每拍读一次，
+/// 文件没变就直接复用上次的解析结果（也不再重复打印坏字段警告）。
+/// 键 = (路径, Option<(mtime 秒, mtime 纳秒, 文件长度)>, 解析结果)。
+type PetConfigCacheEntry = (PathBuf, Option<(u64, u32, u64)>, Option<PetConfig>);
+static PET_CONFIG_CACHE: std::sync::Mutex<Option<PetConfigCacheEntry>> =
+    std::sync::Mutex::new(None);
+
+fn pet_config_cache_lock() -> std::sync::MutexGuard<'static, Option<PetConfigCacheEntry>> {
+    match PET_CONFIG_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
-fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
-    let mut changed = false;
-    let s = &mut store.model.settings;
-    if let Some(v) = c.follow {
-        if s.follow_enabled != v {
-            s.follow_enabled = v;
-            changed = true;
+/// 文件指纹：mtime（纳秒级）+ 长度。两者都没变就认为内容没变。
+fn pet_config_stamp(path: &Path) -> Option<(u64, u32, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let since = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some((since.as_secs(), since.subsec_nanos(), meta.len()))
+}
+
+fn invalidate_pet_config_cache() {
+    *pet_config_cache_lock() = None;
+}
+
+/// 走 mtime 缓存读配置：文件没变就不再解析一遍。
+fn load_pet_config_cached(path: &Path) -> Option<PetConfig> {
+    let stamp = pet_config_stamp(path);
+    {
+        let cache = pet_config_cache_lock();
+        if let Some((cached_path, cached_stamp, cached_cfg)) = cache.as_ref() {
+            if cached_path == path && *cached_stamp == stamp {
+                return cached_cfg.clone();
+            }
         }
+    }
+    let cfg = load_pet_config_at(path);
+    *pet_config_cache_lock() = Some((path.to_path_buf(), stamp, cfg.clone()));
+    cfg
+}
+
+/// 读现有配置的原始 JSON 对象（坏文件按空对象处理）：写盘时用它保留
+/// 本次没改的键——手写的注释、未来版本新增的字段都不会被这次保存吃掉。
+fn read_pet_config_map(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// 原子写 pet-config.json（tmp → fsync → rename）。
+///
+/// 只允许写 `PetConfigPatch` 里声明的键（写盘白名单），并且写前用读端同一套
+/// 校验逻辑验一遍：非法值直接报错、不落盘，绝不让守护读到一份半对的文件。
+fn write_pet_config_at(path: &Path, patch: &PetConfigPatch) -> Result<()> {
+    let patch_map = patch.to_map();
+    let mut warnings = Vec::new();
+    let _ = pet_config_from_obj(&patch_map, &mut warnings);
+    if !warnings.is_empty() {
+        anyhow::bail!("拒绝写入 pet-config.json：{}", warnings.join("；"));
+    }
+    let mut map = read_pet_config_map(path);
+    for (key, value) in patch_map {
+        map.insert(key, value);
+    }
+    if patch.clear_mode {
+        map.remove("mode");
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(map))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_json_atomic(path, &bytes)?;
+    invalidate_pet_config_cache();
+    Ok(())
+}
+
+/// 面板上的模式 → (是否动画, 细节合并秒数)。没写 `mode` 时才用配置里的
+/// animation / refresh_secs，二者不要同时管同一件事。
+fn mode_preset(mode: &str) -> (bool, u32) {
+    match mode {
+        "realtime" | "实时" => (true, 0),
+        "balance" | "平衡" => (true, 10),
+        "minimal" | "极简" => (false, 120),
+        _ => (false, 30),
+    }
+}
+
+/// 由配置生成完整的设置：缺字段一律回落到 Rust 默认值（`Settings::default`），
+/// 不再拿 state.json 里那半份旧快照来补。
+fn settings_from_pet_config(c: &PetConfig) -> Settings {
+    let mut s = Settings::default();
+    if let Some(v) = c.follow {
+        s.follow_enabled = v;
     }
     if let Some(v) = c.sound {
-        if s.sound_enabled != v {
-            s.sound_enabled = v;
-            changed = true;
-        }
+        s.sound_enabled = v;
     }
     if let Some(v) = c.volume {
-        if s.volume != v {
-            s.volume = v;
-            changed = true;
-        }
+        s.volume = v;
     }
     if let Some(v) = c.stale_minutes {
-        if s.stale_minutes != v {
-            s.stale_minutes = v;
-            changed = true;
-        }
+        s.stale_minutes = v;
     }
     if let Some(v) = c.title_source {
-        if s.title_source != v {
-            s.title_source = v;
-            changed = true;
-        }
+        s.title_source = v;
     }
     if let Some(mode) = c.mode.as_deref() {
-        let (animation, refresh) = match mode {
-            "realtime" | "实时" => (true, 0),
-            "balance" | "平衡" => (true, 10),
-            "minimal" | "极简" => (false, 120),
-            _ => (false, 30),
-        };
-        if s.animation != animation || s.refresh_secs != refresh {
-            s.animation = animation;
-            s.refresh_secs = refresh;
-            changed = true;
-        }
+        let (animation, refresh) = mode_preset(mode);
+        s.animation = animation;
+        s.refresh_secs = refresh;
     } else {
         if let Some(v) = c.animation {
-            if s.animation != v {
-                s.animation = v;
-                changed = true;
-            }
+            s.animation = v;
         }
         if let Some(v) = c.refresh_secs {
-            if s.refresh_secs != v {
-                s.refresh_secs = v;
-                changed = true;
-            }
+            s.refresh_secs = v;
         }
     }
+    if let Some(skin) = c.pet_skin.as_deref().and_then(Skin::parse) {
+        s.pet_skin = skin.id().into();
+    }
+    s
+}
+
+/// `Settings` 在 model.rs 里没有 `PartialEq`（不在本次改动范围），
+/// 这里逐项比较，语义等价。
+fn settings_equal(a: &Settings, b: &Settings) -> bool {
+    a.follow_enabled == b.follow_enabled
+        && a.animation == b.animation
+        && a.stale_minutes == b.stale_minutes
+        && a.sound_enabled == b.sound_enabled
+        && a.volume == b.volume
+        && a.refresh_secs == b.refresh_secs
+        && a.pet_skin == b.pet_skin
+        && a.title_source == b.title_source
+}
+
+/// 把一份解析好的配置套进 store：设置**整体替换**（缺字段走默认），
+/// 设备地址与屏幕格式按需更新。返回是否生效了变化。
+fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
+    let next = settings_from_pet_config(c);
+    let mut changed = false;
+    if !settings_equal(&store.model.settings, &next) {
+        store.model.settings = next;
+        changed = true;
+    }
     if let Some(t) = c.target.as_deref() {
-        let t = t.trim().to_string();
-        if !t.is_empty() && store.target.as_deref() != Some(t.as_str()) {
-            store.target = Some(t);
+        let t = t.trim();
+        if !t.is_empty() && store.target.as_deref() != Some(t) {
+            store.target = Some(t.to_string());
             changed = true;
         }
     }
@@ -710,8 +839,9 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
         }
     }
     if changed {
+        let s = &store.model.settings;
         println!(
-            "[配置] 插件配置已生效：follow={} 模式={} 音量={} 目标={} 格式={} 标题来源={}",
+            "[配置] pet-config.json 已生效：follow={} 模式={} 音量={} 目标={} 格式={} 标题来源={} 造型={}",
             s.follow_enabled,
             match (s.animation, s.refresh_secs) {
                 (true, 0) => "实时",
@@ -723,34 +853,71 @@ fn apply_pet_config_value(store: &mut Store, c: &PetConfig) -> bool {
             store.target.as_deref().unwrap_or("自动发现"),
             store.format,
             s.title_source.as_str(),
+            s.pet_skin,
         );
     }
     changed
 }
 
-/// 把磁盘上的设置套进内存模型；返回是否有变化（有变化时不必刷屏，设置本身不上屏）。
-fn refresh_settings(model: &mut Model) -> bool {
-    let Some(s) = disk_settings() else {
+/// 一次性迁移：`pet-config.json` 不存在、但同目录已有 `state.json` 时，
+/// 把旧版本写在 state.json 里的设置/地址/格式/造型搬进配置。之后一律只认配置。
+///
+/// 全新安装不建这个文件：首次加载会顺手写出一个「全默认」的 state.json，
+/// 那份东西没有值得保留的东西，凭空造出配置反而会让人以为迁移过。
+fn migrate_state_settings_to_pet_config(path: &Path, store: &Store) -> bool {
+    if path.exists() || !path.with_file_name("state.json").exists() {
+        return false;
+    }
+    if store.target.is_none()
+        && store.format == default_format()
+        && settings_equal(&store.model.settings, &Settings::default())
+    {
+        return false;
+    }
+    let s = &store.model.settings;
+    let patch = PetConfigPatch {
+        follow: Some(s.follow_enabled),
+        sound: Some(s.sound_enabled),
+        volume: Some(s.volume),
+        target: store.target.clone(),
+        format: Some(store.format.clone()),
+        refresh_secs: Some(s.refresh_secs),
+        animation: Some(s.animation),
+        stale_minutes: Some(s.stale_minutes),
+        title_source: Some(s.title_source),
+        pet_skin: Some(s.pet_skin.clone()),
+        ..Default::default()
+    };
+    match write_pet_config_at(path, &patch) {
+        Ok(()) => {
+            println!(
+                "[配置] 已把 state.json 里的旧设置迁移到 {}（一次性；之后只认这份配置）",
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[配置] 旧设置迁移到 pet-config.json 失败（本次沿用 state.json 快照）: {e}");
+            false
+        }
+    }
+}
+
+/// 用户配置的唯一入口：把 pet-config.json 套进 store（设置 + 设备地址 +
+/// 屏幕格式 + 造型）。每拍 / 每 2 秒调一次；文件没变时只做比较、不重复解析
+/// （mtime 缓存）。返回 true = 有字段生效（调用方据此更新模型、格式并强推一帧）。
+fn apply_user_config(store: &mut Store) -> bool {
+    apply_user_config_at(&pet_config_path(), store)
+}
+
+fn apply_user_config_at(path: &Path, store: &mut Store) -> bool {
+    migrate_state_settings_to_pet_config(path, store);
+    let Some(cfg) = load_pet_config_cached(path) else {
         return false;
     };
-    let changed = model.settings.follow_enabled != s.follow_enabled
-        || model.settings.sound_enabled != s.sound_enabled
-        || model.settings.volume != s.volume
-        || model.settings.animation != s.animation
-        || model.settings.stale_minutes != s.stale_minutes
-        || model.settings.refresh_secs != s.refresh_secs
-        || model.settings.title_source != s.title_source;
-    if changed {
-        model.settings.follow_enabled = s.follow_enabled;
-        model.settings.sound_enabled = s.sound_enabled;
-        model.settings.volume = s.volume;
-        model.settings.animation = s.animation;
-        model.settings.stale_minutes = s.stale_minutes;
-        model.settings.refresh_secs = s.refresh_secs;
-        model.settings.title_source = s.title_source;
-    }
-    changed
+    apply_pet_config_value(store, &cfg)
 }
+
 
 /// 任务完成后多久没有新任务就交还设备：5 分钟。
 fn default_idle_grace() -> u32 {
@@ -818,8 +985,6 @@ impl Default for Store {
             announced_at: 0,
             released_at: None,
             idle_grace: None,
-            skin_explicit: false,
-            settings_explicit: false,
             degraded: false,
         }
     }
@@ -955,6 +1120,13 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // 跨进程串行化：守护、`set`、插件（经 CLI）可能同时写同一份 state.json。
+    // 读-合并-写整段都待在锁里，否则两边各自读到旧值再各自回写，字段就丢了。
+    // 拿不到锁（2 秒超时）时降级为不加锁写入：宁可偶尔丢字段，也不能卡住守护。
+    let _lock = acquire_file_lock(
+        &path.with_extension("lock"),
+        std::time::Duration::from_secs(2),
+    );
     // 守护与交互命令共用一份 state.json。守护内存里的 store 是启动时的快照，
     // 若整份回写，会把别处（init / set / run）刚保存的设备地址覆盖成 None。
     // 写入前合并一次：设备地址与格式以「磁盘上的非空值」为准，除非本次显式改了。
@@ -987,20 +1159,8 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
         if out.idle_grace.is_none() {
             out.idle_grace = disk.idle_grace;
         }
-        // 造型以磁盘为准：守护可能还抱着几分钟前的内存快照。
-        // 只有 `skin set`（skin_explicit）才有权把它写回去。
-        if !store.skin_explicit {
-            out.model.settings.pet_skin = disk.model.settings.pet_skin;
-        }
-        // 跟随/提示音设置同理：只有 `dsh-pet set`（settings_explicit）才有权写回。
-        if !store.settings_explicit {
-            out.model.settings.follow_enabled = disk.model.settings.follow_enabled;
-            out.model.settings.sound_enabled = disk.model.settings.sound_enabled;
-            out.model.settings.volume = disk.model.settings.volume;
-            out.model.settings.animation = disk.model.settings.animation;
-            out.model.settings.stale_minutes = disk.model.settings.stale_minutes;
-            out.model.settings.refresh_secs = disk.model.settings.refresh_secs;
-        }
+        // 注意：`model.settings` / 造型**不再**参与合并——它们是 pet-config.json
+        // 的只读快照，真源在那边；这里合并只会把别处刚改的设置盖回旧值。
     }
     // 内存标记不落盘：recovered / 正常文件里都必须是 false。
     out.degraded = false;
@@ -1040,6 +1200,70 @@ fn save_store_at(path: &Path, store: &Store) -> Result<()> {
     }
 
     write_json_atomic(path, &bytes)
+}
+
+/// 跨进程写锁的句柄：Drop 时删掉 `state.lock`（只删自己建的那份）。
+struct FileLock {
+    path: PathBuf,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let mine = std::process::id().to_string();
+        if let Ok(text) = std::fs::read_to_string(&self.path) {
+            if text.trim() == mine {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+/// 独占创建 `state.lock`（`create_new` = 原子抢占），拿到就写进本进程 pid。
+///
+/// - 锁已存在：可能是别的进程正在写，也可能上一个进程崩了没删。`mtime`
+///   超过 10 秒视为陈旧锁，删掉重试。
+/// - 超过 `timeout`（默认 2 秒）还拿不到：打印一次警告、返回 None，
+///   调用方照常写盘（降级：并发时可能丢字段，但不至于卡死守护）。
+fn acquire_file_lock(path: &Path, timeout: std::time::Duration) -> Option<FileLock> {
+    let started = std::time::Instant::now();
+    let stale_after = std::time::Duration::from_secs(10);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Some(FileLock {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age > stale_after)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(path);
+                    continue;
+                }
+                if started.elapsed() >= timeout {
+                    eprintln!(
+                        "[state] 等待 {} 超时（{} 秒）：降级为不加锁写入，并发时可能丢字段",
+                        path.display(),
+                        timeout.as_secs()
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            // 目录不可写等硬错误：锁不是必需品，直接降级。
+            Err(_) => return None,
+        }
+    }
 }
 
 struct Args {
@@ -1535,12 +1759,11 @@ async fn push_if_changed(
     frame: usize,
     last_sig: &mut Option<String>,
 ) -> bool {
-    // 换肤是另一个进程写 state.json：每帧从磁盘取一次，守护不用重启。
-    // 放进签名渲染之前，皮肤一变这一帧就会因为 sig 不同而刷到设备上。
-    if let Some(s) = disk_pet_skin() {
-        if s != model.settings.pet_skin {
-            model.settings.pet_skin = s;
-        }
+    // 造型的真源是 pet-config.json，`apply_user_config` 每拍已经把它套进 store；
+    // 这里只把 store 的快照同步给 model（`skin set` 之后下一帧就换）。放在签名
+    // 渲染之前，皮肤一变这一帧就会因为 sig 不同而刷到设备上。
+    if store.model.settings.pet_skin != model.settings.pet_skin {
+        model.settings.pet_skin = store.model.settings.pet_skin.clone();
     }
     let phase = if model.settings.animation { frame } else { 0 };
     let mut scene = layout::draw(model, now(), phase);
@@ -1857,10 +2080,12 @@ fn positional(args: &Args) -> Vec<&str> {
         .collect()
 }
 
-/// Buddy 图鉴造型：list / set，落盘到 state.json，守护下一帧自动生效。
+/// Buddy 图鉴造型：list / set，写进 pet-config.json，守护下一帧自动生效。
 fn cmd_skin(args: &Args) -> Result<()> {
     let pos = positional(args);
-    let store = load_store();
+    let mut store = load_store();
+    // 造型的真源也在 pet-config.json：先套进来，打印的「当前」才是真生效的。
+    let _ = apply_user_config(&mut store);
     let current = Skin::parse(&store.model.settings.pet_skin).unwrap_or_default();
     let action = pos.first().copied().unwrap_or("list");
     match action {
@@ -1899,9 +2124,15 @@ fn set_skin(value: &str) -> Result<()> {
         format!("未知造型 {value}；可用 {}", Skin::ALL.iter().map(|s| s.id()).collect::<Vec<_>>().join(" / "))
     })?;
     let mut store = load_store();
-    store.model.settings.pet_skin = skin.id().into();
-    // 显式写入：否则 save_store 的合并会认为「磁盘值更权威」而把本次切换吞掉。
-    store.skin_explicit = true;
+    let _ = apply_user_config(&mut store);
+    write_pet_config_at(
+        &pet_config_path(),
+        &PetConfigPatch {
+            pet_skin: Some(skin.id().into()),
+            ..Default::default()
+        },
+    )?;
+    let _ = apply_user_config(&mut store);
     save_store(&store)?;
     println!("已切换造型：{}（{}）", skin.name(), skin.id());
     println!("守护下一帧自动生效；想立刻看一次：dsh-pet push --demo working");
@@ -1927,67 +2158,64 @@ fn onoff_label(value: bool) -> &'static str {
 
 /// 查看 / 修改跟随与提示音设置（`dsh-pet set ...`）。
 ///
-/// 只改 `state.json` 里的 `model.settings`；守护每一拍重新读磁盘，所以改完 2 秒内
-/// 生效，不需要重启守护。`--follow off` 会让守护释放设备（回到待命、不再占用），
+/// 写 `pet-config.json`（唯一用户配置源，插件面板也读写它）；`state.json` 里的
+/// `model.settings` 只是守护留下的只读快照。守护每一拍重新读配置，所以改完 2 秒
+/// 内生效，不需要重启守护。`--follow off` 会让守护释放设备（回到待命、不再占用），
 /// 这是「暂时让它别上屏」的开关；插件被禁用或 DSH 退出时宠物随之收尾。
 fn cmd_set(args: &Args) -> Result<()> {
     let mut store = load_store();
-    let mut touched = false;
+    // 先套一遍配置：「不带参数」打印的就是真正生效的值，而不是 state.json 旧快照。
+    let _ = apply_user_config(&mut store);
+    let mut patch = PetConfigPatch::default();
     if let Some(v) = args.get("volume") {
         let n: u8 = v
             .parse()
             .with_context(|| format!("--volume 需要 0-100 的整数，收到 {v}"))?;
-        store.model.settings.volume = n.min(100);
-        touched = true;
+        patch.volume = Some(n.min(100));
     }
     if let Some(v) = args.get("sound") {
-        store.model.settings.sound_enabled = parse_onoff(v)?;
-        touched = true;
+        patch.sound = Some(parse_onoff(v)?);
     }
     if let Some(v) = args.get("follow") {
-        store.model.settings.follow_enabled = parse_onoff(v)?;
-        touched = true;
+        patch.follow = Some(parse_onoff(v)?);
     }
     if let Some(v) = args.get("animation") {
-        store.model.settings.animation = parse_onoff(v)?;
-        touched = true;
+        patch.animation = Some(parse_onoff(v)?);
+        // 单独调这两项时把面板的「模式」清掉：mode 会覆盖 animation/refresh，
+        // 不清掉就会出现「我明明关了动画，它俩秒后又自己开了」。
+        patch.clear_mode = true;
     }
     if let Some(v) = args.get("stale") {
         let n: u32 = v
             .parse()
             .with_context(|| format!("--stale 需要分钟数，收到 {v}"))?;
-        store.model.settings.stale_minutes = n.max(1);
-        touched = true;
+        patch.stale_minutes = Some(n.max(1));
     }
     if let Some(v) = args.get("refresh") {
         let n: u32 = v
             .parse()
             .with_context(|| format!("--refresh 需要秒数（0 = 不节流），收到 {v}"))?;
-        store.model.settings.refresh_secs = n;
-        touched = true;
+        patch.refresh_secs = Some(n);
+        patch.clear_mode = true;
     }
     if let Some(v) = args.get("title-source") {
-        store.model.settings.title_source = TitleSource::parse(v).with_context(|| {
+        patch.title_source = Some(TitleSource::parse(v).with_context(|| {
             format!("--title-source 只能是 session（默认）或 prompt，收到 {v}")
-        })?;
-        touched = true;
+        })?);
     }
     if let Some(v) = args.get("format") {
         // 只接受 mono / gray4 / gray16；写回统一的名字，守护下一拍热切换。
-        let f = device::format(v)?;
-        store.format = device::format_name(f).to_string();
-        store.format_set_at = chrono::Local::now().timestamp_millis() as u64;
-        touched = true;
+        patch.format = Some(device::format_name(device::format(v)?).to_string());
     }
     // 一键「安静模式」：关动画 + 30 秒节流。嫌墨水屏一闪一闪时用这个，
     // 比单独调两项省事；`--calm off` 恢复实时跟随。
     if let Some(v) = args.get("calm") {
         let calm = parse_onoff(v)?;
-        store.model.settings.animation = !calm;
-        store.model.settings.refresh_secs = if calm { 30 } else { 0 };
-        touched = true;
+        patch.animation = Some(!calm);
+        patch.refresh_secs = Some(if calm { 30 } else { 0 });
+        patch.clear_mode = true;
     }
-    if !touched {
+    if patch.is_empty() {
         let s = &store.model.settings;
         println!("跟随：{}", onoff_label(s.follow_enabled));
         println!(
@@ -2011,23 +2239,27 @@ fn cmd_set(args: &Args) -> Result<()> {
             store.format
         );
         println!();
+        println!("配置位置：{}", pet_config_path().display());
+        println!();
         println!("改法示例：");
         println!("  dsh-pet set --calm on            安静模式：关动画 + 30 秒节流（推荐先试这个）");
         println!("  dsh-pet set --animation off      只关动画");
         println!("  dsh-pet set --refresh 60         内容更新至少隔 60 秒才刷");
         println!("  dsh-pet set --format mono        黑白 1 位：整屏刷新快 4 倍、闪得少（默认）");
         println!("  dsh-pet set --sound off          完全静音");
-        println!("  dsh-pet set --volume 20          只把提示音调小");
+        println!("  dsh-pet set --volume 20          只把提示音调小（默认 90）");
         println!("  dsh-pet set --follow off         暂停跟随，释放设备");
         println!("  dsh-pet set --title-source prompt 允许标题取提示词首行（会写入 state.json / 设备）");
         println!("  dsh-pet set --title-source session 恢复默认：标题只来自 DSH 会话标题");
         return Ok(());
     }
-    store.settings_explicit = true;
+    write_pet_config_at(&pet_config_path(), &patch)?;
+    // 立刻套回来：打印的是真生效值，state.json 里的快照也跟着对齐。
+    let _ = apply_user_config(&mut store);
     save_store(&store)?;
     let s = &store.model.settings;
     println!(
-        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}",
+        "已保存：跟随 {}｜提示音 {}（音量 {}）｜动画 {}｜刷新节流 {}｜陈旧 {} 分钟｜屏幕 {}｜标题来源 {}｜造型 {}",
         onoff_label(s.follow_enabled),
         onoff_label(s.sound_enabled),
         s.volume,
@@ -2039,8 +2271,10 @@ fn cmd_set(args: &Args) -> Result<()> {
         },
         s.stale_minutes,
         store.format,
-        s.title_source.as_str()
+        s.title_source.as_str(),
+        s.pet_skin
     );
+    println!("写入：{}", pet_config_path().display());
     println!("守护下一拍生效，不需要重启。");
     Ok(())
 }
@@ -2055,14 +2289,11 @@ fn step_skin(cur: Skin, step: i32) -> Skin {
     Skin::ALL[(((at + step) % n + n) % n) as usize]
 }
 
-/// 设备端换造型：内存、磁盘一起改，下一次渲染就能取到。
-///
-/// 必须落盘——`push_if_changed` 每帧先从 `state.json` 读一次造型（那是
-/// `skin set` 与守护之间的唯一同步点），只改内存会被它当场盖回去。
-/// `skin_explicit` 只在这次写入时置位，否则 `save_store` 的合并规则会认为
-/// 「磁盘上的旧值更权威」，把刚换的猫吞掉。
+/// 渲染一张预览图（不连设备）。造型与设置都走 pet-config.json，
+/// 所以 `skin set` / `set --volume` 之后预览立刻和真机一致。
 async fn cmd_preview(args: &Args) -> Result<()> {
     let mut store = load_store();
+    let _ = apply_user_config(&mut store);
     let model = with_model(args, &mut store);
     let frame = args.get("frame").and_then(|f| f.parse().ok()).unwrap_or(0);
     let scene = layout::draw(&model, now(), frame);
@@ -2115,7 +2346,8 @@ async fn cmd_sessions(_args: &Args) -> Result<()> {
 }
 
 async fn cmd_check(args: &Args) -> Result<()> {
-    let store = load_store();
+    let mut store = load_store();
+    let _ = apply_user_config(&mut store);
     let target = args.get("target").map(str::to_string).or(store.target);
     let dev = device::open(target.as_deref()).await?;
     println!(
@@ -2155,11 +2387,13 @@ fn confirm(prompt: &str) -> bool {
 /// 每一步都允许失败而不中断——连不上设备仍能看预览，修正后重跑即可。
 async fn cmd_init(args: &Args) -> Result<()> {
     let mut store = load_store();
+    let _ = apply_user_config(&mut store);
     println!("DeepSeek Harness 宠物 · 初始化\n");
 
     // 1. 现状：把「程序当前认到的配置」先摆出来，用户才能判断哪里不对。
     let sessions = dsh_root();
     println!("数据目录      {}", data_dir().display());
+    println!("用户配置      {}", pet_config_path().display());
     println!(
         "状态缓存      {}（{} 个任务）",
         state_path().display(),
@@ -2209,10 +2443,18 @@ async fn cmd_init(args: &Args) -> Result<()> {
         .get("target")
         .map(str::to_string)
         .or(store.target.clone());
-    // 用户显式写下的地址就有价值：先存起来，连不上也不至于下次还要再输一遍。
+    // 用户显式写下的地址就有价值：先存起来（写 pet-config.json），连不上也不至于
+    // 下次还要再输一遍。
     if let Some(t) = args.get("target").map(str::to_string) {
         if store.target.as_deref() != Some(t.as_str()) {
-            store.target = Some(t);
+            write_pet_config_at(
+                &pet_config_path(),
+                &PetConfigPatch {
+                    target: Some(t),
+                    ..Default::default()
+                },
+            )?;
+            let _ = apply_user_config(&mut store);
             save_store(&store)?;
             println!(
                 "  已保存设备地址：{}",
@@ -2237,9 +2479,16 @@ async fn cmd_init(args: &Args) -> Result<()> {
                 ),
                 Err(e) => println!("  读取设备状态失败：{e}"),
             }
-            // 记住地址：之后 watch/run/push 不带 --target 也能用。
+            // 记住地址（写 pet-config.json）：之后 watch/run/push 不带 --target 也能用。
             if store.target.as_deref() != Some(d.summary.address.as_str()) {
-                store.target = Some(d.summary.address.clone());
+                write_pet_config_at(
+                    &pet_config_path(),
+                    &PetConfigPatch {
+                        target: Some(d.summary.address.clone()),
+                        ..Default::default()
+                    },
+                )?;
+                let _ = apply_user_config(&mut store);
                 save_store(&store)?;
                 println!("  已保存设备地址：{}", d.summary.address);
             }
@@ -2308,6 +2557,7 @@ async fn cmd_init(args: &Args) -> Result<()> {
 
 async fn cmd_push(args: &Args) -> Result<()> {
     let mut store = load_store();
+    let _ = apply_user_config(&mut store);
     let model = with_model(args, &mut store);
     let fmt = device::format(args.get("format").unwrap_or(&store.format))?;
     let png = render(&model, 0)?;
@@ -2389,10 +2639,9 @@ async fn announce(dev: &Device, model: &Model, store: &mut Store, task: &Task) {
 
 async fn cmd_run(args: &Args) -> Result<()> {
     let mut store = load_store();
-    // 插件设置页的配置优先于 state.json：DSH 插件一保存，下一拍就生效。
-    if apply_pet_config(&mut store) {
-        store.settings_explicit = true;
-    }
+    // 用户配置的唯一来源是 pet-config.json（插件面板与 CLI 都写它）。
+    // state.json 里的 `model.settings` 只是快照，只在首次迁移时被读一次。
+    let _ = apply_user_config(&mut store);
     if let Some(v) = args.get("volume").and_then(|v| v.parse::<u8>().ok()) {
         store.model.settings.volume = v.min(100);
     }
@@ -2403,10 +2652,17 @@ async fn cmd_run(args: &Args) -> Result<()> {
         store.model.settings.animation = false;
     }
     let mut fmt = device::format(args.get("format").unwrap_or(&store.format))?;
-    // 显式地址优先并记住，避免每次都得带 --target。
+    // 显式地址优先并记住（写 pet-config.json），避免每次都得带 --target。
     if let Some(t) = args.get("target").map(str::to_string) {
         if store.target.as_deref() != Some(t.as_str()) {
-            store.target = Some(t);
+            write_pet_config_at(
+                &pet_config_path(),
+                &PetConfigPatch {
+                    target: Some(t),
+                    ..Default::default()
+                },
+            )?;
+            let _ = apply_user_config(&mut store);
             save_store(&store)?;
         }
     }
@@ -2416,10 +2672,10 @@ async fn cmd_run(args: &Args) -> Result<()> {
         .or(store.target.clone());
     let mut model = store.model.clone();
     // run 的 --skin 只作用于本次会话（守护传下来的参数也算），不落盘。
-    if let Some(v) = args.get("skin") {
-        if let Some(s) = Skin::parse(v) {
-            model.settings.pet_skin = s.id().into();
-        }
+    // 存成局部变量：每拍套完 pet-config 之后还要再盖一次，否则会被配置冲掉。
+    let session_skin = args.get("skin").and_then(Skin::parse);
+    if let Some(s) = session_skin {
+        model.settings.pet_skin = s.id().into();
     }
     // 守护模式（standby）下跟随被手动关掉：别去占设备，直接回待命。
     // 判在 `device::open` 之前——否则会在用户说「先别上屏」之后还去抢一次连接。
@@ -2544,38 +2800,25 @@ async fn cmd_run(args: &Args) -> Result<()> {
                 if recording {
                     continue;
                 }
-                // 每拍把磁盘设置读回来：`dsh-pet set --sound/--volume/--follow`
-                // 改完 2 秒内生效，不需要重启守护。
-                refresh_settings(&mut model);
-                // 插件设置页写的 pet-config.json：再套一次，插件配置优先于 state.json。
-                if apply_pet_config(&mut store) {
+                // 用户配置每拍重读一次（pet-config.json；mtime 没变时直接复用上次
+                // 解析结果）：插件面板或 `dsh-pet set` 改完 2 秒内生效，不用重启守护。
+                if apply_user_config(&mut store) {
                     model.settings = store.model.settings.clone();
+                    // run 的 --skin 只作用于本次会话：配置覆盖回来后再盖一次。
+                    if let Some(skin) = session_skin {
+                        model.settings.pet_skin = skin.id().into();
+                    }
                     if args.get("format").is_none() {
                         if let Ok(new_fmt) = device::format(&store.format) {
-                            fmt = new_fmt;
+                            if device::format_name(new_fmt) != device::format_name(fmt) {
+                                println!("[屏幕] 刷新格式切换为 {}（下一帧生效）", store.format);
+                                fmt = new_fmt;
+                            }
                         }
                     }
                     last_sig = None;
                     pending_push = true;
                     push_not_before = now();
-                }
-                // 屏幕格式（mono / gray4 / gray16）由面板或 CLI 写 state.json：
-                // 下一拍热切换，不用重启守护；格式变了就强推一帧，别让签名挡住。
-                if let Some((wanted, ts)) = disk_format() {
-                    if wanted != store.format || ts > store.format_set_at {
-                        let changed = wanted != store.format;
-                        store.format = wanted;
-                        store.format_set_at = ts;
-                        if changed {
-                            if let Ok(new_fmt) = device::format(&store.format.clone()) {
-                                println!("[屏幕] 刷新格式切换为 {}（下一帧生效）", store.format);
-                                fmt = new_fmt;
-                                last_sig = None;
-                                pending_push = true;
-                                push_not_before = now();
-                            }
-                        }
-                    }
                 }
                 // 待命页要显示设备电量与 Wi-Fi：每 5 分钟刷新一次设备状态，
                 // 别让空闲页面永远停在连接那一刻的读数上。
@@ -2595,11 +2838,18 @@ async fn cmd_run(args: &Args) -> Result<()> {
                     clicks = (0, 0);
                     model.settings.sound_enabled = !model.settings.sound_enabled;
                     store.model = model.clone();
-                    store.settings_explicit = true;
+                    // 静音开关的真源是 pet-config.json：只改内存会被下一拍的
+                    // 配置覆盖盖回去，所以这里写配置（state.json 只同步快照）。
+                    let patch = PetConfigPatch {
+                        sound: Some(model.settings.sound_enabled),
+                        ..Default::default()
+                    };
+                    if let Err(e) = write_pet_config_at(&pet_config_path(), &patch) {
+                        eprintln!("设置保存失败: {e}");
+                    }
                     if let Err(e) = save_store(&store) {
                         eprintln!("设置保存失败: {e}");
                     }
-                    store.settings_explicit = false;
                     model.quip = if model.settings.sound_enabled {
                         "提示音已开"
                     } else {
@@ -2701,8 +2951,18 @@ async fn cmd_run(args: &Args) -> Result<()> {
                                 // 要再回来，在插件设置页把「跟随」打开即可。
                                 model.settings.follow_enabled = false;
                                 store.model = model.clone();
-                                store.settings_explicit = true;
                                 store.released_at = Some(now());
+                                // 跟随是用户配置：写进 pet-config.json，
+                                // 别让守护下一拍读配置时又把 follow 改回开。
+                                let patch = PetConfigPatch {
+                                    follow: Some(false),
+                                    ..Default::default()
+                                };
+                                if let Err(e) =
+                                    write_pet_config_at(&pet_config_path(), &patch)
+                                {
+                                    eprintln!("设置保存失败: {e}");
+                                }
                                 if let Err(e) = save_store(&store) {
                                     eprintln!("设置保存失败: {e}");
                                 }
@@ -2804,21 +3064,11 @@ async fn wait_for_task(
             println!("控制面板已退出：结束待命。");
             return Ok(false);
         }
-        // 外层待命也要读设置：`dsh-pet set --follow off` 之后不能再用启动时的旧快照
-        // 判断「要不要占设备」，否则刚释放又立刻被拉起来。
-        refresh_settings(&mut store.model);
-        // 插件设置页（pet-config.json）优先：保存后最多 2 秒生效。
-        if apply_pet_config(store) {
-            store.settings_explicit = true;
+        // 待命阶段也要读用户配置：`dsh-pet set --follow off` 之后不能再用启动时的
+        // 旧快照判断「要不要占设备」，否则刚释放又立刻被拉起来。设备地址与屏幕
+        // 格式也在这一个入口里同步（配置变了才回写 state.json）。
+        if apply_user_config(store) {
             let _ = save_store(store);
-        }
-        // 屏幕格式也要每拍同步：待命阶段保存状态时不能用启动时的格式旧值盖掉用户的修改。
-        if let Some((wanted, ts)) = disk_format() {
-            if wanted != store.format || ts > store.format_set_at {
-                println!("[屏幕] 刷新格式切换为 {wanted}（下次占用时生效）");
-                store.format = wanted;
-                store.format_set_at = ts;
-            }
         }
         if !dsh_running() {
             println!("DeepSeek Harness 已退出：结束待命。");
@@ -2980,12 +3230,20 @@ async fn cmd_watch(args: &Args) -> Result<()> {
     // 先落一次心跳，状态查询立刻能看到「守护在跑」，不用等第一个 tick。
     write_heartbeat();
 
-    // 显式给了地址就记住：下次 `watch` / `run` / `push` 不带参数也能连上。
+    // 显式给了地址就记住（写 pet-config.json）：下次 `watch` / `run` / `push`
+    // 不带参数也能连上。用户配置只认这一份文件。
     let mut store = load_store();
-    apply_pet_config(&mut store);
+    let _ = apply_user_config(&mut store);
     if let Some(t) = args.get("target").map(str::to_string) {
         if store.target.as_deref() != Some(t.as_str()) {
-            store.target = Some(t);
+            write_pet_config_at(
+                &pet_config_path(),
+                &PetConfigPatch {
+                    target: Some(t),
+                    ..Default::default()
+                },
+            )?;
+            let _ = apply_user_config(&mut store);
             save_store(&store)?;
         }
     }
@@ -3096,7 +3354,9 @@ async fn cmd_watch(args: &Args) -> Result<()> {
 }
 
 async fn cmd_sound(args: &Args) -> Result<()> {
-    let store = load_store();
+    let mut store = load_store();
+    // 音量默认值来自 pet-config.json（其次 Rust 默认 90），不从 state.json 快照取。
+    let _ = apply_user_config(&mut store);
     let status = args
         .get("status")
         .map(parse_status)
@@ -3138,6 +3398,8 @@ fn usage() {
 
   DSH 启动时会自动拉起宠物（`watch`），退出时自动收尾；一般不需要手动运行。
   设置：DeepSeek Harness → 设置 → Plugins → 鳄鱼大宠物（跟随/模式/声音/设备 IP/格式）。
+  所有设置只写一个文件：pet-config.json（插件面板与 `dsh-pet set` 都改它）；
+  state.json 只存运行时状态（任务、提醒指纹、电量、设备占用与交还时间）。
 
 诊断命令：
   dsh-pet preview [--demo <状态>] [--out 路径] [--frame N] [--session <ID>]
@@ -3147,7 +3409,7 @@ fn usage() {
   dsh-pet set     [--sound on|off] [--volume 0-100] [--follow on|off] [--animation on|off]
                   [--refresh 秒] [--calm on|off] [--format mono|gray4|gray16]
                   [--title-source session|prompt]
-                                           查看/修改跟随与刷新设置（2 秒内生效）
+                                           查看/修改用户配置（写 pet-config.json，2 秒内生效）
   dsh-pet check   [--target IP|ID]         只核对设备，不推画面
   dsh-pet sound   --status waiting|done [--target IP|ID] [--volume 0-100]
                                            只播放一次提示音
@@ -3157,7 +3419,7 @@ fn usage() {
                                            守护：有任务才占用设备，任务结束 5 分钟无新任务即交还
   dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
                                            语音链路诊断
-  dsh-pet where                            显示数据与配置路径
+  dsh-pet where                            显示数据与配置路径（配置 = pet-config.json）
   dsh-pet forget                           删除本机状态缓存
   dsh-pet forget --titles                  只清理隐私：已有任务标题换成 session-短号，清空提醒指纹
 
@@ -3288,7 +3550,8 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         "where" => {
-            println!("配置: {}", state_path().display());
+            println!("配置: {}（唯一用户配置源）", pet_config_path().display());
+            println!("状态缓存: {}（运行时状态，不是设置）", state_path().display());
             println!("输出: {}", out_dir().display());
             println!("会话: {}", dsh_root().display());
             Ok(())
@@ -3588,20 +3851,18 @@ mod tests {
         let store: Store = serde_json::from_str(old).unwrap();
         assert_eq!(store.model.settings.pet_skin, "pixel");
         assert_eq!(store.target.as_deref(), Some("192.168.50.123"));
-        assert!(!store.skin_explicit);
     }
 
     #[test]
-    fn skin_survives_a_round_trip_and_explicit_flag_stays_local() {
+    fn skin_survives_a_round_trip() {
         let mut store = Store::default();
         store.model.settings.pet_skin = "astro".into();
-        store.skin_explicit = true;
         let bytes = serde_json::to_vec(&store).unwrap();
-        // 显式标记只在内存里：不能污染 state.json，更不能让守护下次读成 true。
+        // state.json 只是状态缓存：里面只有快照，不该再出现任何「显式写入」标记。
         assert!(!String::from_utf8_lossy(&bytes).contains("skin_explicit"));
+        assert!(!String::from_utf8_lossy(&bytes).contains("settings_explicit"));
         let back: Store = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.model.settings.pet_skin, "astro");
-        assert!(!back.skin_explicit);
     }
 
     #[test]
@@ -3861,6 +4122,145 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join(&quarantined[0])).unwrap(),
             b"{bad"
+        );
+    }
+
+    #[test]
+    fn settings_come_from_pet_config_only() {
+        let dir = TempDir::new("single-source");
+        let pet = dir.path().join("pet-config.json");
+        let state = dir.path().join("state.json");
+        // state.json 里还留着旧快照（音量 12、跟随关、造型 astro、标题来源 prompt）。
+        // pet-config 只写了音量与跟随：其余字段必须回落到 Rust 默认值，不能拿快照补。
+        std::fs::write(
+            &state,
+            br#"{"model":{"cache_version":3,"settings":{"follow_enabled":false,
+                "sound_enabled":false,"volume":12,"animation":false,"stale_minutes":99,
+                "refresh_secs":300,"pet_skin":"astro","title_source":"prompt"}},
+                "format":"gray16","target":"10.0.0.9"}"#,
+        )
+        .unwrap();
+        std::fs::write(&pet, br#"{"volume":30,"follow":true}"#).unwrap();
+
+        let mut store: Store = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        assert!(apply_user_config_at(&pet, &mut store));
+
+        let s = &store.model.settings;
+        assert_eq!(s.volume, 30, "pet-config 是唯一真源");
+        assert!(s.follow_enabled);
+        assert!(s.sound_enabled, "配置里没写的字段回落到 Rust 默认，而不是 state.json");
+        assert_eq!(s.stale_minutes, 15);
+        assert!(s.animation);
+        assert_eq!(s.refresh_secs, 0);
+        assert_eq!(s.pet_skin, "pixel");
+        assert_eq!(s.title_source, TitleSource::Session);
+        // 配置里没有 target/format：沿用运行时状态，不能被清空。
+        assert_eq!(store.format, "gray16");
+        assert_eq!(store.target.as_deref(), Some("10.0.0.9"));
+    }
+
+    #[test]
+    fn cli_set_survives_plugin_save() {
+        let dir = TempDir::new("cli-vs-plugin");
+        let pet = dir.path().join("pet-config.json");
+
+        // CLI：只改音量与标题来源。
+        write_pet_config_at(
+            &pet,
+            &PetConfigPatch {
+                volume: Some(33),
+                title_source: Some(TitleSource::Prompt),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 插件保存：读整份 → 合上自己那几个键 → 整份写回（bridge.js writeConfig 的行为）。
+        let mut map = read_pet_config_map(&pet);
+        map.insert("mode".into(), serde_json::json!("calm"));
+        std::fs::write(
+            &pet,
+            serde_json::to_vec_pretty(&serde_json::Value::Object(map)).unwrap(),
+        )
+        .unwrap();
+
+        let mut store = Store::default();
+        assert!(apply_user_config_at(&pet, &mut store));
+        let s = &store.model.settings;
+        assert_eq!(s.volume, 33, "CLI 写的音量不能被插件保存吞掉");
+        assert_eq!(s.title_source, TitleSource::Prompt);
+        assert!(!s.animation, "插件写的 mode 生效");
+        assert_eq!(s.refresh_secs, 30);
+    }
+
+    #[test]
+    fn unknown_pet_config_fields_ignored() {
+        let dir = TempDir::new("unknown-keys");
+        let pet = dir.path().join("pet-config.json");
+        std::fs::write(
+            &pet,
+            r#"{"volume":20,"future_feature":{"nested":true},"comment":"手写的备注"}"#.as_bytes(),
+        )
+        .unwrap();
+
+        let cfg = load_pet_config_at(&pet).expect("未知键不影响解析");
+        assert_eq!(cfg.volume, Some(20));
+        let mut store = Store::default();
+        assert!(apply_pet_config_value(&mut store, &cfg));
+        assert_eq!(store.model.settings.volume, 20);
+
+        // 写盘要保留未知键：别把用户的备注和未来字段洗掉。
+        write_pet_config_at(
+            &pet,
+            &PetConfigPatch {
+                volume: Some(55),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let map = read_pet_config_map(&pet);
+        assert_eq!(map.get("volume").and_then(|v| v.as_u64()), Some(55));
+        assert!(map.contains_key("future_feature"), "未知字段必须原样保留");
+        assert_eq!(
+            map.get("comment").and_then(|v| v.as_str()),
+            Some("手写的备注")
+        );
+    }
+
+    #[test]
+    fn concurrent_save_keeps_fields() {
+        let dir = TempDir::new("lock");
+        let path = dir.path().join("state.json");
+        let mut base = Store::default();
+        base.model.cache_version = 3; // 跳过迁移，别在并发里多写一次
+        save_store_at(&path, &base).unwrap();
+
+        // 两个进程/线程各写各的字段：没有锁就会互相覆盖。
+        let released = path.clone();
+        let a = std::thread::spawn(move || {
+            for i in 0..20 {
+                let mut s = load_store_at(&released);
+                s.released_at = Some(1_000 + i);
+                save_store_at(&released, &s).unwrap();
+            }
+        });
+        let graced = path.clone();
+        let b = std::thread::spawn(move || {
+            for i in 0..20 {
+                let mut s = load_store_at(&graced);
+                s.idle_grace = Some(200 + i as u32);
+                save_store_at(&graced, &s).unwrap();
+            }
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let disk: Store = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(disk.released_at.is_some(), "并发写不能把 released_at 弄丢");
+        assert!(disk.idle_grace.is_some(), "并发写不能把 idle_grace 弄丢");
+        assert!(
+            !dir.path().join("state.lock").exists(),
+            "锁必须在收尾时释放，不能留在状态目录里"
         );
     }
 
