@@ -195,12 +195,10 @@ fn ctx_label(model: &Model) -> Option<String> {
     Some(format!("上下文 {pct}% · {left}"))
 }
 
-pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
+pub fn draw(model: &Model, now: i64) -> Value {
     let t = model.current(now);
     let state = t.as_ref().map(|t| t.status());
     let working = state == Some(Status::Working);
-    let animate = working && model.settings.animation;
-    let _phase = if animate { frame % 6 } else { 0 };
     let mut e = vec![];
 
     // 品牌头：中文主行 + 英文副行，右上角是当前模式徽章（演示时显示「演示」）。
@@ -211,11 +209,11 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
     let mode = if model.demo.is_some() {
         "演示"
     } else {
-        match (model.settings.animation, model.settings.refresh_secs) {
-            (true, 0) => "实时",
-            (true, _) => "平衡",
-            (false, 0..=45) => "安静",
-            (false, _) => "极简",
+        match model.settings.refresh_secs {
+            0 => "实时",
+            120.. => "极简",
+            30..=45 => "安静",
+            _ => "平衡",
         }
     };
     rect_r(&mut e, 322, 6, 62, 20, 6, Some(0));
@@ -285,8 +283,10 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             368,
         );
         text(&mut e, "有任务时自动上屏", 20, 142 + BODY_SHIFT, 13, 368);
-    } else {
-        let headline = t.as_ref().map(|t| t.label()).unwrap_or("等待任务");
+    } else if let Some(cur) = tasks.first().copied().or(t.as_ref()) {
+        // 已经完成的任务不在 display_order 里（那只排「正在跑/等你处理」），
+        // 但完成后的五秒停留页仍要显示它，所以退回 current() 给出的那一条。
+        let headline = cur.label();
         let tx = status_glyph(&mut e, state, 20, 58 + BODY_SHIFT, 22);
         text(&mut e, headline, tx, 58 + BODY_SHIFT, 22, 300 - (tx - 20));
         let title = t.as_ref().map(|t| t.event.title.as_str()).unwrap_or(
@@ -359,44 +359,40 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
                 .progress
                 .map(|p| (p, t.event.progress_source, t.event.progress_steps))
         });
-        match progress {
-            Some((p, source, steps)) => {
-                rect(&mut e, 20, 156 + BODY_SHIFT, 256, 13, None);
-                if p > 0 {
-                    rect(
-                        &mut e,
-                        23,
-                        159 + BODY_SHIFT,
-                        (250u32 * p as u32 / 100) as i32,
-                        7,
-                        Some(0),
-                    );
-                }
-                let label = match (source, steps) {
-                    (ProgressSource::Todo, Some((done, total))) => {
-                        format!("任务清单 {done}/{total} · {p}%")
-                    }
-                    (ProgressSource::Todo, None) => format!("任务清单完成度 {p}%"),
-                    (ProgressSource::Agent, _) => format!("Agent 上报进度 {p}%"),
-                };
-                text(&mut e, &label, 20, 184 + BODY_SHIFT, 12, 264);
-            }
-            None if working => {
-                let activity = t
-                    .as_ref()
-                    .map(|t| t.event.detail.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("处理中，暂无活动明细");
-                text(
+        if let Some((p, source, steps)) = progress {
+            rect(&mut e, 20, 156 + BODY_SHIFT, 256, 13, None);
+            if p > 0 {
+                rect(
                     &mut e,
-                    &title_lines(&format!("当前实施状态：{activity}"), 36, 1).join(""),
-                    20,
-                    162 + BODY_SHIFT,
-                    14,
-                    270,
+                    23,
+                    159 + BODY_SHIFT,
+                    (250u32 * p as u32 / 100) as i32,
+                    7,
+                    Some(0),
                 );
             }
-            None => {}
+            let label = match (source, steps) {
+                (ProgressSource::Todo, Some((done, total))) => {
+                    format!("任务清单 {done}/{total} · {p}%")
+                }
+                (ProgressSource::Todo, None) => format!("任务清单完成度 {p}%"),
+                (ProgressSource::Agent, _) => format!("Agent 上报进度 {p}%"),
+            };
+            text(&mut e, &label, 20, 184 + BODY_SHIFT, 12, 264);
+        } else if working {
+            let activity = t
+                .as_ref()
+                .map(|t| t.event.detail.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("处理中，暂无活动明细");
+            text(
+                &mut e,
+                &title_lines(&format!("当前实施状态：{activity}"), 36, 1).join(""),
+                20,
+                162 + BODY_SHIFT,
+                14,
+                270,
+            );
         }
     }
 
@@ -467,7 +463,7 @@ pub fn draw(model: &Model, now: i64, frame: usize) -> Value {
             let pick = if pool.is_empty() {
                 "跟随中".to_string()
             } else {
-                pool[(frame as usize) % pool.len()].clone()
+                pool[0].clone()
             };
             pick
         };
@@ -508,88 +504,7 @@ fn wifi_word(rssi: i16) -> &'static str {
     }
 }
 
-/// 语音投递确认页：识别文本 + 目标会话 + 还能等几秒。
-///
-/// 这一页要回答三个问题，所以版式按「结论 → 内容 → 操作」竖着排：
-/// 投给谁（标题）、说了什么（正文）、现在能做什么（底部）。
-pub fn voice(draft: &crate::voice::Draft, now: i64) -> Value {
-    let mut e = vec![];
-    text(&mut e, "ZECTRIX / 语音投递", 16, 19, 12, 260);
-    rect_r(&mut e, 326, 8, 58, 22, 7, Some(0));
-    text_white(&mut e, "语音", 341, 24, 14, 30);
 
-    // 目标会话：没有会话时也要说清楚「会粘贴到哪儿」，不能让人以为丢失了。
-    let target = match draft.target() {
-        Some(t) => format!("→ {}", t.title),
-        None => "→ 当前窗口".to_string(),
-    };
-    for (i, line) in title_lines(&target, 26, 1).iter().enumerate() {
-        text(&mut e, line, 16, 59 + i as i32 * 30, 24, 340);
-    }
-    rect(&mut e, 16, 84, 368, 0, None);
-
-    let body = if draft.text.trim().is_empty() {
-        "（没听清，再说一次）".to_string()
-    } else {
-        draft.text.trim().to_string()
-    };
-    // 短句放大、长句缩小：一句话占半屏时 15 号字太小，一个字都看不清；
-    // 而长句必须能整段塞进来，所以按行数反过来选字号。
-    let mut lines = title_lines(&body, 48, 6);
-    let (size, lh) = if lines.len() <= 2 {
-        lines = title_lines(&body, 40, 5);
-        (18, 25)
-    } else {
-        (15, 19)
-    };
-    for (i, line) in lines.iter().enumerate() {
-        text(&mut e, line, 16, 106 + i as i32 * lh, size, 360);
-    }
-    // 小字跟在正文后面，别钉死在底部：只说一句话时中间留一大片空白很难看。
-    let foot_y = (106 + lines.len() as i32 * lh + 6).min(228);
-    // 第二行小字平时报「录了几秒、只粘贴不发送」；投递失败后换成失败原因，
-    // 让人知道该再按一次还是去电脑上看看窗口。
-    let foot = draft.hint.clone().unwrap_or_else(|| {
-        format!("{:.1} 秒录音 · 只粘贴，不发送", draft.seconds)
-    });
-    text(&mut e, &foot, 16, foot_y, 11, 330);
-
-    // 底部操作条：黑底白字，和主界面的「回电脑确认」一致，读一眼就知道下一步。
-    rect_r(&mut e, 16, 240, 368, 30, 6, Some(0));
-    let hint = if draft.targets.len() > 1 {
-        format!(
-            "上下键 换会话（{}/{}） · 确认键 粘贴",
-            draft.index + 1,
-            draft.targets.len()
-        )
-    } else {
-        "确认键 粘贴到输入框".to_string()
-    };
-    text_white(&mut e, &hint, 26, 260, 13, 300);
-
-    let left = (draft.expires_at - now).max(0);
-    text(&mut e, &format!("{left} 秒后丢弃"), 16, 290, 11, 200);
-    text_right(&mut e, "语音由本机转写", 200, 290, 11, 184);
-
-    json!({"canvas":{"w":400,"h":300},"elements":e})
-}
-/// 语音流程中的过渡页（「识别中」「没听清」「投递失败」）。
-///
-/// 只放一句话 + 一行解释：这些状态都是一两秒就过去的，不需要更多信息，
-/// 多写反而让人以为要等他操作。
-pub fn voice_note(title: &str, detail: &str, dots: usize) -> Value {
-    let mut e = vec![];
-    text(&mut e, "ZECTRIX / 语音投递", 16, 19, 12, 260);
-    text(&mut e, title, 16, 104, 26, 368);
-    for (i, line) in title_lines(detail, 46, 3).iter().enumerate() {
-        text(&mut e, line, 16, 150 + i as i32 * 20, 15, 360);
-    }
-    // 三个点的进度节奏：不给具体百分比，因为转写耗时会随句子长短变。
-    let waiting = "·".repeat(dots.min(3)) + &" ".repeat(3 - dots.min(3));
-    text(&mut e, &waiting, 16, 240, 18, 200);
-    text_right(&mut e, "语音由本机转写", 200, 290, 11, 184);
-    json!({"canvas":{"w":400,"h":300},"elements":e})
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,60 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn voice_pages_stay_inside_the_canvas() {
-        let targets = vec![
-            crate::voice::Target {
-                session: "a".into(),
-                title: "基础固件编译".into(),
-            },
-            crate::voice::Target {
-                session: "b".into(),
-                title: "写周报".into(),
-            },
-        ];
-        let d = crate::voice::Draft::new(
-            "把今天的会议纪要整理成三条要点，发到项目群里。".into(),
-            3.2,
-            targets,
-            100,
-        );
-        let scenes = [
-            voice(&d, 100),
-            voice(&d, 130), // 过期后剩 0 秒，不能出现负数
-            voice_note("正在识别…", "松手后在本机转写，音频不上传云端", 2),
-            voice_note("转写失败", "很长的错误信息也要能折行放进版心，不能顶到边框外面去", 0),
-        ];
-        for v in scenes {
-            let e = v["elements"].as_array().unwrap();
-            assert!(e.len() <= 200);
-            for el in e {
-                assert!(el["x"].as_i64().unwrap() >= 0);
-                assert!(el["y"].as_i64().unwrap() < 300);
-            }
-        }
-    }
-
-    #[test]
-    fn voice_draft_cycles_between_sessions_only_when_there_are_two() {
-        let t = |s: &str| crate::voice::Target {
-            session: s.into(),
-            title: s.into(),
-        };
-        let mut one = crate::voice::Draft::new("x".into(), 1.0, vec![t("a")], 0);
-        one.cycle(1);
-        one.cycle(-1);
-        assert_eq!(one.index, 0, "只有一个目标时按键不该改变选择");
-
-        let mut two = crate::voice::Draft::new("x".into(), 1.0, vec![t("a"), t("b")], 0);
-        two.cycle(1);
-        assert_eq!(two.target().unwrap().session, "b");
-        two.cycle(1);
-        assert_eq!(two.target().unwrap().session, "a", "到末尾要绕回第一个");
-        two.cycle(-1);
-        assert_eq!(two.target().unwrap().session, "b", "往前也要绕");
-    }
-
-    #[test]
     fn fixed_rows_survive_heartbeats_selection_and_time() {
         for count in [2usize, 3, 4, 5, 9, 10] {
             let mut m = Model::default();
@@ -726,16 +587,16 @@ mod tests {
             }
             // apply 会轮换右下角花絮短语；本测试只关心行序，先冻结它。
             m.quip = "测试花絮".into();
-            let baseline = draw(&m, 1, 0);
-            assert_eq!(baseline, draw(&m, 60, 0), "no automatic rotation");
+            let baseline = draw(&m, 1);
+            assert_eq!(baseline, draw(&m, 60), "no automatic rotation");
             let mut heartbeat = m.running(1)[0].event.clone();
             heartbeat.seq = 2;
             m.apply(heartbeat, "agent", 61).unwrap();
             m.quip = "测试花絮".into();
-            assert_eq!(baseline, draw(&m, 61, 0), "heartbeat must not reorder rows");
+            assert_eq!(baseline, draw(&m, 61), "heartbeat must not reorder rows");
             let pages = count.div_ceil(TASKS_PER_PAGE);
             for page in 0..pages {
-                let v = draw(&m, 62, 0);
+                let v = draw(&m, 62);
                 // 多任务列表也不能压品牌行/底部分隔线，最多 3 行 + 两条状态行。
                 assert_bands_clear(&v);
                 let e = v["elements"].as_array().unwrap();
@@ -766,18 +627,18 @@ mod tests {
                     m.cycle(1, 62);
                 }
             }
-            assert_eq!(baseline, draw(&m, 62, 0), "page navigation wraps");
+            assert_eq!(baseline, draw(&m, 62), "page navigation wraps");
             m.selected = Some(m.running(62)[1].key());
             if count <= TASKS_PER_PAGE {
                 assert_eq!(
                     baseline,
-                    draw(&m, 62, 0),
+                    draw(&m, 62),
                     "selection keeps all rows visible"
                 );
             } else {
                 m.selected = None;
                 m.cycle(-1, 62);
-                assert!(draw(&m, 62, 0)
+                assert!(draw(&m, 62)
                     .to_string()
                     .contains(&format!("{}/{}", pages, pages)));
             }
@@ -803,7 +664,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let v = draw(&m, 2, 0);
+        let v = draw(&m, 2);
         let s = v.to_string();
         assert!(
             s.contains("当前实施状态：正在执行命令"),
@@ -818,7 +679,7 @@ mod tests {
         ev.progress = Some(43);
         ev.progress_steps = Some((3, 7));
         m.apply(ev, "dsh", 2).unwrap();
-        let s = draw(&m, 3, 0).to_string();
+        let s = draw(&m, 3).to_string();
         assert!(s.contains("任务清单 3/7 · 43%"));
         assert!(!s.contains("当前实施状态"));
     }
@@ -844,7 +705,7 @@ mod tests {
         )
         .unwrap();
         // 没有上下文数据时保持原标签；花絮短语随 apply 已换好、且来自短语池。
-        let s = draw(&m, 2, 0).to_string();
+        let s = draw(&m, 2).to_string();
         assert!(s.contains("DSH 本机"), "无上下文数据回退原标签");
         assert!(!s.contains("上下选任务"), "按键提示已下线");
         assert!(
@@ -855,7 +716,7 @@ mod tests {
         // 有上下文数据时左下角换成占用百分比与剩余，右下角显示花絮。
         m.ctx_used = Some(119222);
         m.ctx_size = Some(300000);
-        let s = draw(&m, 2, 0).to_string();
+        let s = draw(&m, 2).to_string();
         assert!(
             s.contains("上下文 40% · 剩 181K"),
             "左下角应显示上下文占用：{s}"
@@ -897,7 +758,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let v = draw(&m, 2, 0).to_string();
+        let v = draw(&m, 2).to_string();
         assert!(v.contains("采用哪种推送策略？"), "题干应上屏");
         assert!(v.contains("请回到电脑确认"), "要有回电脑的指引");
         assert!(v.contains("设备仅作提示"), "底部提示改为仅提示");
@@ -917,27 +778,25 @@ mod tests {
             Status::Unknown,
         ] {
             m.demo = Some(s);
-            for frame in 0..6 {
-                let scene = draw(&m, 100, frame);
-                let e = scene["elements"].as_array().unwrap();
-                // 90×120 鳄鱼素材贪婪矩形化后，已出图的演示页实测 245–280 个场景元素
-                //（素材 208–274，版式约 10）；unknown 演示 286，仍在 400 上限内。
-                assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
-                // 品牌行分隔线与底部分隔线把版面切成三段：品牌两行 / 版心 / 底部信息。
-                assert_bands_clear(&scene);
-                for el in e {
-                    if el["type"] == "line" {
-                        // 矢量图标（完成的对勾）：坐标是 x1/y1/x2/y2，同样必须在画布内。
-                        assert!(el["x1"].as_i64().unwrap() >= 0);
-                        assert!(el["y1"].as_i64().unwrap() >= 0);
-                        assert!(el["x2"].as_i64().unwrap() < 400);
-                        assert!(el["y2"].as_i64().unwrap() < 300);
-                        assert!(el["width"].as_i64().unwrap() >= 1);
-                        continue;
-                    }
-                    assert!(el["x"].as_i64().unwrap() >= 0);
-                    assert!(el["y"].as_i64().unwrap() < 300);
+            let scene = draw(&m, 100);
+            let e = scene["elements"].as_array().unwrap();
+            // 90×120 鳄鱼素材贪婪矩形化后，已出图的演示页实测 245–280 个场景元素
+            //（素材 208–274，版式约 10）；unknown 演示 286，仍在 400 上限内。
+            assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
+            // 品牌行分隔线与底部分隔线把版面切成三段：品牌两行 / 版心 / 底部信息。
+            assert_bands_clear(&scene);
+            for el in e {
+                if el["type"] == "line" {
+                    // 矢量图标（完成的对勾）：坐标是 x1/y1/x2/y2，同样必须在画布内。
+                    assert!(el["x1"].as_i64().unwrap() >= 0);
+                    assert!(el["y1"].as_i64().unwrap() >= 0);
+                    assert!(el["x2"].as_i64().unwrap() < 400);
+                    assert!(el["y2"].as_i64().unwrap() < 300);
+                    assert!(el["width"].as_i64().unwrap() >= 1);
+                    continue;
                 }
+                assert!(el["x"].as_i64().unwrap() >= 0);
+                assert!(el["y"].as_i64().unwrap() < 300);
             }
         }
     }
@@ -968,22 +827,20 @@ mod tests {
             Status::Unknown,
         ] {
             m.demo = Some(s);
-            for frame in 0..6 {
-                let scene = draw(&m, 100, frame);
-                let footer_sep = *separator_ys(&scene).last().expect("底部分隔线");
-                let sprite = sprite_rects(&scene);
+            let scene = draw(&m, 100);
+            let footer_sep = *separator_ys(&scene).last().expect("底部分隔线");
+            let sprite = sprite_rects(&scene);
+            assert!(
+                sprite.len() > 20,
+                "演示状态 {s:?} 没画出鳄鱼（{} 个矩形）",
+                sprite.len()
+            );
+            for r in sprite {
+                let bottom = r["y"].as_i64().unwrap() + r["h"].as_i64().unwrap();
                 assert!(
-                    sprite.len() > 20,
-                    "演示状态 {s:?} 第 {frame} 帧没画出鳄鱼（{} 个矩形）",
-                    sprite.len()
+                    bottom <= footer_sep,
+                    "演示状态 {s:?} 鳄鱼压到底部分隔线：bottom={bottom}, sep={footer_sep}"
                 );
-                for r in sprite {
-                    let bottom = r["y"].as_i64().unwrap() + r["h"].as_i64().unwrap();
-                    assert!(
-                        bottom <= footer_sep,
-                        "演示状态 {s:?} 第 {frame} 帧鳄鱼压到底部分隔线：bottom={bottom}, sep={footer_sep}"
-                    );
-                }
             }
         }
     }
@@ -994,7 +851,7 @@ mod tests {
         m.settings.follow_enabled = true;
         m.battery = Some(88);
         m.rssi = Some(-60);
-        let scene = draw(&m, 10_000, 0);
+        let scene = draw(&m, 10_000);
         let v = scene.to_string();
         assert!(v.contains("鳄鱼大宠物"), "左上保留中文品牌词");
         assert!(v.contains("Zetrix / DSH pet"), "英文产品名作为副行上屏");
@@ -1066,9 +923,9 @@ mod tests {
         )
         .unwrap();
         m.quip = "测试花絮".into();
-        let done = draw(&m, 1_004, 0).to_string();
+        let done = draw(&m, 1_004).to_string();
         assert!(done.contains("任务完成"), "完成后先停留");
-        let idle = draw(&m, 1_006, 0).to_string();
+        let idle = draw(&m, 1_006).to_string();
         assert!(idle.contains("待命中"), "5 秒后回待命页");
         assert!(!idle.contains("任务完成"));
     }
@@ -1104,7 +961,7 @@ mod tests {
             .unwrap();
         }
         m.quip = "测试花絮".into();
-        let page1 = draw(&m, 200, 0);
+        let page1 = draw(&m, 200);
         let s = page1.to_string();
         assert!(s.contains("4 个任务 · 1/2"), "四个任务要显示页码");
         // Waiting 置顶：第一行必须是等待中的任务。
@@ -1119,7 +976,7 @@ mod tests {
             .to_string();
         assert_eq!(first_title, "任务2", "等待任务必须排第一");
         m.cycle(1, 200);
-        let page2 = draw(&m, 200, 0).to_string();
+        let page2 = draw(&m, 200).to_string();
         assert!(page2.contains("4 个任务 · 2/2"));
         assert!(page2.contains("任务0"), "第二页显示剩下的一条");
     }

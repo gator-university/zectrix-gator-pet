@@ -16,80 +16,6 @@ use std::sync::{Mutex, OnceLock};
 const SPRITE_W: usize = 90;
 const SPRITE_H: usize = 120;
 
-/// 六套旧造型的 id/显示名仍保留，用于 `skin` 诊断命令兼容；
-/// 版式已经不再按造型换装，而是按动作选图（动作由当前状态决定）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Skin {
-    Pixel,
-    Abacus,
-    Fortune,
-    Astro,
-    Lens,
-    Latte,
-}
-
-impl Default for Skin {
-    fn default() -> Self {
-        Skin::Astro
-    }
-}
-
-impl Skin {
-    pub const ALL: [Skin; 6] = [
-        Skin::Pixel,
-        Skin::Abacus,
-        Skin::Fortune,
-        Skin::Astro,
-        Skin::Lens,
-        Skin::Latte,
-    ];
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Skin::Pixel => "pixel",
-            Skin::Abacus => "abacus",
-            Skin::Fortune => "fortune",
-            Skin::Astro => "astro",
-            Skin::Lens => "lens",
-            Skin::Latte => "latte",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Skin::Pixel => "像素喵",
-            Skin::Abacus => "金算喵",
-            Skin::Fortune => "暴富喵",
-            Skin::Astro => "星际喵",
-            Skin::Lens => "镜头喵",
-            Skin::Latte => "拿铁喵",
-        }
-    }
-
-    pub fn desc(self) -> &'static str {
-        match self {
-            Skin::Pixel => "最原始的像素猫",
-            Skin::Abacus => "算盘一响，黄金万两",
-            Skin::Fortune => "暴富猫，见者有份",
-            Skin::Astro => "头上带天线，信号满格",
-            Skin::Lens => "镜头对准，记录工作",
-            Skin::Latte => "一杯拿铁，慢慢干活",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value.trim().to_ascii_lowercase().as_str() {
-            "pixel" => Skin::Pixel,
-            "abacus" => Skin::Abacus,
-            "fortune" => Skin::Fortune,
-            "astro" => Skin::Astro,
-            "lens" => Skin::Lens,
-            "latte" => Skin::Latte,
-            _ => return None,
-        })
-    }
-}
-
 /// 六个动作（SPEC FR-CROC-01）。单帧静态，只有动作变了才重绘。
 pub const ACTIONS: [&str; 6] = ["idle", "working", "waiting", "done", "error", "sleep"];
 
@@ -272,10 +198,4 @@ mod tests {
         assert!(e.is_empty());
     }
 
-    #[test]
-    fn skin_ids_roundtrip() {
-        for s in Skin::ALL {
-            assert_eq!(Skin::parse(s.id()), Some(s));
-        }
-    }
 }

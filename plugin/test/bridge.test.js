@@ -224,6 +224,23 @@ test('POST /config 合法值原子落盘并能读回', async () => {
   resetConfig()
 })
 
+test('POST /config 静默丢弃已下线的 animation / pet_skin 字段', async () => {
+  resetConfig()
+  const res = await request('/config', {
+    method: 'POST',
+    body: { volume: 40, animation: false, pet_skin: 'astro' },
+    headers: authHeaders({ origin: ORIGIN, 'sec-fetch-site': 'same-site' }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(res.json.config.volume, 40)
+  assert.equal('animation' in res.json.config, false, 'animation 已下线，不应落盘')
+  assert.equal('pet_skin' in res.json.config, false, 'pet_skin 已下线，不应落盘')
+  const onDisk = fs.readFileSync(configPath, 'utf8')
+  assert.ok(!onDisk.includes('animation'))
+  assert.ok(!onDisk.includes('pet_skin'))
+  resetConfig()
+})
+
 test('POST /test 忽略 body 里的 target，只用已保存的 target', async () => {
   resetConfig({ target: '192.168.1.50' })
   const calls = []

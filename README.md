@@ -48,7 +48,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 
 > 插件自带 `bin/dsh-pet.exe`，不依赖 .NET / VC++ / Rust 运行时，也不会写 DSH 的数据目录。
 
-### 开机自启
+### 启动与退出（不需要开机自启）
 
 **插件随 DSH 启停，无需单独自启。** DSH 打开，插件就拉起宠物；DSH 退出，宠物跟着结束。
 不需要登录启动项、启动文件夹或计划任务——DSH 自己就是入口。
@@ -153,7 +153,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 ## 从源码构建
 
 ```powershell
-cargo test                 # 59 lib + 27 bin = 86
+cargo test                 # 55 lib + 34 bin = 89
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```
@@ -167,9 +167,9 @@ dsh-pet preview --demo working --out out\working.png
 ## 目录结构
 
 ```
-plugin\             DSH 插件包（package.json / index.js / client.js / bin / locales / icon）
+plugin\             DSH 插件包（package.json / index.js / client.js / bin / locale / icon）
 src\                Rust：dsh.rs 会话跟随、layout.rs 版式、sprite.rs 鳄鱼、raster.rs 绘制、
-                    voice.rs 语音诊断、device.rs 设备通道、model.rs 状态模型
+                    device.rs 设备通道、model.rs 状态模型
 assets\croc\        鳄鱼动作 PNG（default 装扮）
 assets\quips.txt    右下角花絮
 docs\SPEC.md        功能清单与逐项验收（唯一功能规格）

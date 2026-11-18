@@ -8,4 +8,3 @@ pub mod raster;
 pub mod sound;
 pub mod sprite;
 pub mod uia;
-pub mod voice;

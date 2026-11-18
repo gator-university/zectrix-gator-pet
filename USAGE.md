@@ -49,7 +49,7 @@ DSH → 设置 → **Plugins → 鳄鱼大宠物**：
 
 - 临时停用：设置页关「跟随」，或设备三击。
 - 彻底移除：Plugins 里禁用/移除 `zectrix-croc-pet`；DSH 下次启动不再拉起宠物。
-- 本机数据（可删）：`%LOCALAPPDATA%\zectrix-dsh-pet\`（state.json、pet-config.json、pet.log、recordings）。
+- 本机数据（可删）：`%LOCALAPPDATA%\zectrix-dsh-pet\`（state.json、pet-config.json、pet.log）。
   旧版本留下的开机启动/快捷方式会在新版宠物首次启动时自动清理（见上文「开机自启」）。
 
 ## 2. 配置文件
@@ -66,11 +66,9 @@ DSH → 设置 → **Plugins → 鳄鱼大宠物**：
 | `volume` | 0–100 | 90 | 音量 |
 | `target` | string | 自动发现 | 设备 IP / 设备 id；不写时按局域网发现 |
 | `format` | `mono`/`gray4`/`gray16` | `mono` | 屏幕刷新格式 |
-| `mode` | `realtime`/`balance`/`calm`/`minimal` | `realtime` | 模式（写了会覆盖 refresh_secs/animation） |
+| `mode` | `realtime`/`balance`/`calm`/`minimal` | `realtime` | 模式（写了会覆盖 refresh_secs） |
 | `refresh_secs` | int | 0 | 细节合并秒数（不写 mode 时单独生效） |
-| `animation` | bool | true | 是否让花絮/细节动起来（不写 mode 时单独生效） |
 | `stale_minutes` | int | 15 | 多久没更新算「状态陈旧」 |
-| `pet_skin` | 造型 id | `pixel` | 当前造型（`dsh-pet skin set` 写入） |
 | `title_source` | `session`/`prompt` | `session` | 标题来源。`session`=只读 DSH `session/title`（无标题用「目录名 第N轮」），不读正文；`prompt`=显式 opt-in，允许把提示词首行当标题、提问前 60 字当 detail，**会写入 state.json 并显示在设备上** |
 
 旧版本把设置写在 `state.json` 的 `model.settings` 里：升级后首次启动，如果
@@ -86,12 +84,12 @@ DSH → 设置 → **Plugins → 鳄鱼大宠物**：
 dsh-pet watch   [--watch-pid PID] [--target IP] [--format mono|gray4|gray16] [--idle-grace 秒] [--verbose]
                                     守护：无任务不占设备；任务结束按宽限交还
                                     --verbose 时状态行附加标题（默认只记 session-短号 + 状态词）
-dsh-pet preview [--demo <状态>] [--out 路径] [--frame N] [--session <ID>]
+dsh-pet preview [--demo <状态>] [--out 路径] [--session <ID>]
                                     渲染 400×300 PNG，不连设备（最常用的验收工具）
 dsh-pet scene   [--demo <状态>]     打印布局 JSON（autotest 断言用）
 dsh-pet sessions                    列出可跟随的会话、状态、进度、上下文占用
 dsh-pet set     [--follow on|off] [--sound on|off] [--volume 0-100]
-                [--animation on|off] [--refresh 秒] [--calm on|off]
+                [--refresh 秒] [--calm on|off]
                 [--format mono|gray4|gray16] [--title-source session|prompt]
                                     查看/修改用户配置（写 pet-config.json，2 秒内生效）
 dsh-pet check   [--target IP|ID]    只检查设备（型号/电量/信号），不推画面
@@ -99,8 +97,6 @@ dsh-pet sound   --status waiting|done [--target IP|ID] [--volume 0-100]
                                     单独播一次提示音
 dsh-pet push    [--demo <状态>] [--target IP|ID] [--format mute]
                                     单次推送后断开（调试版式用）
-dsh-pet voice   probe|paste|open|targets|windows|focus|doctor|say|preview
-                                    语音链路诊断（设备手势已按规格改为长按无操作）
 dsh-pet where                       打印配置（pet-config.json）/状态缓存/会话路径
 dsh-pet forget                      删除本机状态缓存
 dsh-pet forget --titles             只做隐私清理：已有任务标题换成 session-<短号>（无会话 id 用
@@ -113,7 +109,7 @@ dsh-pet --version                   版本号
 常用验收：
 
 ```powershell
-cargo test                                          # 86 项
+cargo test                                          # 89 项
 .\plugin\bin\dsh-pet.exe preview --demo working --out out\working.png
 .\plugin\bin\dsh-pet.exe check --target 192.168.1.162
 .\plugin\bin\dsh-pet.exe sessions
@@ -132,7 +128,7 @@ cargo test                                          # 86 项
 
 ## 5. 开发与目录
 
-- 源码：`src/`（Rust 2021，`cargo test` 86 项）
+- 源码：`src/`（Rust 2021，`cargo test` 89 项）
 - 插件：`plugin/`（`index.js` 宿主：spawn + 配置桥 127.0.0.1:4517；`client.js`：设置页）
 - 规格：`docs/SPEC.md`；决策：`docs/adr/`；术语：`GLOSSARY.md`
 - 截图：`docs/screens/`
