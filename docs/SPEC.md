@@ -2,7 +2,7 @@
 
 > 项目：`zectrix-croc-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
-> 版本：0.7.3 · 2026-11-18
+> 版本：0.8.0 · 2026-11-18
 > 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
@@ -196,17 +196,17 @@
 ## 8. 设置页（FR-SET）
 
 **FR-SET-01 位置**
-- 期望：DSH 的 Plugins 页 → 本插件详情（与官方插件一致）；无独立面板/托盘。
-- 状态：待验证（代码完成；0.7.3 修掉 `dsh.client.inject: ["slots"]` —— 该字段要的是「先加载哪些客户端模块包」，写成服务名会让 client bundle 加载失败；移除后需刷新 DSH 界面确认）。
-- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.effect(() => ctx.slots.inject('plugins.bundle.config', …))`；`package.json` `dsh.client{platform:web,immediately:true}`（无 inject）；Node 沙箱 harness 实测注册 `{name:'plugins.bundle.config', key:'zectrix-croc-pet'}` 且组件为函数（`CLIENT OK`）；展示元信息 `plugin/locale/{en,zh}.json`（meta.title/description）与 `./icon` 已导出并通过 `files` 打包，插件启用/停用重载无警告、宠物进程正常拉起。页面渲染需刷新 DSH GUI 后确认。
+- 期望：DSH 侧栏「插件」页 → 已安装插件 → 本插件详情里渲染配置表单（与官方插件一致）；「设置 → 内置插件」只是只读列表；无独立面板/托盘。
+- 状态：已验收（0.7.3 修掉 `dsh.client.inject: ["slots"]` —— 该字段要的是「先加载哪些客户端模块包」，写成服务名会让 client bundle 加载失败；0.7.4 修深色主题下拉配色）。
+- 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.effect(() => ctx.slots.inject('plugins.bundle.config', …))`；`package.json` `dsh.client{platform:web,immediately:true}`（无 inject）；用户在侧栏「插件 → 已安装插件 → 鳄鱼大宠物」看到跟随/模式/提示音/音量/设备 IP/刷新格式/保存/重新读取表单并保存生效（0.7.3/0.7.4 截图）。
 
 **FR-SET-02 字段**
 - 术语说明：见 GLOSSARY「配置桥」「宿主插件」「client bundle」。
-- 跟随开关、模式、提示音+音量、设备 IP+「测试连接」、刷新格式（mono/gray4/gray16）。
-- `title_source`（`session`/`prompt`）已支持 `pet-config.json` 与 `dsh-pet set --title-source`；
-  设置页控件尚未接入（本票写范围不含 `plugin/`），默认 `session` 即为隐私安全值。
+- 跟随开关、模式、提示音+音量、设备 IP+「测试连接」、刷新格式（mono/gray4/gray16）、
+  `title_source`（`session`/`prompt`，设置页已带隐私提示）。
 - 动作调试（6 动作预览）v1 未做：列为后续项，不阻塞验收。
-- 状态：待验证（字段已实现；动作调试未实现）。
+- 状态：已验收（字段全部接入设置页；动作调试为后续项）。
+- 证据：`plugin/client.js`（0.7.4）字段齐全；`pet-config.json` 白名单在 `plugin/bridge.js` 与 `src/config.rs` 两端同校验。
 
 **FR-SET-03 生效**
 - 期望：保存后 ≤2 秒宠物读到新配置（写 `pet-config.json`，守护轮询）。
@@ -218,22 +218,69 @@
 - 状态：已验收。
 - 证据：宿主插件 HTTP `POST /test` → `dsh-pet check`（8s 超时）；实测返回 `{"ok":true,"output":"错误: 设备忙碌…（设备在线；当前画面由宠物维护，属正常）"}`，宠物占用设备时也能确认在线。
 
-## 9. 发布与归属（FR-REL）
+## 9. 安全与隐私（FR-SEC / FR-PRIV / FR-DATA）
+
+**FR-SEC-01 配置桥鉴权**
+- 期望：桥只监听 `127.0.0.1`；`/config`、`/test` 必须带逐安装 token（`%LOCALAPPDATA%\zectrix-dsh-pet\bridge-token`，0600）；`/token` 只接受白名单 Origin + 同源/同站请求；`/health` 免 token 但只回 `{ok, version}`。
+- 状态：已验收。
+- 证据：`plugin/bridge.js` + `plugin/test/bridge.test.js`（13 例，`npm test` 全绿）；提交 `9fc45fc`（T1）。
+
+**FR-SEC-02 跨站与最小暴露**
+- 期望：任何非白名单 Origin 或 `Sec-Fetch-Site: cross-site` 一律 403；CORS 只回精确 Origin + `Vary: Origin`，无 `*`；`/test` 只用已存设备 IP，忽略请求体 target。
+- 状态：已验收。
+- 证据：`bridge.test.js` 覆盖 401/403/415/413/400 与 OPTIONS 路径；提交 `9fc45fc`。
+
+**FR-SEC-03 输入校验与原子写**
+- 期望：设备 IP 限私网/回环 IPv4；音量 0–100；格式/模式限枚举；非法值 400 且不写盘；`pet-config.json` 与 `state.json` 均为 tmp+rename 原子写。
+- 状态：已验收。
+- 证据：`bridge.js` 校验 + `src/config.rs` 读端同校验；`write_json_atomic`（提交 `9fc45fc`、`482ab6a`）。
+
+**FR-PRIV-01 标题来源**
+- 期望：默认 `title_source=session`，只读 `session/title`；缺失时用「项目目录名 第 N 轮」；完全不读 `user/message`；`prompt` 模式必须显式开启。
+- 状态：已验收。
+- 证据：`src/dsh.rs` 默认分支 + 4 个单测；提交 `7e30871`（T2）；设置页已带 privacy 提示。
+
+**FR-PRIV-02 等待文案与提醒指纹**
+- 期望：Waiting detail 默认固定「有 1 个问题待确认」；`state.json` 的提醒指纹只存 `sha256(key|status)` 前 16 位，不含标题/提问正文；旧长文案在加载时清空。
+- 状态：已验收。
+- 证据：`src/sound.rs` SHA-256 实现 + 向量测试；提交 `7e30871`。
+
+**FR-PRIV-03 日志与历史清理**
+- 期望：`pet.log` 默认只记 `session-<短号> · 状态词`，`--verbose` 才带标题；`dsh-pet forget --titles` 可把旧标题清成 session 短号并清空指纹，保留设置。
+- 状态：已验收。
+- 证据：`src/daemon.rs` 状态日志 + `cli.rs` forget 子命令；单测覆盖；0.8.0 部署时已对真机状态执行一次清理（`forget --titles`：替换 76 条标题、清空提醒指纹；旧 `pet.log` 归档为 `pet.log.bak` 后重建）。
+
+**FR-DATA-01 损坏保护**
+- 期望：`state.json` 解析失败时改名为 `state.corrupt-<ts>.json` 且**绝不覆盖**（降级只写 `state.recovered.json`）；正常写前滚 `state.bak.json`；`pet-config.json` 字段级容错。
+- 状态：已验收。
+- 证据：`src/store.rs` + 单测 `save_never_overwrites_a_state_file_it_cannot_parse` 等；提交 `80dd438`（T3）。
+
+**FR-PERF-01 主循环开销**
+- 期望：空闲 tick 平均 <5ms；`--trace-tick` 可输出每 10 拍耗时；会话扫描按 mtime 增量、团队扫描 10 秒全量 1 秒快查；`state.json` 按 stamp 缓存、写盘节流 1 秒。
+- 状态：已验收。
+- 证据：`--trace-tick` 实测空闲一拍 1.17ms（扫描 0.663 + 团队 0.430 + 读缓存 0.076）；提交 `6a86e7c`（T8）。
+
+**FR-ARCH-01 模块拆分**
+- 期望：`main.rs` <800 行，职责拆到 `store/config/scan/daemon/cli`；测试集中 `src/tests.rs`；`cargo test --offline` ≥80。
+- 状态：已验收。
+- 证据：`main.rs` 449 行；101 项测试（55 lib + 46 bin）全绿、0 warning；提交 `79d4625`…`e7cf357`（T9）。
+
+## 10. 发布与归属（FR-REL）
 
 **FR-REL-01 归属**：README/USAGE/SPEC 注明 fork 自 MuskCheng/zectrix-workbuddy-pet；LICENSE 保留原版权。
 - 状态：已验收。
 
 **FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-croc-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
-- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-croc-pet （`main` 已推送；tag `v0.7.2`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
-- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
+- 状态：已验收。公开仓库 https://github.com/gator-university/zectrix-croc-pet （`main` 已推送；tag `v0.8.0`；`plugin/bin/dsh-pet.exe` 已入库，安装无需本地构建）。
+- 证据：`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 安装到 profile `node_modules`（0.7.2 首装验证；0.7.3 修复设置页加载；0.8.0 安全整改后以同一 spec 升级）；重启 DSH 后宠物进程命令行指向 `…\.dsh\profiles\desktop\node_modules\zectrix-croc-pet\bin\dsh-pet.exe`，配置桥 `/health` 返回同一路径。
 
-**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.3）；`engines.dsh >= 0.2.1-alpha.2`。
+**FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.8.0）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
 
-## 10. 可验证性（FR-VER）
+## 11. 可验证性（FR-VER）
 
-**FR-VER-01 自动化**：`cargo test` 全过（≥88 项）。
-- 状态：已验收。55 lib + 34 bin = **89** 项。
+**FR-VER-01 自动化**：`cargo test` 全过（≥80 项），插件侧 `npm test` 全过。
+- 状态：已验收。55 lib + 46 bin = **101** 项；`plugin` 侧 14 例。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
@@ -247,11 +294,12 @@
 （任务标题换 `session-<短号>`、清空提醒指纹，不删设置）。
 - 状态：已验收（见 `usage()` 与 USAGE.md 第 3 节）。
 
-## 11. 已知限制 / 后续项
+## 12. 已知限制 / 后续项
 
 - 同一时刻只能一个程序占设备（固件约束）。
-- 动作调试页（FR-SET-02 子项）、GitHub 建仓与发布未做。
+- 动作调试页（FR-SET-02 子项）未做；列为后续项。
 - 语音输入（`voice` 模块 + CLI）与六套猫造型已按规格移除（0.8.0）：设备长按无操作，
   `voice`/`skin` 命令、`pet_skin`/`animation` 设置项与相关模块全部删除；旧
   `pet-config.json`/`state.json` 里残留的 `pet_skin`、`animation` 键按未知字段静默忽略。
 - 设置页需重启 DSH 后才可见（client bundle 在启动时加载）。
+- FR-VER-03 真机照片待用户补。

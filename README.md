@@ -5,7 +5,7 @@
 一只像素小鳄鱼，跟着 DSH 的会话状态换动作。它是 **DeepSeek Harness 插件**：
 DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugins 里，没有别的常驻程序。
 
-`Windows 10 / 11 x64` · `v0.7.2` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
+`Windows 10 / 11 x64` · `v0.8.0` · `MIT` · DSH `>= 0.2.1-alpha.2` · ZECTRIX Note 4（400×300 单色）
 
 <p align="center">
   <img src="docs/screens/working.png" width="420" alt="设备上的一帧：单任务详情，右下角是鳄鱼大宠物">
@@ -43,8 +43,9 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
    - 装发布版：填仓库地址 `https://github.com/gator-university/zectrix-croc-pet`；
    - 本机开发：选本地目录 `E:\myAIProjects\zetrix-dsh-screen\plugin`（`link:` 安装）。
 2. **重启 DeepSeek Harness**——宿主插件与设置页都在启动时加载。
-3. 打开 设置 → **Plugins → 鳄鱼大宠物**：填设备 IP，点「测试连接」，保存。
+3. 侧栏 **插件 → 已安装插件 → 鳄鱼大宠物**：填设备 IP，点「测试连接」，保存。
    第一次保存后 ≈2 秒，设备就会开始跟。
+   （「设置 → 内置插件」只是只读列表；配置在侧栏「插件」页的详情里。）
 
 > 插件自带 `bin/dsh-pet.exe`，不依赖 .NET / VC++ / Rust 运行时，也不会写 DSH 的数据目录。
 
@@ -149,6 +150,27 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
   默认 `session` 模式不会。升级前留下的旧标题可用 `dsh-pet forget --titles`
   一次性替换为 `session-<短号>`（无会话 id 用 `task-<序号>`）并清空指纹；
 - 与设备只走局域网 UDP（32342），无云端、无账号。
+
+### 本地配置桥（安全）
+
+设置页与宠物进程之间用一个只监听 `127.0.0.1:4517` 的小 HTTP 桥（`plugin/bridge.js`）：
+
+- **逐安装 token**：首次启动生成 48 位十六进制 token，存
+  `%LOCALAPPDATA%\zectrix-dsh-pet\bridge-token`（仅当前用户可读）；`/config`、`/test`
+  必须带 `X-Croc-Pet-Token`，读取端与写入端同校验；
+- **跨站防护**：`/token` 只接受白名单 Origin（本机 `127.0.0.1`/`localhost`）且
+  `Sec-Fetch-Site` 为 `same-origin`/`same-site`；任何请求带非白名单 Origin 或
+  `cross-site` 一律 403；CORS 只回精确 Origin + `Vary: Origin`，不再有 `*`；
+- **最小暴露**：`/health` 免 token，但只回 `{ok, version}`，不含安装路径；
+  `/test` 只测设置里已存的设备 IP，请求体里的 target 被忽略；
+- **输入校验**：设备 IP 只接受私网/回环 IPv4；音量 0–100；格式与模式只接受枚举值；
+  非法请求返回 400 且不写盘；配置文件用 tmp + rename 原子写。
+
+### 升级
+
+从旧版升级：重新安装同一 Git 地址（或本地目录）→ **重启 DSH**。旧版本写入的开机启动项、
+快捷方式与计划任务会由新版首次启动时自动清理；旧 `state.json` 里的提示词标题可用
+`dsh-pet forget --titles` 一次性清成 `session-<短号>`。
 
 ## 从源码构建
 

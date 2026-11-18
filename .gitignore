@@ -6,3 +6,6 @@
 
 __pycache__/
 zectrix-local-push-sdk/
+
+# to-tickets 本地工作区（不影响构建）
+.scratch/
