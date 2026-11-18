@@ -65,11 +65,14 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 | --- | --- |
 | 跟随 | 关闭后立即释放设备，回设备自己的默认界面 |
 | 模式 | 实时 / 平衡 / 安静 / 极简（控制细节刷新合并间隔） |
-| 提示音 + 音量 | 进入「等你处理 / 任务完成」时响一次，0–100 |
+| 提示音 + 音量 | 进入「等你处理 / 任务完成」时响一次，0–100（默认 90） |
 | 设备 IP | 支持「测试连接」，直接返回设备是否可达与电量 |
 | 刷新格式 | mono（默认，约 1–2 秒/帧）/ gray4（约 3.5 秒）/ gray16（约 5 秒） |
+| 标题来源 | session（默认，只读会话标题）/ prompt（把提示词首行当标题，**会写入 state.json 与设备**） |
 
-保存后写入 `%LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json`，宠物进程每 2 秒热读，**不用重启 DSH**。
+保存后写入 `%LOCALAPPDATA%\zectrix-dsh-pet\pet-config.json`（**唯一用户配置源**），
+宠物进程每 2 秒热读，**不用重启 DSH**。`state.json` 只存运行时状态，不是设置；
+命令行 `dsh-pet set` 改的也是 `pet-config.json`，两边不会互相覆盖。
 
 ## 设备手势
 
@@ -150,7 +153,7 @@ DSH 打开它就起来，DSH 关闭它就退出，设置页就在 DSH 的 Plugin
 ## 从源码构建
 
 ```powershell
-cargo test                 # 59 lib + 22 bin = 81
+cargo test                 # 59 lib + 27 bin = 86
 cargo build --release      # target\release\dsh-pet.exe
 copy target\release\dsh-pet.exe plugin\bin\dsh-pet.exe
 ```
