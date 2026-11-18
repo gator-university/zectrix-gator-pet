@@ -208,8 +208,8 @@
 **FR-REL-01 归属**：README/USAGE/SPEC 注明 fork 自 MuskCheng/zectrix-workbuddy-pet；LICENSE 保留原版权。
 - 状态：已验收。
 
-**FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `https://github.com/gator-university/zectrix-croc-pet`；本地开发用 link 目录。
-- 状态：部分验收（仓库已创建并推送 `main`：https://github.com/gator-university/zectrix-croc-pet ；本地 link 安装已验证；**从 Git 地址直接安装待验证**——插件清单在 `plugin/` 子目录，仓库根是 Rust crate）。
+**FR-REL-02 安装方式**：DSH Add plugin → Git 地址 `github:gator-university/zectrix-croc-pet#path:/plugin`（仓库根是 Rust crate，插件清单在 `plugin/` 子目录；仓库已带 `plugin/bin/dsh-pet.exe`）。本地开发用 link 目录。
+- 状态：待验证（仓库已创建并推送 `main`：https://github.com/gator-university/zectrix-croc-pet ；`pnpm add "github:gator-university/zectrix-croc-pet#path:/plugin"` 实测安装成功、profile `node_modules/zectrix-croc-pet` 含 exe 与配置桥；**运行态需重启 DSH 后复核**，见 FR-LIFE-01）。
 
 **FR-REL-03 版本**：`Cargo.toml` 与插件 `package.json` 同步（0.7.2）；`engines.dsh >= 0.2.1-alpha.2`。
 - 状态：已验收。
