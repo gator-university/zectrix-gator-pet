@@ -55,12 +55,34 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
 
-    function api(path, init) {
-      return fetch(BASE + path, init).then(async r => {
-        const body = await r.json().catch(() => ({}))
-        if (!r.ok || body.ok === false) throw new Error(body.error || '请求失败')
-        return body
-      })
+    // 配置桥每次安装生成随机 token，只对同源/同站的浏览器页面返回。
+    // 首次请求先 GET /token（浏览器会自动带 Origin 与 Sec-Fetch-Site），
+    // 之后所有请求都带 X-Croc-Pet-Token。
+    let tokenPromise = null
+    function getToken() {
+      if (!tokenPromise) {
+        tokenPromise = fetch(BASE + '/token', { cache: 'no-store' })
+          .then(async r => {
+            const body = await r.json().catch(() => ({}))
+            if (!r.ok || !body.token) throw new Error(body.error || '无法获取设置桥令牌')
+            return body.token
+          })
+          .catch(e => {
+            // 失败不缓存，设置页「重试」会重新取。
+            tokenPromise = null
+            throw new Error(`无法获取设置桥令牌：${String(e.message || e)}`)
+          })
+      }
+      return tokenPromise
+    }
+
+    async function api(path, init) {
+      const token = await getToken()
+      const headers = { ...((init && init.headers) || {}), 'x-croc-pet-token': token }
+      const r = await fetch(BASE + path, { ...init, headers })
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok || body.ok === false) throw new Error(body.error || '请求失败')
+      return body
     }
 
     function Field(props) {
