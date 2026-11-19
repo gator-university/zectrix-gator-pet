@@ -1,6 +1,6 @@
 # 开发 checkpoint
 
-更新日期：2026-11-19（Asia/Shanghai）
+更新日期：2026-11-20（Asia/Shanghai）
 
 ## 恢复入口
 
@@ -23,7 +23,13 @@
 - 已知工具限制：当前 stable toolchain 没有 rustfmt；`npm test` 的 Node 测试调度器被子进程 `EPERM` 阻止，但两个测试文件分别运行通过。
 - 一次误运行的 `preview --help` 被 CLI 当作实际预览命令，命令期间用户目录 `state.json` 的时间戳发生变化；备份步骤报访问拒绝。未读取或回滚该文件，也未继续访问用户缓存。
 - 交接中的可选项为 GitHub Actions CI、SDK tag 固定和 `binarySha256`；尚未选择实施范围。
-- 新功能先更新 SPEC 和任务票，再按用户确认的范围实施。当前多任务改版未安装、未发布、未推送，也未重启 DSH。
+- 新功能先更新 SPEC 和任务票，再按用户确认的范围实施。多任务改版已提交并推送到 `mine/main`（`05cddb8`），未安装、未发布，也未重启 DSH。
+
+## Git 写入结论（2026-11-20）
+
+- 2026-11-19 的 `.git/index.lock: Permission denied` 根因是沙箱只允许宿主文件工具写入仓库子目录，shell 子进程对 `src/`、`docs/`、`.git` 等已有子目录无写权限；不是 NTFS ACL 拒绝。`.git` 上两个历史 SID 的 DENY 项未匹配当前令牌，目录属主也仍是当前账户。
+- 以放宽的沙箱模式一次性完成暂存、提交与推送后验证：本地 HEAD 与 `mine/main` 同为 `05cddb8`，工作区干净；`origin/main` 仍领先 67 个提交，未向 origin 推送。
+- 后续会话若回到受限沙箱，git 写入仍会失败；应在当前运行时边界内申请放宽，或改用宿主文件工具做只读检查。
 
 ## 操作约束
 
