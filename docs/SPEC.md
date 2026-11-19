@@ -3,7 +3,7 @@
 > 项目：`zectrix-gator-pet`（历史名 dsh-pet）
 > 形态：**DSH 插件**（宿主 bundle 内置 `bin/dsh-pet.exe`），把 DeepSeek Harness 的实时状态推到 ZECTRIX Note 4 墨水屏。
 > 版本：0.8.3 · 2026-11-18
-> 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `待实现`。
+> 状态取值：`已验收`（自动化+真机证据齐） / `待验证`（代码完成，缺一项证据） / `实现中` / `待实现`。
 > 本文件是唯一功能清单；实现变更先改这里，再改代码。
 
 ## 0. 背景与来源
@@ -101,20 +101,22 @@
 
 ## 4. 版式（FR-UI）
 
+2026-11-19 已确认并完成多任务改版代码与自动化验收：2 个及以上任务也显示 90×120 鳄鱼，每页最多 3 个任务；等待回答/审批置顶并用黑底白字状态条，新等待优先且回到第一页；鳄鱼反映全部任务的等待状态，页头显示待处理总数。详细规则与验收见 [多任务鳄鱼布局](specs/multi-task-gator-layout.md)。真机证据另行记录。
+
 **FR-UI-01 单任务详情页**
 - 内容：左上品牌「鳄鱼大宠物」12px（副行「Zetrix / DSH pet」9px）、右上模式徽章；状态大字+图标；标题≤3 行；详情一行；进度条；等待页题干/徽章；底部两态。
 - 状态：已验收。
 - 证据：`docs/screens/working.png`、`docs/screens/waiting.png`、`docs/screens/done.png`；`cargo test` lib 59 项（含 layout）。
 
 **FR-UI-02 双任务**
-- 期望：两行，每行「状态图标 + 标题 2 行 + 状态短语」；不画鳄鱼；Waiting 置顶。
+- 期望：右下显示 90×120 鳄鱼；每页最多 3 项；标题在鳄鱼上方可用整行宽度，下方收窄到鳄鱼左侧；长标题按像素宽度截断并保留省略号。
 - 状态：已验收。
-- 证据：`out/v6-idle.png`（真实两任务）、`out/v6-live.png`；`display_order()` 测试。
+- 证据：`docs/screens/multi-task/working-2-page-1.png`；`multi_task_overview_keeps_the_gator_and_avoids_its_area`、`long_chinese_mixed_and_windows_path_titles_keep_a_fitted_ellipsis`；2026-11-19 用户确认真机效果良好。
 
 **FR-UI-03 三个及以上**
-- 期望：紧凑列表每页 3 行，右上「1/2」页码；上/下键翻页；Waiting 永远置顶；新 Waiting 自动第一页。
-- 状态：已验收（自动化）；真机 3+ 待拍照。
-- 证据：测试 `waiting_task_is_pinned_first_and_pages_show_numbers`（4 任务显示「4 个任务 · 1/2」，第一行等待任务，翻页 2/2）。
+- 期望：沿用 FR-UI-02 布局；每页最多 3 项；显示页码和全局待处理数；Waiting 永远置顶；新 Waiting 回到第一页，普通更新保留手动页。
+- 状态：已验收。
+- 证据：`docs/screens/multi-task/working-3-page-1.png`、`working-4-page-1.png`、`working-4-page-2.png`；`waiting_task_is_pinned_first_and_pages_show_numbers`、`manual_page_survives_progress_update`；2026-11-19 用户确认真机效果良好。
 
 **FR-UI-04 状态图标**
 - 期望：● 正在工作、！等你处理、■ 已停止、× 遇到问题、? 待确认、完成用矢量对勾（不依赖字体符号）。
@@ -150,9 +152,10 @@
 
 **FR-GATOR-02 触发规则**
 - idle：无任务（含完成 5 秒后）；working：有 Working；waiting：有 Waiting；done：完成后 5 秒内；error：Error/Stopped（决定：Stopped 也走 error 动作）；sleep：连续 30 分钟无活跃任务（`model.last_active_at`）。
+- 多任务时以全部活跃任务判断：任一任务 Waiting 就显示 waiting；全部工作时显示 working；翻页不改变鳄鱼动作。
 - 素材从 30×40@3× 换到 90×120@1× 后，触发规则与动作选择不变。
 - 状态：已验收。
-- 证据：`layout.rs` 动作选择分支；`last_active_at` 在扫描时刷新。
+- 证据：`multi_task_waits_are_highlighted_and_reflected_across_pages`；`docs/screens/multi-task/waiting-5-page-1.png`、`waiting-5-page-2.png`；2026-11-19 用户确认真机效果良好。
 
 **FR-GATOR-03 素材契约**
 - 路径 `assets/gator/default/{action}.png`；90×120 单色 PNG（L 模式，只含 0/255），按 1:1 直接绘制在 (300,152)，不再缩放；`sprite::draw_action(elements, x, y, action, scale)` 的 `scale` 参数保留（v1 传 1，供未来更换素材尺寸）；装扮目录 `assets/gator/<outfit>/`；可选第二帧（v1 不用）。
@@ -199,6 +202,7 @@
 - 期望：DSH 侧栏「插件」页 → 已安装插件 → 本插件详情里渲染配置表单（与官方插件一致）；「设置 → 内置插件」只是只读列表；无独立面板/托盘。
 - 状态：已验收（0.7.3 修掉 `dsh.client.inject: ["slots"]` —— 该字段要的是「先加载哪些客户端模块包」，写成服务名会让 client bundle 加载失败；0.7.4 修深色主题下拉配色）。
 - 证据：`plugin/client.js` 用 `window.__ModuleLoader__` + `ctx.effect(() => ctx.slots.inject('plugins.bundle.config', …))`；`package.json` `dsh.client{platform:web,immediately:true}`（无 inject）；用户在侧栏「插件 → 已安装插件 → 鳄鱼大宠物」看到跟随/模式/提示音/音量/设备 IP/刷新格式/保存/重新读取表单并保存生效（0.7.3/0.7.4 截图）。
+- 0.8.3 验收补充（2026-11-19）：用户确认该位置的完整设置表单正常显示，没有 `Failed to fetch`；本轮只读检查 `/health` 返回 `{"ok":true,"version":"0.8.3"}`。
 
 **FR-SET-02 字段**
 - 术语说明：见 GLOSSARY「配置桥」「宿主插件」「client bundle」。
@@ -207,6 +211,7 @@
 - 动作调试（6 动作预览）v1 未做：列为后续项，不阻塞验收。
 - 状态：已验收（字段全部接入设置页；动作调试为后续项）。
 - 证据：`plugin/client.js`（0.7.4）字段齐全；`pet-config.json` 白名单在 `plugin/bridge.js` 与 `src/config.rs` 两端同校验。
+- 0.8.3 验收补充（2026-11-19）：用户确认完整设置表单正常，包含跟随、模式、提示音、音量、设备 IP、刷新格式、标题来源、保存和重新读取。本次确认范围为表单显示；保存生效的既有证据见 FR-SET-03。
 
 **FR-SET-03 生效**
 - 期望：保存后 ≤2 秒宠物读到新配置（写 `pet-config.json`，守护轮询）。
@@ -300,10 +305,11 @@
 ## 11. 可验证性（FR-VER）
 
 **FR-VER-01 自动化**：`cargo test` 全过（≥80 项），插件侧 `npm test` 全过。
-- 状态：已验收。58 lib + 53 bin = **111** 项；`plugin` 侧 25 例。
+- 状态：待验证。Rust 68 lib + 53 bin = **121** 项全过，release 构建通过；插件两个测试文件共 25 例分别运行全过，`npm test` 聚合运行受沙箱子进程 `EPERM` 阻止。
 
 **FR-VER-02 预览**：`dsh-pet preview --out …` 生成 400×300 PNG，覆盖单/双/3+、等待、完成、出错、空闲、6 动作。
 - 状态：已验收。证据：`docs/screens/{live,working,waiting,done,error,stopped}.png`（由最终 90×120 素材重出）。
+- 多任务补充预览：`docs/screens/multi-task/` 使用正式 `layout::draw` 与 `raster::to_png` 生成，包含 2/3/4 项、末页和跨页等待场景。
 - 性能目标：单帧元素上限从 220 提到 **400**（90×120 素材的贪心矩形比 30×40 多；实测单帧 245–280 个场景元素 = 素材 208–274 个矩形 + 版式约 10，见 `src/layout.rs` 的 `layouts_obey_hub_limits`，上限 400；再高应简化素材而不是拆动作）。
 
 **FR-VER-03 真机**：关键页面推送到设备后由用户确认。

@@ -213,8 +213,8 @@ fn draw_line(c: &mut Canvas, el: &Value) {
 }
 
 fn draw_text(c: &mut Canvas, el: &Value, fonts: &Fonts) {
-    let content = el["content"].as_str().unwrap_or("");
-    if content.is_empty() {
+    let source = el["content"].as_str().unwrap_or("");
+    if source.is_empty() {
         return;
     }
     let x = int(el, "x", 0);
@@ -224,6 +224,16 @@ fn draw_text(c: &mut Canvas, el: &Value, fonts: &Fonts) {
     let right = (x + limit).min(W);
     let bold = el["weight"].as_str() == Some("bold");
     let font = if bold { &fonts.bold } else { &fonts.regular };
+    let fitted;
+    let content = if el["truncate"].as_bool() == Some(true) {
+        fitted = fit_text(source, limit.max(0) as f32, font, size);
+        fitted.as_str()
+    } else {
+        source
+    };
+    if content.is_empty() {
+        return;
+    }
     // 墨水色默认黑；黑底白字徽章传 "color":255。
     let ink = el["color"].as_u64().map(|v| v.min(255) as u8).unwrap_or(0);
 
@@ -258,6 +268,32 @@ fn draw_text(c: &mut Canvas, el: &Value, fonts: &Fonts) {
         }
         pen += metrics.advance_width;
     }
+}
+
+fn fit_text(content: &str, max_width: f32, font: &Font, size: f32) -> String {
+    let width = |s: &str| {
+        s.chars()
+            .map(|ch| font.rasterize(ch, size).0.advance_width)
+            .sum::<f32>()
+    };
+    if width(content) <= max_width {
+        return content.to_string();
+    }
+    let ellipsis_width = font.rasterize('…', size).0.advance_width;
+    let mut fitted = String::new();
+    let mut used = 0.0;
+    for ch in content.chars() {
+        let advance = font.rasterize(ch, size).0.advance_width;
+        if used + advance + ellipsis_width > max_width {
+            break;
+        }
+        fitted.push(ch);
+        used += advance;
+    }
+    if ellipsis_width <= max_width {
+        fitted.push('…');
+    }
+    fitted
 }
 
 pub fn render(scene: &Value, fonts: &Fonts) -> Vec<u8> {
@@ -373,6 +409,43 @@ mod tests {
                     "宽度限制外必须保持白色"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fitted_text_keeps_an_ellipsis_inside_its_pixel_limit() {
+        let fonts = Fonts::load().unwrap();
+        let scene = json!({"elements":[{
+            "type":"text","content":"MMMMMMMMMMMMMMMM","x":20,"y":60,
+            "size":16,"width_limit":64,"truncate":true
+        }]});
+        let pixels = render(&scene, &fonts);
+        let ink_columns: Vec<i32> = (20..400)
+            .filter(|x| (0..300).any(|y| pixels[(y * 400 + x) as usize] < 220))
+            .collect();
+        assert!(!ink_columns.is_empty());
+        let rightmost = *ink_columns.last().unwrap();
+        assert!(rightmost < 84, "文字不得越过 x + width_limit，实际 {rightmost}");
+        assert!(rightmost >= 68, "省略号应留在可用区域末端，实际 {rightmost}");
+    }
+
+    #[test]
+    fn long_chinese_mixed_and_windows_path_titles_keep_a_fitted_ellipsis() {
+        let fonts = Fonts::load().unwrap();
+        let samples = [
+            "检查多任务标题截断是否适配中文字符宽度和省略号",
+            "Update task_cache.rs after normal heartbeats preserve ordering",
+            r"C:\Users\liujj\AppData\Local\Temp\very-long-session-title-for-preview.log",
+        ];
+
+        for sample in samples {
+            let fitted = fit_text(sample, 112.0, &fonts.regular, 16.0);
+            assert!(fitted.ends_with('…'), "标题应保留省略号：{sample}");
+            let width = fitted
+                .chars()
+                .map(|ch| fonts.regular.rasterize(ch, 16.0).0.advance_width)
+                .sum::<f32>();
+            assert!(width <= 112.0, "{sample} 截断后仍超出像素宽度：{width}");
         }
     }
 

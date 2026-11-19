@@ -199,6 +199,7 @@ mod tests {
                 thread_id: None,
                 seq,
                 status,
+                waiting_kind: None,
                 title: "整理今天的待办".into(),
                 detail: detail.into(),
                 progress: None,
@@ -210,6 +211,7 @@ mod tests {
             updated_at: 1_700_000_000,
             stale: false,
             subagent_busy: false,
+            waiting_order: 0,
         }
     }
 

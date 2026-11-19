@@ -10,6 +10,8 @@ fn event(seq: u64, status: Status) -> TaskEvent {
         thread_id: None,
         seq,
         status,
+        waiting_kind: (status == Status::Waiting)
+            .then_some(dsh_pet::model::WaitingKind::Question),
         title: "真实任务".into(),
         detail: String::new(),
         progress: None,

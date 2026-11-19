@@ -11,6 +11,14 @@ pub enum Status {
     Stopped,
     Unknown,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingKind {
+    Question,
+    Permission,
+}
+
 impl Status {
     pub fn label(self) -> &'static str {
         match self {
@@ -76,6 +84,8 @@ pub struct Event {
     pub thread_id: Option<String>,
     pub seq: u64,
     pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_kind: Option<WaitingKind>,
     pub title: String,
     #[serde(default)]
     pub detail: String,
@@ -100,13 +110,29 @@ pub struct Task {
     /// 所以设备也不该把它当成「任务完成」。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent_busy: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub waiting_order: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 impl Task {
+    pub fn waiting_label(&self) -> &'static str {
+        match self.event.waiting_kind {
+            Some(WaitingKind::Question) => "等你回答",
+            Some(WaitingKind::Permission) => "等你批准",
+            None => "等你处理",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         if self.subagent_busy {
             return "子智能体运行中";
         }
-        if self.status() == Status::Waiting && self.event.detail.starts_with("权限审批") {
+        if self.status() == Status::Waiting
+            && self.event.waiting_kind == Some(WaitingKind::Permission)
+        {
             "等待权限审批"
         } else {
             self.status().label()
@@ -196,6 +222,8 @@ pub struct Model {
     pub team_busy: std::collections::HashMap<String, i64>,
     #[serde(skip)]
     pub selected: Option<String>,
+    #[serde(skip)]
+    pub manual_page: Option<usize>,
     #[serde(skip)]
     pub demo: Option<Status>,
 }
@@ -339,17 +367,37 @@ impl Model {
         event.title = clean(event.title.trim(), 120);
         event.detail = clean(&event.detail, 240);
         event.agent = clean(&event.agent, 40);
+        if event.status != Status::Waiting {
+            event.waiting_kind = None;
+        }
         if event.title.is_empty() {
             bail!("任务标题无有效字符")
         }
         // 记录旧状态：花絮只在状态真正变了才换。同一个「等你处理」每 2 秒
         // 被重复上报（等待期间事件持续产生）时，换花絮会让整屏反复刷新。
         let task_id = event.task_id.clone();
-        let before = self
+        let (before, old_waiting_order) = self
             .tasks
             .iter()
             .find(|t| t.source == source && t.event.task_id == task_id)
-            .map(|t| t.status());
+            .map(|t| (Some(t.status()), t.waiting_order))
+            .unwrap_or((None, 0));
+        let entered_waiting = event.status == Status::Waiting && before != Some(Status::Waiting);
+        let waiting_order = if event.status != Status::Waiting {
+            0
+        } else if entered_waiting {
+            self.tasks
+                .iter()
+                .filter(|t| t.event.status == Status::Waiting)
+                .map(|t| t.waiting_order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        } else if old_waiting_order == 0 {
+            0
+        } else {
+            old_waiting_order
+        };
         if let Some(t) = self
             .tasks
             .iter_mut()
@@ -363,10 +411,13 @@ impl Model {
                 // 但派生字段可能变了——最典型的是会话标题在会话中途被重新生成，
                 // 重新扫描才第一次读到。内容有变就更新文案，完全一致才去重。
                 if event.status == t.event.status
-                    && (event.title != t.event.title || event.detail != t.event.detail)
+                    && (event.title != t.event.title
+                        || event.detail != t.event.detail
+                        || event.waiting_kind != t.event.waiting_kind)
                 {
                     t.event.title = event.title;
                     t.event.detail = event.detail;
+                    t.event.waiting_kind = event.waiting_kind;
                     return Ok(true);
                 }
                 return Ok(false);
@@ -383,6 +434,7 @@ impl Model {
                 updated_at: at,
                 stale: false,
                 subagent_busy: false,
+                waiting_order,
             };
         } else {
             self.tasks.push(Task {
@@ -391,7 +443,11 @@ impl Model {
                 updated_at: at,
                 stale: false,
                 subagent_busy: false,
+                waiting_order,
             });
+        }
+        if entered_waiting {
+            self.manual_page = Some(0);
         }
         self.tasks
             .sort_by_key(|t| std::cmp::Reverse((t.updated_at, t.event.seq)));
@@ -532,7 +588,14 @@ impl Model {
     /// 水墨屏跟着反复刷新。这里只在当前这条结束、消失时才重新挑一条。
     pub fn auto_focus(&mut self, now: i64) {
         let active = self.running(now);
-        if active.is_empty() {
+        if active.is_empty() || self.manual_page.is_some() {
+            return;
+        }
+        if self.selected.as_ref().is_some_and(|key| {
+            active
+                .iter()
+                .any(|task| task.key() == *key && task.status() == Status::Waiting)
+        }) {
             return;
         }
         let best = active
@@ -563,6 +626,7 @@ impl Model {
                     thread_id: None,
                     seq: 1,
                     status,
+                    waiting_kind: None,
                     title: "整理今天的待办".into(),
                     detail: "状态演示，不代表真实任务".into(),
                     progress: if status == Status::Working {
@@ -578,6 +642,7 @@ impl Model {
                 updated_at: now,
                 stale: false,
                 subagent_busy: false,
+                waiting_order: 0,
             });
         }
         let active = self.running(now);
@@ -620,9 +685,18 @@ impl Model {
     pub fn display_order(&self, now: i64) -> Vec<Task> {
         let mut tasks = self.running(now);
         tasks.sort_by(|a, b| {
-            (b.status() == Status::Waiting)
-                .cmp(&(a.status() == Status::Waiting))
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
+            match (a.status() == Status::Waiting, b.status() == Status::Waiting) {
+                (true, true) => b
+                    .waiting_order
+                    .cmp(&a.waiting_order)
+                    .then_with(|| a.key().cmp(&b.key())),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => b
+                    .updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.key().cmp(&b.key())),
+            }
         });
         tasks
     }
@@ -632,20 +706,27 @@ impl Model {
         // 单个活跃任务时上下键无事可做：翻到历史任务只会让人困惑。
         let active = self.display_order(now);
         if active.len() <= 1 {
+            self.manual_page = None;
             return;
         }
         if active.len() > TASKS_PER_PAGE {
-            let page = self
-                .selected
-                .as_ref()
-                .and_then(|key| active.iter().position(|t| &t.key() == key))
-                .unwrap_or(0)
-                / TASKS_PER_PAGE;
             let pages = active.len().div_ceil(TASKS_PER_PAGE);
+            let page = self
+                .manual_page
+                .unwrap_or_else(|| {
+                    self.selected
+                        .as_ref()
+                        .and_then(|key| active.iter().position(|t| &t.key() == key))
+                        .unwrap_or(0)
+                        / TASKS_PER_PAGE
+                })
+                .min(pages.saturating_sub(1));
             let next = (page as i32 + step).rem_euclid(pages as i32) as usize;
+            self.manual_page = Some(next);
             self.selected = Some(active[next * TASKS_PER_PAGE].key());
             return;
         }
+        self.manual_page = None;
         let tasks = active;
         if tasks.is_empty() {
             self.selected = None;
@@ -666,6 +747,7 @@ mod tests {
             thread_id: None,
             seq,
             status,
+            waiting_kind: (status == Status::Waiting).then_some(WaitingKind::Question),
             title: "真实任务".into(),
             detail: String::new(),
             progress: None,
@@ -788,6 +870,91 @@ mod tests {
         m.apply(done, "dsh", 300).unwrap();
         assert_eq!(m.current(310).unwrap().event.task_id, "old");
         assert_eq!(m.current(310).unwrap().status(), Status::Waiting);
+    }
+
+    #[test]
+    fn waiting_order_survives_heartbeats_and_new_waits_move_first() {
+        let mut model = Model::default();
+        let mut old = ev(1, Status::Waiting);
+        old.task_id = "old-wait".into();
+        model.apply(old, "agent", 100).unwrap();
+
+        let mut new = ev(1, Status::Waiting);
+        new.task_id = "new-wait".into();
+        model.apply(new, "agent", 200).unwrap();
+
+        let mut heartbeat = ev(2, Status::Waiting);
+        heartbeat.task_id = "old-wait".into();
+        model.apply(heartbeat, "agent", 300).unwrap();
+
+        let order: Vec<_> = model
+            .display_order(301)
+            .into_iter()
+            .map(|task| task.event.task_id)
+            .collect();
+        assert_eq!(order, ["new-wait", "old-wait"]);
+    }
+
+    #[test]
+    fn reentering_waiting_moves_task_ahead_of_existing_waits() {
+        let mut model = Model::default();
+        let mut first = ev(1, Status::Waiting);
+        first.task_id = "first".into();
+        model.apply(first, "agent", 100).unwrap();
+
+        let mut other = ev(1, Status::Waiting);
+        other.task_id = "other".into();
+        model.apply(other, "agent", 200).unwrap();
+
+        let mut resumed = ev(2, Status::Working);
+        resumed.task_id = "first".into();
+        model.apply(resumed.clone(), "agent", 300).unwrap();
+        resumed.seq += 1;
+        resumed.status = Status::Waiting;
+        model.apply(resumed, "agent", 400).unwrap();
+
+        let order: Vec<_> = model
+            .display_order(401)
+            .into_iter()
+            .map(|task| task.event.task_id)
+            .collect();
+        assert_eq!(order, ["first", "other"]);
+    }
+
+    #[test]
+    fn legacy_cache_without_wait_metadata_remains_readable() {
+        let model: Model = serde_json::from_str(
+            r#"{"cache_version":3,"tasks":[{"event":{"task_id":"legacy","seq":1,"status":"waiting","title":"旧缓存"},"source":"agent","updated_at":100,"stale":false}]}"#,
+        )
+        .unwrap();
+
+        let task = &model.tasks[0];
+        assert_eq!(task.event.waiting_kind, None);
+        assert_eq!(task.waiting_order, 0);
+        assert_eq!(task.waiting_label(), "等你处理");
+        assert_eq!(model.display_order(101)[0].event.task_id, "legacy");
+    }
+
+    #[test]
+    fn page_navigation_clamps_to_the_visible_page_after_tasks_disappear() {
+        let mut model = Model::default();
+        for index in 0..10 {
+            let mut event = ev(1, Status::Working);
+            event.task_id = format!("page-{index}");
+            model.apply(event, "agent", 100 + index).unwrap();
+        }
+
+        for _ in 0..3 {
+            model.cycle(1, 200);
+        }
+        assert_eq!(model.manual_page, Some(3));
+
+        model.tasks.retain(|task| task.event.task_id != "page-0");
+        let expected = model.display_order(200)[0].key();
+        model.cycle(1, 200);
+
+        assert_eq!(model.manual_page, Some(0));
+        assert_eq!(model.selected.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

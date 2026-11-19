@@ -29,6 +29,9 @@ fn text_white(e: &mut Vec<Value>, s: &str, x: i32, y: i32, size: i32, width: i32
 fn text(e: &mut Vec<Value>, s: &str, x: i32, y: i32, size: i32, width: i32) {
     e.push(json!({"type":"text","content":s,"x":x,"y":y,"size":size,"width_limit":width,"weight":if size>=24 {"bold"} else {"regular"}}));
 }
+fn text_fit(e: &mut Vec<Value>, s: &str, x: i32, y: i32, size: i32, width: i32) {
+    e.push(json!({"type":"text","content":s,"x":x,"y":y,"size":size,"width_limit":width,"truncate":true,"weight":if size>=24 {"bold"} else {"regular"}}));
+}
 fn text_right(e: &mut Vec<Value>, s: &str, x: i32, y: i32, size: i32, width: i32) {
     e.push(json!({"type":"text","content":s,"x":x,"y":y,"size":size,"width_limit":width,"align":"right","weight":"regular"}));
 }
@@ -111,6 +114,19 @@ fn truncate_last(lines: &mut [String]) {
     if let Some(last) = lines.last_mut() {
         last.pop();
         last.push('…');
+    }
+}
+
+/// 多任务概览的行布局：`(行顶 y, 标题可用像素宽度)`。
+/// 鳄鱼从 y=152 起占右下角 (300,152)–(390,272)：行顶落在 152 附近或以下的行
+/// 只用到鳄鱼左侧的 268px（20+268=288 < 300），最上面的行在鳄鱼上方，可用满
+/// 整行宽度 368px（20+368=388，右边留 12px）。最后一页只有 1 项时仍沿用首行
+/// 位置与整行宽度，不切成单任务详情。
+fn multi_row_geometry(visible: usize) -> Vec<(i32, i32)> {
+    match visible {
+        2 => vec![(88, 368), (181, 268)],
+        3 => vec![(76, 368), (143, 268), (210, 268)],
+        _ => vec![(76, 368)],
     }
 }
 
@@ -234,38 +250,61 @@ pub fn draw(model: &Model, now: i64) -> Value {
     if multi {
         let pages = tasks.len().div_ceil(TASKS_PER_PAGE);
         let page = model
-            .selected
-            .as_ref()
-            .and_then(|key| tasks.iter().position(|t| &t.key() == key))
-            .unwrap_or(0)
-            / TASKS_PER_PAGE;
-        let heading = if pages > 1 {
-            format!("{} 个任务 · {}/{}", tasks.len(), page + 1, pages)
-        } else {
-            format!("{} 个任务", tasks.len())
-        };
-        text(&mut e, &heading, 20, 52 + BODY_SHIFT, 15, 320);
-        // 两个任务每个给两行；三个以上压成单行并分页，保证每行都读得全。
-        let (row_height, title_max) = match tasks.len() {
-            2 => (82, 2usize),
-            3 => (64, 1),
-            _ => (50, 1),
-        };
-        for (i, task) in tasks
-            .iter()
-            .skip(page * TASKS_PER_PAGE)
-            .take(TASKS_PER_PAGE)
-            .enumerate()
-        {
-            let y = 62 + BODY_SHIFT + i as i32 * row_height;
-            let lines = title_lines(&task.event.title, 25, title_max);
-            for (k, line) in lines.iter().enumerate() {
-                text(&mut e, line, 20, y + 14 + k as i32 * 19, 16, 368);
+            .manual_page
+            .unwrap_or_else(|| {
+                model
+                    .selected
+                    .as_ref()
+                    .and_then(|key| tasks.iter().position(|t| &t.key() == key))
+                    .unwrap_or(0)
+                    / TASKS_PER_PAGE
+            })
+            .min(pages.saturating_sub(1));
+        let pending = tasks.iter().filter(|task| task.status() == Status::Waiting).count();
+        let heading = format!("{} 个任务 · 待处理 {pending}", tasks.len());
+        text(&mut e, &heading, 20, 52 + BODY_SHIFT, 13, 310);
+        if pages > 1 {
+            text_right(
+                &mut e,
+                &format!("{}/{}", page + 1, pages),
+                320,
+                52 + BODY_SHIFT,
+                12,
+                64,
+            );
+        }
+        // 每页最多 3 项；行高由可见行数决定（2 项时一行给两行标题的空间）。
+        let first = page * TASKS_PER_PAGE;
+        let visible = &tasks[first..(first + TASKS_PER_PAGE).min(tasks.len())];
+        for (i, (row_top, width)) in multi_row_geometry(visible.len()).into_iter().enumerate() {
+            let Some(task) = visible.get(i) else { break };
+            let y = row_top + BODY_SHIFT;
+            // 标题单行，超宽按像素截断并保留省略号；下半部分收窄到鳄鱼左侧。
+            text_fit(
+                &mut e,
+                &task.event.title,
+                20,
+                y + 14,
+                16,
+                width,
+            );
+            if task.status() == Status::Waiting {
+                let label = task.waiting_label();
+                let bar_width = if task.event.waiting_kind.is_some() { 68 } else { 72 };
+                rect_r(&mut e, 20, y + 25, bar_width, 18, 3, Some(0));
+                text_white(&mut e, label, 27, y + 38, 11, bar_width - 14);
+            } else {
+                let tx = status_glyph(&mut e, Some(task.status()), 20, y + 35, 12);
+                let avail = width - (tx - 20);
+                text_fit(
+                    &mut e,
+                    &task_status_text(task),
+                    tx,
+                    y + 35,
+                    11,
+                    avail,
+                );
             }
-            let status = task_status_text(task);
-            let status_y = y + 14 + lines.len() as i32 * 19 + 2;
-            let tx = status_glyph(&mut e, Some(task.status()), 20, status_y, 12);
-            text(&mut e, &status, tx, status_y, 11, 368 - (tx - 20));
         }
     } else if idle {
         // 待命页：没有任务时不占屏也不编造内容，只说「我在等活」。
@@ -396,9 +435,14 @@ pub fn draw(model: &Model, now: i64) -> Value {
         }
     }
 
-    // 鳄鱼：单任务/待命页画在右下角 (300,152)（= 150 + BODY_SHIFT），90×120；多任务列表整宽，不画。
-    if !multi {
-        let action = if idle {
+    // 鳄鱼固定在右下角 (300,152)，多任务布局为素材留出空间。
+    let action = if multi {
+        if tasks.iter().any(|task| task.status() == Status::Waiting) {
+            "waiting"
+        } else {
+            "working"
+        }
+    } else if idle {
             // 连续 30 分钟没有活跃任务才睡觉；never-active 的新装状态保持 idle。
             if model
                 .last_active_at
@@ -418,11 +462,9 @@ pub fn draw(model: &Model, now: i64) -> Value {
             "error"
         } else {
             "idle"
-        };
-        // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-GATOR-03）。
-        // 品牌行加高后版式整体下移 2px（ticket 02），素材跟着下移，仍不压底部分隔线。
-        sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 1);
-    }
+    };
+    // v2 素材就是 90×120，按 1:1 画；不再放大 3×（SPEC FR-GATOR-03）。
+    sprite::draw_action(&mut e, 300, 150 + BODY_SHIFT, action, 1);
 
     rect(&mut e, 16, 271 + BODY_SHIFT, 368, 0, None);
     // 底部两态：有任务 = 上下文占用 + 花絮；空闲 = 电量/Wi-Fi + 等你派活。
@@ -573,6 +615,7 @@ mod tests {
                         thread_id: None,
                         seq: 1,
                         status: Status::Working,
+                        waiting_kind: None,
                         title: format!("任务名称{i}"),
                         detail: String::new(),
                         progress: None,
@@ -622,7 +665,7 @@ mod tests {
                     .windows(2)
                     .all(|w| w[0]["y"].as_i64() < w[1]["y"].as_i64()));
                 assert!(!v.to_string().contains('%'));
-                assert!(e.len() <= 200);
+                assert!(e.len() <= 400, "单帧元素 {} 超过 400", e.len());
                 if pages > 1 {
                     m.cycle(1, 62);
                 }
@@ -653,6 +696,7 @@ mod tests {
                 thread_id: None,
                 seq: 1,
                 status: Status::Working,
+                waiting_kind: None,
                 title: "接入宠物".into(),
                 detail: "正在执行命令".into(),
                 progress: None,
@@ -693,6 +737,7 @@ mod tests {
                 thread_id: None,
                 seq: 1,
                 status: Status::Working,
+                waiting_kind: None,
                 title: "接入宠物".into(),
                 detail: String::new(),
                 progress: None,
@@ -747,6 +792,7 @@ mod tests {
                 thread_id: None,
                 seq: 1,
                 status: Status::Waiting,
+                waiting_kind: Some(crate::model::WaitingKind::Question),
                 title: "接入宠物".into(),
                 detail: "采用哪种推送策略？".into(),
                 progress: None,
@@ -801,7 +847,7 @@ mod tests {
         }
     }
 
-    /// 鳄鱼矩形压在右下角，单任务/待命页才有；多任务列表整宽不画。
+    /// 鳄鱼矩形位于右下角。
     fn sprite_rects(scene: &Value) -> Vec<&Value> {
         scene["elements"]
             .as_array()
@@ -813,6 +859,188 @@ mod tests {
                     && e["y"].as_i64().unwrap_or(0) >= 152
             })
             .collect()
+    }
+
+    #[test]
+    fn multi_task_overview_keeps_the_gator_and_avoids_its_area() {
+        for count in [2usize, 3, 4] {
+            let mut model = Model::default();
+            for i in 0..count {
+                model
+                    .apply(
+                        crate::model::Event {
+                            task_id: format!("multi-{i}"),
+                            thread_id: None,
+                            seq: 1,
+                            status: Status::Working,
+                            waiting_kind: None,
+                            title: format!("检查多个任务和墨水屏鳄鱼布局 {i}"),
+                            detail: String::new(),
+                            progress: None,
+                            progress_source: crate::model::ProgressSource::Agent,
+                            progress_steps: None,
+                            agent: "Test".into(),
+                        },
+                        "agent",
+                        100 + i as i64,
+                    )
+                    .unwrap();
+            }
+
+            let scene = draw(&model, 200);
+            assert!(sprite_rects(&scene).len() > 20, "{count} 个任务仍应显示鳄鱼");
+            let mut expected = Vec::new();
+            sprite::draw_action(&mut expected, 300, 152, "working", 1);
+            assert_eq!(sprite_rects(&scene), sprite_rects(&json!({"elements": expected})));
+            let texts = scene["elements"].as_array().unwrap();
+            let titles: Vec<_> = texts
+                .iter()
+                .filter(|element| {
+                    element["type"] == "text"
+                        && element["content"]
+                            .as_str()
+                            .is_some_and(|content| content.starts_with("检查多个任务"))
+                })
+                .collect();
+            assert_eq!(titles.len(), count.min(TASKS_PER_PAGE));
+            for title in titles {
+                let right = title["x"].as_i64().unwrap() + title["width_limit"].as_i64().unwrap();
+                assert!(right <= 288 || title["y"].as_i64().unwrap() < 152);
+                assert_eq!(title["truncate"], true, "标题由字体度量负责截断");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_task_waits_are_highlighted_and_reflected_across_pages() {
+        let mut model = Model::default();
+        for (id, status, waiting_kind) in [
+            ("question", Status::Waiting, Some(crate::model::WaitingKind::Question)),
+            ("permission", Status::Waiting, Some(crate::model::WaitingKind::Permission)),
+            ("working", Status::Working, None),
+            ("working-2", Status::Working, None),
+        ] {
+            model
+                .apply(
+                    crate::model::Event {
+                        task_id: id.into(),
+                        thread_id: None,
+                        seq: 1,
+                        status,
+                        waiting_kind,
+                        title: format!("任务 {id}"),
+                        detail: String::new(),
+                        progress: None,
+                        progress_source: crate::model::ProgressSource::Agent,
+                        progress_steps: None,
+                        agent: "Test".into(),
+                    },
+                    "agent",
+                    100,
+                )
+                .unwrap();
+        }
+
+        let first_page = draw(&model, 200);
+        let first_text = first_page.to_string();
+        assert!(first_text.contains("4 个任务 · 待处理 2"));
+        for label in ["等你回答", "等你批准"] {
+            assert!(first_text.contains(label), "缺少等待类型 {label}");
+            let inverse = first_page["elements"].as_array().unwrap().iter().any(|el| {
+                el["type"] == "text" && el["content"] == label && el["color"] == 255
+            });
+            assert!(inverse, "{label} 必须以白字显示在黑底状态条上");
+        }
+
+        model.cycle(1, 200);
+        let second_page = draw(&model, 200);
+        let mut expected = Vec::new();
+        sprite::draw_action(&mut expected, 300, 152, "waiting", 1);
+        let expected_scene = json!({"elements": expected});
+        assert_eq!(
+            sprite_rects(&second_page),
+            sprite_rects(&expected_scene),
+            "当前页只有工作任务时，鳄鱼仍反映其他页的等待事项"
+        );
+
+        for id in ["question", "permission"] {
+            let mut resolved = model
+                .tasks
+                .iter()
+                .find(|task| task.event.task_id == id)
+                .unwrap()
+                .event
+                .clone();
+            resolved.seq += 1;
+            resolved.status = Status::Working;
+            resolved.waiting_kind = None;
+            model.apply(resolved, "agent", 300).unwrap();
+        }
+        let all_working = draw(&model, 301);
+        let mut expected = Vec::new();
+        sprite::draw_action(&mut expected, 300, 152, "working", 1);
+        assert_eq!(
+            sprite_rects(&all_working),
+            sprite_rects(&json!({"elements": expected})),
+            "全部等待事项解除后，鳄鱼应恢复工作动作"
+        );
+    }
+
+    #[test]
+    fn manual_page_survives_progress_update() {
+        let mut model = Model::default();
+        for i in 0..4 {
+            model
+                .apply(
+                    crate::model::Event {
+                        task_id: format!("page-{i}"),
+                        thread_id: None,
+                        seq: 1,
+                        status: Status::Working,
+                        waiting_kind: None,
+                        title: format!("任务 {i}"),
+                        detail: String::new(),
+                        progress: None,
+                        progress_source: crate::model::ProgressSource::Agent,
+                        progress_steps: None,
+                        agent: "Test".into(),
+                    },
+                    "agent",
+                    100 + i as i64,
+                )
+                .unwrap();
+        }
+
+        model.cycle(1, 200);
+        let selected = model.selected.clone().unwrap();
+        let task = model
+            .tasks
+            .iter()
+            .find(|task| task.key() == selected)
+            .unwrap();
+        let mut update = task.event.clone();
+        update.seq += 1;
+        model.apply(update, "agent", 300).unwrap();
+        model.auto_focus(300);
+
+        assert!(draw(&model, 300).to_string().contains("2/2"));
+
+        let mut new_wait = model
+            .tasks
+            .iter()
+            .find(|task| task.event.task_id == "page-1")
+            .unwrap()
+            .event
+            .clone();
+        new_wait.seq += 1;
+        new_wait.status = Status::Waiting;
+        new_wait.waiting_kind = Some(crate::model::WaitingKind::Question);
+        model.apply(new_wait, "agent", 400).unwrap();
+        model.auto_focus(400);
+
+        let first_page = draw(&model, 400).to_string();
+        assert!(first_page.contains("1/2"), "新等待应把设备带回首页");
+        assert!(first_page.contains("待处理 1"));
     }
 
     #[test]
@@ -911,6 +1139,7 @@ mod tests {
                 thread_id: None,
                 seq: 1,
                 status: Status::Done,
+                waiting_kind: None,
                 title: "整理今天的待办".into(),
                 detail: String::new(),
                 progress: None,
@@ -948,6 +1177,8 @@ mod tests {
                     thread_id: None,
                     seq: 1,
                     status,
+                    waiting_kind: (status == Status::Waiting)
+                        .then_some(crate::model::WaitingKind::Question),
                     title: format!("任务{}", i),
                     detail: String::new(),
                     progress: None,
@@ -963,7 +1194,8 @@ mod tests {
         m.quip = "测试花絮".into();
         let page1 = draw(&m, 200);
         let s = page1.to_string();
-        assert!(s.contains("4 个任务 · 1/2"), "四个任务要显示页码");
+        assert!(s.contains("4 个任务 · 待处理 1"), "页头显示全局待处理数量");
+        assert!(s.contains("1/2"), "四个任务要显示页码");
         // Waiting 置顶：第一行必须是等待中的任务。
         let first_title = page1["elements"]
             .as_array()
@@ -976,8 +1208,11 @@ mod tests {
             .to_string();
         assert_eq!(first_title, "任务2", "等待任务必须排第一");
         m.cycle(1, 200);
-        let page2 = draw(&m, 200).to_string();
-        assert!(page2.contains("4 个任务 · 2/2"));
+        let page2_scene = draw(&m, 200);
+        assert!(sprite_rects(&page2_scene).len() > 20, "最后一页仍显示鳄鱼");
+        let page2 = page2_scene.to_string();
+        assert!(page2.contains("4 个任务 · 待处理 1"));
+        assert!(page2.contains("2/2"));
         assert!(page2.contains("任务0"), "第二页显示剩下的一条");
     }
 

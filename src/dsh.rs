@@ -35,7 +35,7 @@
 //! （变短）时从头重新推导。记录自带单调递增的 `seq`，直接用它做事件序号——跨进程
 //! 重启、跨补写都稳定，不需要自己数字节偏移。
 
-use crate::model::{clean, Event, ProgressSource, Status};
+use crate::model::{clean, Event, ProgressSource, Status, WaitingKind};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -49,6 +49,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_INITIAL: u64 = 8 * 1024 * 1024;
 /// 最多跟踪的会话数，与上游一致。
 const MAX_FILES: usize = 24;
+
+fn sort_session_files(files: &mut [(PathBuf, i64)]) {
+    files.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
 /// 只有最近活跃的会话才在首轮导入时上屏，避免历史任务堆满列表。
 const IMPORT_WINDOW: i64 = 12 * 3600;
 /// 「完成」要静默这么久才上报：流式落盘时 turn/end 之后可能紧跟下一轮，
@@ -78,15 +85,6 @@ fn warn_decode_truncated() {
 const STALL_SKIP: u32 = 3;
 /// 没有标题时用项目目录名，最多这么长。
 const TITLE_MAX: usize = 60;
-
-/// 等待用户处理的种类。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WaitKind {
-    /// 结构化提问：设备上把题干一起显示出来。
-    Question,
-    /// 权限确认卡：只提示「有操作等你确认」，不提工具参数。
-    Permission,
-}
 
 /// 文件尾部记录的类型：状态由「最后一条生命周期记录」决定。
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -251,7 +249,7 @@ struct Cursor {
     /// 提问题干（等待解除后不再使用）。
     asking: String,
     /// callId / 确认 id → 等待种类；拿到结果或确认结果即移除。
-    waiting: HashMap<String, WaitKind>,
+    waiting: HashMap<String, WaitingKind>,
     /// 本轮待办清单：序号 → 是否已完成。只存完成状态，正文一概不保存。
     todos: BTreeMap<usize, bool>,
     ctx_used: Option<u32>,
@@ -345,7 +343,8 @@ impl Cursor {
                     // 提问不是「活动」：它有自己的等待状态。题干只在 prompt
                     // 模式读取；默认模式连内存都不留。
                     if !call_id.is_empty() {
-                        self.waiting.insert(call_id.to_string(), WaitKind::Question);
+                        self.waiting
+                            .insert(call_id.to_string(), WaitingKind::Question);
                     }
                     if allow_prompt {
                         let text = ask_text(data["arguments"].as_str().unwrap_or(""));
@@ -383,7 +382,8 @@ impl Cursor {
             }
             "approval/asked" => {
                 if let Some(id) = data["id"].as_str() {
-                    self.waiting.insert(id.to_string(), WaitKind::Permission);
+                    self.waiting
+                        .insert(id.to_string(), WaitingKind::Permission);
                 }
                 self.last = Last::Working;
             }
@@ -422,7 +422,8 @@ impl Cursor {
                 }
                 // 定时提问的答复：这才是「提问已经有人答了」的权威信号。
                 if source_kind == "user-question-reply" {
-                    self.waiting.retain(|_, kind| *kind != WaitKind::Question);
+                    self.waiting
+                        .retain(|_, kind| *kind != WaitingKind::Question);
                     self.asking.clear();
                 }
             }
@@ -506,10 +507,14 @@ impl Cursor {
     }
 
     /// 是否有权限确认在等（区别于提问），等待画面据此换文案。
-    fn permission_pending(&self) -> bool {
-        self.waiting
-            .values()
-            .any(|k| *k == WaitKind::Permission)
+    fn waiting_kind(&self) -> Option<WaitingKind> {
+        if self.waiting.values().any(|k| *k == WaitingKind::Permission) {
+            Some(WaitingKind::Permission)
+        } else if self.waiting.values().any(|k| *k == WaitingKind::Question) {
+            Some(WaitingKind::Question)
+        } else {
+            None
+        }
     }
 
     /// 是否可以把当前状态推上去：「完成」要等记录静默，
@@ -543,8 +548,9 @@ impl Cursor {
             fallback.to_string()
         };
         let progress = self.progress();
+        let waiting_kind = self.waiting_kind();
         let detail = match status {
-            Status::Waiting if self.permission_pending() => {
+            Status::Waiting if waiting_kind == Some(WaitingKind::Permission) => {
                 "有操作等你确认 · 请回电脑点允许".to_string()
             }
             // 题干只在显式开启 prompt 模式时外传；默认固定文案，不带提问正文。
@@ -570,6 +576,7 @@ impl Cursor {
                 },
                 seq,
                 status,
+                waiting_kind,
                 title,
                 detail,
                 progress: progress.map(|x| x.0),
@@ -992,7 +999,8 @@ impl Watcher {
 
         // 没有新记录时也要有一次判定：被去抖压住的「完成」只有在静默到期后
         // 才轮得到上报，而上面那个循环在没有新字节时根本不会解码。
-        let idle: Vec<PathBuf> = self.cursors.keys().cloned().collect();
+        let mut idle: Vec<PathBuf> = self.cursors.keys().cloned().collect();
+        idle.sort();
         for path in idle {
             let stem = path
                 .parent()
@@ -1075,7 +1083,7 @@ impl Watcher {
                 }
             }
         }
-        out.sort_by_key(|a| std::cmp::Reverse(a.1));
+        sort_session_files(&mut out);
         out.truncate(MAX_FILES);
         Ok(out)
     }
@@ -1097,6 +1105,28 @@ mod tests {
     use crate::model::Model;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn session_file_order_is_stable_when_modification_times_match() {
+        let mut files = vec![
+            (PathBuf::from("session-c"), 100),
+            (PathBuf::from("session-b"), 100),
+            (PathBuf::from("session-old"), 99),
+            (PathBuf::from("session-a"), 100),
+        ];
+
+        sort_session_files(&mut files);
+
+        assert_eq!(
+            files,
+            [
+                (PathBuf::from("session-a"), 100),
+                (PathBuf::from("session-b"), 100),
+                (PathBuf::from("session-c"), 100),
+                (PathBuf::from("session-old"), 99),
+            ]
+        );
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1275,6 +1305,7 @@ mod tests {
         let waiting = w.scan().unwrap();
         let ev = &waiting.last().unwrap().0;
         assert_eq!(ev.status, Status::Waiting);
+        assert_eq!(ev.waiting_kind, Some(WaitingKind::Question));
         // 默认不把提问正文写到屏幕上。
         assert_eq!(ev.detail, "有 1 个问题待确认");
 
@@ -1375,6 +1406,7 @@ mod tests {
         let waiting = w.scan().unwrap();
         let ev = &waiting.last().unwrap().0;
         assert_eq!(ev.status, Status::Waiting);
+        assert_eq!(ev.waiting_kind, Some(WaitingKind::Permission));
         assert!(ev.detail.contains("等你确认"));
 
         append(
